@@ -156,9 +156,7 @@ class SegregatedDend(BaseDend):
     def __init__(
         self, compartment,
         wiring: wr.SegregatedDendWiring,
-        step_mode: str = "s",
-        multi=False,
-        num_compartment = 2
+        step_mode: str = "s"
     ):
         """The constructor of SegregatedDend.
 

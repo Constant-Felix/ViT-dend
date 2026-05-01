@@ -161,7 +161,8 @@ class BaseDendNeuron(base.MemoryModule, abc.ABC):
 
     def reset(self):
         self.dend.reset()
-        self.soma.reset()
+        if hasattr(self.soma,'reset()'):
+            self.soma.reset()
 
     def v_soma_float2tensor_by_shape_ints(self, device, *shape):
         """If soma.v is a float, turn it into a tensor with specified shape.
@@ -632,8 +633,9 @@ class VActivationForwardDendNeuron(VForwardDendNeuron):
         self, dend: dendrite.SegregatedDend, 
         soma:soma.LIFSoma,
         soma_shape: List[int], 
-        f_da: Callable,
-        forward_strength: Union[float, torch.Tensor] = 1.,
+        f_da: Callable = lambda x:x,
+        psn = False,
+        forward_strength: Union[float, torch.Tensor] = 1., ##
         forward_strength_learnable: bool = False, step_mode: str = "m",
         layer: int = 0,
         store_v_dend_seq: bool = False, store_v_soma_seq: bool = False,
@@ -683,10 +685,11 @@ class VActivationForwardDendNeuron(VForwardDendNeuron):
         )
         self.f_da = f_da
         self.layer = layer
+        self.psn = psn
         #print("done")
 
     def get_input2soma(
-        self, v_dend_output: torch.Tensor, v_soma: torch.Tensor
+        self, v_dend_output: torch.Tensor
     ) -> torch.Tensor:
         input2soma = self.f_da(v_dend_output)
         input2soma = input2soma * self.forward_strength
@@ -701,27 +704,122 @@ class VActivationForwardDendNeuron(VForwardDendNeuron):
         v_dend_output_seq = self.dend(x_seq) # 这两行是可以成功平行计算的
 
         # v2soma_seq.shape = [T, N, *self.soma_shape, self.dend.wiring.n_output]
-        self.v_soma_float2tensor_by_shape_ints(
-            x_seq.device, *v_dend_output_seq[0].shape[:-1]
-        )
+        if self.psn == False:
+            self.v_soma_float2tensor_by_shape_ints(
+                x_seq.device, *v_dend_output_seq[0].shape[:-1]
+            )
 
-        input2soma_seq = self.get_input2soma(v_dend_output_seq, self.soma.v)
+        input2soma_seq = self.get_input2soma(v_dend_output_seq)
         if hook is not None:
             hook = v_dend_output_seq.detach()
         #input2soma_seq.shape = [T, N, *self.soma_shape]
-        self.soma.step_mode = "m"
+        if self.psn == False:
+            self.soma.step_mode = "m"
         soma_spike_seq = self.soma(input2soma_seq)
+        #if hook==None:   ##
+            #return soma_spike_seq ##
         if self.store_v_dend_seq:
             self.v_dend_seq = self.dend.compartment.v_seq
         if self.store_v_soma_seq:
             self.v_soma_seq = self.soma.v_seq
         if self.store_v_dend_pre_spike:
-            # For VForwardDendNeuron, v_dend_pre_spike == v_dend_seq in 
-            # multi-step mode
             self.v_dend_pre_spike = self.dend.compartment.v_seq
         if self.store_v_soma_pre_spike:
             self.v_soma_pre_spike = self.soma.v_pre_spike
         return soma_spike_seq,hook
+
+class VConcatForwardDendNeuron(VForwardDendNeuron):
+    """
+    A layer of neurons that transmit activated v_dend forward to the soma using Concatenation.
+    
+    与 VActivationForwardDendNeuron 不同，此类不沿分支维度求和，
+    而是将 N 个分支的特征在 Channel 维度上进行拼接 (Concat)
+    使输出通道数扩大为 C_sub * N。
+    """
+
+    def __init__(
+        self, dend: dendrite.SegregatedDend, 
+        soma: soma.LIFSoma, 
+        soma_shape: List[int], 
+        f_da: Callable = lambda x:x,
+        psn = False,
+        forward_strength: Union[float, torch.Tensor] = 1.,
+        forward_strength_learnable: bool = False, step_mode: str = "m",
+        layer: int = 0,
+        store_v_dend_seq: bool = False, store_v_soma_seq: bool = False,
+        store_v_dend_pre_spike: bool = False,
+        store_v_soma_pre_spike: bool = False,
+    ):
+        super().__init__(
+            dend, soma, soma_shape, 
+            forward_strength, forward_strength_learnable, step_mode,
+            store_v_dend_seq, store_v_soma_seq, 
+            store_v_dend_pre_spike, store_v_soma_pre_spike
+        )
+        self.f_da = f_da
+        self.layer = layer
+        self.psn = psn
+
+    def get_input2soma(
+        self, v_dend_output: torch.Tensor
+    ) -> torch.Tensor:
+        input2soma = self.f_da(v_dend_output)
+        input2soma = input2soma * self.forward_strength
+        
+        # ==========================================
+        # 核心修改：通道拼接 (Concat) 逻辑
+        # ==========================================
+        if input2soma.dim() == 5:
+            # Seq-CIFAR (1D数据): [T, B, C_sub, H, N]
+            T, B, C_sub, H, N = input2soma.shape
+            # [T, B, C_sub, H, N] -> [T, B, N, C_sub, H] -> [T, B, N*C_sub, H]
+            input2soma = input2soma.permute(0, 1, 4, 2, 3).contiguous()
+            return input2soma.view(T, B, N * C_sub, H)
+            
+        elif input2soma.dim() == 6:
+            # Static Image (2D数据): [T, B, C_sub, H, W, N]
+            T, B, C_sub, H, W, N = input2soma.shape
+            # [T, B, C_sub, H, W, N] -> [T, B, N, C_sub, H, W] -> [T, B, N*C_sub, H, W]
+            input2soma = input2soma.permute(0, 1, 5, 2, 3, 4).contiguous()
+            return input2soma.view(T, B, N * C_sub, H, W)
+            
+        else:
+            raise ValueError(f"Unexpected input2soma dimension: {input2soma.dim()}")
+
+    def multi_step_forward(self, x_seq: torch.Tensor, hook=None) -> torch.Tensor:
+        """This implementation is equivalent but more efficient than default."""
+        x_seq = self.reshape_input(x_seq, "m") # shape=[T, N, n_soma, n_input]
+        self.dend.step_mode = "m"
+        v_dend_output_seq = self.dend(x_seq) 
+
+        #if self.psn == False:
+        #    self.v_soma_float2tensor_by_shape_ints(
+        #        x_seq.device, *v_dend_output_seq[0].shape[:-1]
+        #    )
+
+        input2soma_seq = self.get_input2soma(v_dend_output_seq)
+        
+        if hook is not None:
+            hook = v_dend_output_seq.detach()
+            
+        if self.psn == False:  ##
+            self.soma.step_mode = "m"  ##
+            
+        soma_spike_seq = self.soma(input2soma_seq)
+        
+        #if hook is None:   
+            #return soma_spike_seq 
+            
+        if self.store_v_dend_seq:
+            self.v_dend_seq = self.dend.compartment.v_seq
+        if self.store_v_soma_seq:
+            self.v_soma_seq = self.soma.v_seq
+        if self.store_v_dend_pre_spike:
+            self.v_dend_pre_spike = self.dend.compartment.v_seq
+        if self.store_v_soma_pre_spike:
+            self.v_soma_pre_spike = self.soma.v_pre_spike
+            
+        return soma_spike_seq, hook
 
 
 class VForwardSBackwardDendNeuron(BaseDendNeuron, abc.ABC):

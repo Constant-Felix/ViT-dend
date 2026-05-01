@@ -21,21 +21,6 @@ class Erode(nn.Module):
     def forward(self, x):
         return self.pool(x)
 
-class TrainableSigmoid(nn.Module):
-    def __init__(self, soma_shape,feature_dim=4):
-        super().__init__()
-        s = len(soma_shape) + 2
-        self.w = nn.Parameter(torch.randn(*(1 for _ in range(s)), feature_dim))
-        self.b = nn.Parameter(torch.zeros(*(1 for _ in range(s)), feature_dim))
-        self.d_raw = nn.Parameter(torch.zeros(*(1 for _ in range(s)), feature_dim))
-
-    def forward(self, x):
-        # x: (5, 4, 7, 3)
-        d = torch.nn.functional.softplus(self.d_raw)   # 保证 d >= 0，防数值爆炸
-        return torch.sigmoid(d * (self.w * x - self.b))
-
-
-
 class MS_MLP_dend_Conv(nn.Module):
     def __init__(
         self,
@@ -49,7 +34,8 @@ class MS_MLP_dend_Conv(nn.Module):
         integer = False,
         multi = False,
         para = False,
-        num_compartment = 2
+        num_compartment = 2,
+        bn_alter = False,
     ):
         super().__init__()
         out_features = out_features or in_features
@@ -77,9 +63,9 @@ class MS_MLP_dend_Conv(nn.Module):
                 )
         else:
             if multi==False:
-                self.dc1 = dend_compartment.PassiveDendCompartment(step_mode="m")
+                self.dc1 = dend_compartment.PassiveDendCompartment(step_mode="m",c_sub=hidden_features)
             else:
-                self.dc1 = dend_compartment.MultiScaleDendCompartment(num_compartment,step_mode='m')    
+                self.dc1 = dend_compartment.MultiScaleDendCompartment(num_compartment,step_mode='m',c_sub=hidden_features)    
             #self.dc1.tau = 3 ##这里是有问题的，要调整dend的写法
             self.wr1 = wiring.SegregatedDendWiring(num_compartment)
             self.dend1 = dendrite.SegregatedDend(step_mode='m',compartment=self.dc1,wiring=self.wr1)
@@ -111,9 +97,9 @@ class MS_MLP_dend_Conv(nn.Module):
                 )
         else:
             if multi==False:
-                self.dc2 = dend_compartment.PassiveDendCompartment(step_mode="m")
+                self.dc2 = dend_compartment.PassiveDendCompartment(step_mode="m",c_sub=hidden_features)
             else:
-                self.dc2 = dend_compartment.MultiScaleDendCompartment(num_compartment,step_mode='m')    
+                self.dc2 = dend_compartment.MultiScaleDendCompartment(num_compartment,step_mode='m',c_sub=hidden_features)    
             self.wr2 = wiring.SegregatedDendWiring(num_compartment)
             self.dend2 = dendrite.SegregatedDend(step_mode='m',compartment=self.dc2,wiring=self.wr2)
             if integer == False:
@@ -187,6 +173,7 @@ class MS_SSA_dend_Conv(nn.Module):
         multi=False,
         para=False,
         layer=0,
+        bn_alter=False
     ):
         super().__init__()
         assert (
@@ -211,9 +198,9 @@ class MS_SSA_dend_Conv(nn.Module):
                 )
         else:
             if multi==False:
-                self.dc1 = dend_compartment.PassiveDendCompartment(step_mode="m")
+                self.dc1 = dend_compartment.PassiveDendCompartment(step_mode="m",c_sub=dim*num_compartment)
             else:
-                self.dc1 = dend_compartment.MultiScaleDendCompartment(num_compartment,step_mode='m')    
+                self.dc1 = dend_compartment.MultiScaleDendCompartment(num_compartment,step_mode='m',c_sub=dim*num_compartment)    
             self.wr1 = wiring.SegregatedDendWiring(num_compartment)
             self.dend1 = dendrite.SegregatedDend(step_mode='m',compartment=self.dc1,wiring=self.wr1)
             if integer == False:
@@ -233,9 +220,9 @@ class MS_SSA_dend_Conv(nn.Module):
                 )
         else:
             if multi==False:
-                self.dc2 = dend_compartment.PassiveDendCompartment(step_mode="m")
+                self.dc2 = dend_compartment.PassiveDendCompartment(step_mode="m",c_sub=dim*num_compartment)
             else:
-                self.dc2 = dend_compartment.MultiScaleDendCompartment(num_compartment,step_mode='m')    
+                self.dc2 = dend_compartment.MultiScaleDendCompartment(num_compartment,step_mode='m',c_sub=dim*num_compartment)    
             self.wr2 = wiring.SegregatedDendWiring(num_compartment)
             self.dend2 = dendrite.SegregatedDend(step_mode='m',compartment=self.dc2,wiring=self.wr2)
             if integer == False:
@@ -256,9 +243,9 @@ class MS_SSA_dend_Conv(nn.Module):
                 )
         else:
             if multi==False:
-                self.dc3 = dend_compartment.PassiveDendCompartment(step_mode="m")
+                self.dc3 = dend_compartment.PassiveDendCompartment(step_mode="m",c_sub=dim*num_compartment)
             else:
-                self.dc3 = dend_compartment.MultiScaleDendCompartment(num_compartment,step_mode='m')    
+                self.dc3 = dend_compartment.MultiScaleDendCompartment(num_compartment,step_mode='m',c_sub=dim*num_compartment)    
             self.wr3 = wiring.SegregatedDendWiring(num_compartment)
             self.dend3 = dendrite.SegregatedDend(step_mode='m',compartment=self.dc3,wiring=self.wr3)
             if integer == False:
@@ -440,7 +427,8 @@ class MS_Block_dend_Conv(nn.Module):
         dend = False,
         integer = False,
         multi = False,
-        para = False
+        para = False,
+        bn_alter=False
     ):
         super().__init__()
         self.attn = MS_SSA_dend_Conv(
@@ -459,7 +447,8 @@ class MS_Block_dend_Conv(nn.Module):
             num_compartment=num_compartment,
             integer=integer,
             multi=multi,
-            para=para
+            para=para,
+            bn_alter=bn_alter
         )
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         self.num_compartment = num_compartment
@@ -476,7 +465,8 @@ class MS_Block_dend_Conv(nn.Module):
             dend=dend,
             integer=integer,
             multi=multi,
-            para=para
+            para=para,
+            bn_alter=bn_alter
         )
         #print(f"in feature: {self.mlp.in_features}, hidden: {self.mlp.hidden_features}")
 

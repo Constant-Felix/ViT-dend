@@ -1,10 +1,11 @@
 import torch
 
 
-def TET_loss(outputs, labels, criterion, means, lamb):
+def TET_loss(outputs, labels, criterion, means, lamb, c_states=None, firing_rates=None):
     T = outputs.size(0)
     Loss_es = 0
     for t in range(T):
+        #Loss_es += criterion(outputs[t, ...], labels,c_states,firing_rates)
         Loss_es += criterion(outputs[t, ...], labels)
     Loss_es = Loss_es / T  # L_TET
     if lamb != 0:

@@ -1,5 +1,7 @@
 output/
 all_spike/
+logs/
+events.*
 data/
 imgs/
 Trained_models_original/

@@ -48,7 +48,7 @@ amp: False
 channels-last: False
 batch_size: 64
 val_batch_size: 64
-lr: 1e-3
+lr: 6e-4
 min_lr: 1e-5
 sched: cosine
 weight_decay: 6e-2

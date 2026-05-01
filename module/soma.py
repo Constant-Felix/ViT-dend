@@ -81,6 +81,27 @@ def expand_tensor_cumulative(tensor, max_value=4):
 
     return binary
 
+class MultiSpike8(nn.Module):
+
+    class quant8(torch.autograd.Function):
+
+        @staticmethod
+        def forward(ctx, input):
+            ctx.save_for_backward(input)
+            return torch.floor(torch.clamp(input, min=0, max=8))   ####改成了取整
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            input, = ctx.saved_tensors
+            grad_input = grad_output.clone()
+            #             print("grad_input:",grad_input)
+            grad_input[input < 0] = 0
+            grad_input[input > 8] = 0
+            return grad_input
+
+    def forward(self, x):
+        return self.quant8.apply(x) 
+
 
 class MultiSpike4(nn.Module):
 
@@ -102,27 +123,7 @@ class MultiSpike4(nn.Module):
 
     def forward(self, x):
         return self.quant4.apply(x)
-
-class MultiSpike8(nn.Module):
-
-    class quant8(torch.autograd.Function):
-
-        @staticmethod
-        def forward(ctx, input):
-            ctx.save_for_backward(input)
-            return torch.floor(torch.clamp(input, min=0, max=8))   ####改成了取整
-
-        @staticmethod
-        def backward(ctx, grad_output):
-            input, = ctx.saved_tensors
-            grad_input = grad_output.clone()
-            #             print("grad_input:",grad_input)
-            grad_input[input < 0] = 0
-            grad_input[input > 8] = 0
-            return grad_input
-
-    def forward(self, x):
-        return self.quant8.apply(x)      
+     
 
 class IntergerSoma(neuron.BaseNode):
     def __init__(
@@ -197,9 +198,89 @@ class IntergerSoma_infer(neuron.BaseNode):   ###暂时我没有改这里的tau
 
         return spike
     
+import torch
+import torch.nn as nn
 
+class SSF_Quant(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, U, v_th):
+        ctx.save_for_backward(input)
+        ctx.U = U
+        # 根据论文公式(17)：先截断，除以阈值，最后向下取整 (floor)
+        clipped_input = torch.clamp(input, min=-U, max=U)
+        return torch.floor(clipped_input / v_th)
 
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, = ctx.saved_tensors
+        U = ctx.U
+        grad_input = grad_output.clone()
+        
+        # 替代梯度 (STE): 在有效截断区间 [-U, U] 内放行梯度，超出则截断为 0
+        grad_input[input < -U] = 0
+        grad_input[input > U] = 0
+        return grad_input, None, None  # 对应 input, U, v_th 的梯度，常数不需要梯度
 
+class SSF(nn.Module):
+    def __init__(self, U: int = 4, v_th: float = 1.0):
+        super().__init__()
+        self.U = U
+        self.v_th = v_th
+        
+        # 【核心新增】引入可学习的平移参数 phi_p 和缩放参数 phi_s
+        # 初始化为不改变原分布的状态 (phi_p=0, phi_s=1)
+        self.phi_p = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+        self.phi_s = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+
+    def forward(self, x):
+        # 1. 膜电位平移与缩放 (PyTorch 的 autograd 会自动计算 phi_p 和 phi_s 的梯度)
+        # 为防止缩放因子在训练中更新至负数或极小值导致除零错误，进行极小值限制
+        phi_s_clamped = torch.clamp(self.phi_s, min=1e-3)
+        x_norm = (x - self.phi_p) / phi_s_clamped
+        
+        # 2. 离散化与激活 (进入自定义的直通估计器)
+        spike = SSF_Quant.apply(x_norm, self.U, self.v_th)
+        return spike
+
+class IntergerSoma_ssf(neuron.BaseNode): # 假设基于 SpikingJelly 或类似框架的基类
+    def __init__(
+        self, tau: float = 2.,
+        v_threshold: float = 1., v_reset: float = 0., detach_reset: bool = False, decay_input: bool = True,
+        step_mode='m', backend='torch', thre = 4,
+        surrogate_function: Callable = surrogate.Sigmoid()
+    ):
+        super().__init__(
+            v_threshold, v_reset, surrogate_function, detach_reset, step_mode, backend
+        )
+        self.tau = nn.Parameter(torch.tensor(tau, dtype=torch.float32))
+        self.decay_input = decay_input
+        
+        # 替换原有的 MultiSpike 为 SSF 机制
+        self.qtrick = SSF(U=thre, v_th=v_threshold)
+    
+    def multi_step_forward(self, x: torch.Tensor):
+        spike = torch.zeros_like(x[0]).to(x.device)
+        output = torch.zeros_like(x)
+        mem_old = 0
+        time_window = x.shape[0]
+        tau = torch.clamp(self.tau, min=1+1e-3)
+        
+        for i in range(time_window):
+            if i >= 1:
+                if self.decay_input == False:
+                    mem = (mem_old)/tau + x[i]
+                else:
+                    mem = (mem_old)/tau + x[i]*(1-1/tau)
+            else:
+                mem = x[i]
+                
+            # 这里输入给 SSF 的是原始膜电位，SSF 内部会自动进行平移和缩放
+            spike = self.qtrick(mem)
+
+            mem_old = mem.clone()
+            output[i] = spike
+            
+        return output
 
 class LIFSoma(BaseSoma):
 

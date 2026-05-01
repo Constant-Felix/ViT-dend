@@ -22,7 +22,7 @@ ratio: [1.0, 1.0]
 interpolation: bicubic
 train_interpolation: bicubic
 use_conv_as_linear: true
-#pooling_stat: "0011"
+pooling_stat: "0011"
 time_steps: 4
 layer: 4
 dim: 384
@@ -49,7 +49,7 @@ amp: False
 channels-last: False
 batch_size: 64
 val_batch_size: 64
-lr: 1e-3
+lr: 9e-4
 min_lr: 1e-5
 sched: cosine
 weight_decay: 6e-2

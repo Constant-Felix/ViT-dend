@@ -40,6 +40,7 @@ class SpikeDrivenTransformer_dend(nn.Module):
         integer = False,
         multi = False,
         sps_integer = False,
+        bn_alter = False,
         para = False,
         get_embed=False,
         dvs_mode=False,
@@ -94,6 +95,7 @@ class SpikeDrivenTransformer_dend(nn.Module):
                     integer = integer,
                     multi = multi,
                     para = para,
+                    bn_alter = bn_alter,
                     layer=j,
                 )
                 for j in range(depths)

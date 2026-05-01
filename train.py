@@ -33,6 +33,7 @@ from timm.models import (
     #convert_splitbn_model,
     model_parameters,
 )
+from loss import NGCULoss
 try:
     # new layout
     from timm.models.layers import convert_splitbn_model
@@ -51,7 +52,7 @@ from timm.optim import create_optimizer_v2, optimizer_kwargs
 from timm.scheduler import create_scheduler
 from timm.utils import ApexScaler, NativeScaler
 import model, dvs_utils, criterion
-
+from timm.optim.optim_factory import param_groups_weight_decay
 try:
     from apex import amp
     from apex.parallel import DistributedDataParallel as ApexDDP
@@ -81,7 +82,7 @@ def resume_checkpoint(
 ):
     resume_epoch = None
     if os.path.isfile(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu",weights_only=False)
         if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
             if log_info:
                 _logger.info("Restoring model state from checkpoint...")
@@ -178,7 +179,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--pooling-stat",
-    default="1111",
+    default="0011",
     type=str,
     help="pooling layers in SPS moduls",
 )
@@ -252,7 +253,7 @@ parser.add_argument(
     help="number of label classes (Model default if None)",
 )
 parser.add_argument(
-    "--time-steps",
+    "--time_steps",
     type=int,
     default=4,
     metavar="N",
@@ -474,21 +475,21 @@ parser.add_argument(
     help="manual epoch number (useful on restarts)",
 )
 parser.add_argument(
-    "--decay-epochs",
+    "--decay_epochs",
     type=float,
     default=30,
     metavar="N",
     help="epoch interval to decay LR",
 )
 parser.add_argument(
-    "--warmup-epochs",
+    "--warmup_epochs",
     type=int,
     default=3,
     metavar="N",
     help="epochs to warmup LR, if scheduler supports",
 )
 parser.add_argument(
-    "--cooldown-epochs",
+    "--cooldown_epochs",
     type=int,
     default=10,
     metavar="N",
@@ -805,6 +806,11 @@ parser.add_argument(
     action="store_true"
 )
 parser.add_argument(
+    "--concat",
+    default=False,
+    action="store_true"
+)
+parser.add_argument(
     "-j",
     "--workers",
     type=int,
@@ -1056,7 +1062,7 @@ def main():
                 drop_block_rate=args.drop_block,
                 img_size_h=args.img_size, img_size_w=args.img_size,
                 patch_size=args.patch_size, embed_dims=args.dim, num_heads=args.num_heads, mlp_ratios=args.mlp_ratio,
-                in_channels=3, num_classes=args.num_classes, qkv_bias=False,
+                in_channels=args.in_channels, num_classes=args.num_classes, qkv_bias=False,
                 depths=args.layer, sr_ratios=1,
                 T=args.time_steps
             )    
@@ -1089,7 +1095,8 @@ def main():
                 integer = args.integer,
                 multi = args.multi,
                 para = args.para,
-                sps_integer = args.sps_integer
+                sps_integer = args.sps_integer,
+                bn_alter = args.bn_alter
             )
         else:
             model = create_model(
@@ -1102,24 +1109,34 @@ def main():
                 patch_size=args.patch_size, embed_dims=args.dim, num_heads=args.num_heads, mlp_ratios=args.mlp_ratio,
                 in_channels=args.in_channels, num_classes=args.num_classes, qkv_bias=False,
                 depths=args.layer, sr_ratios=1,
-                T=args.time_steps,num_compartment = args.num_compartment,
+                T=args.time_steps,num_compartment = args.num_compartment,TET=args.TET,
                 dend = args.dend,
                 integer = args.integer,
                 multi = args.multi,
                 sps_integer = args.sps_integer,
-                bn_alter = args.bn_alter
+                bn_alter = args.bn_alter,
+                concat = args.concat
             )  
         print(f"compartment: {args.num_compartment}, dim: {args.dim}")
         #print(f"model's in_channel is {model.in_channels}")        
     if args.local_rank == 0:
         _logger.info(f"Creating model {args.model}")
-        _logger.info(
-            str(
-                torchinfo.summary(
-                    model, (2, args.in_channels, args.img_size, args.img_size)
+        if args.dataset not in dvs_utils.DVS_DATASET:
+            _logger.info(
+                str(
+                    torchinfo.summary(
+                        model, (2, args.in_channels, args.img_size, args.img_size)
+                    )
                 )
             )
-        )
+        else:
+             _logger.info(
+                str(
+                    torchinfo.summary(
+                        model, (7, 2, args.in_channels, args.img_size, args.img_size)
+                    )
+                )
+            )   
 
     if args.num_classes is None:
         assert hasattr(
@@ -1198,6 +1215,7 @@ def main():
 
     optimizer = create_optimizer_v2(model, **optimizer_kwargs(cfg=args))
 
+   
     # setup automatic mixed-precision (AMP) loss scaling and op casting
     amp_autocast = suppress  # do nothing
     loss_scaler = None
@@ -1207,7 +1225,7 @@ def main():
         if args.local_rank == 0:
             _logger.info("Using NVIDIA APEX AMP. Training in mixed precision.")
     elif use_amp == "native":
-        amp_autocast = torch.cuda.amp.autocast
+        amp_autocast = torch.amp.autocast
         loss_scaler = NativeScaler()
         if args.local_rank == 0:
             _logger.info("Using native Torch AMP. Training in mixed precision.")
@@ -1224,6 +1242,7 @@ def main():
             optimizer=None if args.no_resume_opt else optimizer,
             loss_scaler=None if args.no_resume_opt else loss_scaler,
             log_info=args.local_rank == 0,
+            
         )
 
     # setup exponential moving average of model weights, SWA could be used here too
@@ -1454,26 +1473,35 @@ def main():
     # setup loss function
     if args.jsd:
         assert num_aug_splits > 1  # JSD only valid with aug splits set
-        train_loss_fn = JsdCrossEntropy(
+        train_fn = JsdCrossEntropy(
             num_splits=num_aug_splits, smoothing=args.smoothing
         ).cuda()
     elif mixup_active:
         # smoothing is handled with mixup target transform
         if args.bce_loss:
-            train_loss_fn = BinaryCrossEntropy(target_threshold=args.bce_target_thresh)
+            train_fn = BinaryCrossEntropy(target_threshold=args.bce_target_thresh)
         else:
-            train_loss_fn = SoftTargetCrossEntropy()
+            train_fn = SoftTargetCrossEntropy()
     elif args.smoothing:
         if args.bce_loss:
-            train_loss_fn = BinaryCrossEntropy(
+            train_fn = BinaryCrossEntropy(
                 smoothing=args.smoothing, target_threshold=args.bce_target_thresh
             )
         else:
-            train_loss_fn = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
+            train_fn = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
     else:
-        train_loss_fn = nn.CrossEntropyLoss()
+        train_fn = nn.CrossEntropyLoss()
 
-    train_loss_fn = train_loss_fn.cuda()
+    train_loss_fn = train_fn.cuda()
+    #train_loss_fn = NGCULoss(
+    #    train_fn,
+    #    c_max_threshold=0.9, 
+    #    eta1=0.01,           
+    #    eta2=0.005,           
+    #    eta3=0.01,           
+    #    target_rate=0.1      
+    #).cuda()
+
     validate_loss_fn = nn.CrossEntropyLoss().cuda()
 
     # setup checkpoint saver and eval metric tracking
@@ -1631,13 +1659,27 @@ def train_one_epoch(
         if args.channels_last:
             input = input.contiguous(memory_format=torch.channels_last)
 
-        with amp_autocast():
-            output = model(input,hook=dict())[0]
+        with amp_autocast('cuda'):
+            output = model(input)[0] #
+            c_states = []
+            firing_rates = []
+            #for m in model.modules():
+                # 收集 AdvancedNGCUDendCompartment 产生的 (T, B, N) 序列
+            #    if hasattr(m, 'current_C_seq'):
+            #        c_states.append(m.current_C_seq)
+                # 收集神经元的平均放电率 (需确保你的 LIF 类记录了该属性)
+            #    if hasattr(m, 'firing_rate'):
+            #        firing_rates.append(m.firing_rate)
+
             if args.TET:
+                #loss = criterion.TET_loss(
+                #    output, target, loss_fn, means=args.TET_means, lamb=args.TET_lamb,c_states=c_states,firing_rates=firing_rates
+                #)
                 loss = criterion.TET_loss(
                     output, target, loss_fn, means=args.TET_means, lamb=args.TET_lamb
                 )
             else:
+                #loss = loss_fn(output, target, c_states, firing_rates)
                 loss = loss_fn(output, target)
         sample_number += input.shape[0]
         #if not args.distributed:
@@ -1646,7 +1688,7 @@ def train_one_epoch(
         else:
             reduced_loss = loss.data
             
-        losses_m.update(reduced_loss.item(), input.size(0))
+        losses_m.update(reduced_loss.item(), input.size(0))                
 
         optimizer.zero_grad()
         if loss_scaler is not None:
@@ -1672,6 +1714,9 @@ def train_one_epoch(
             optimizer.step()
 
         functional.reset_net(model)
+        #for m in model.modules():
+        #    if hasattr(m, 'current_C_seq'):
+        #        m.current_C_seq = None # 显式释放计算图引用
         if model_ema is not None:
             model_ema.update(model)
             functional.reset_net(model_ema)
@@ -1762,8 +1807,8 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix="")
             if args.channels_last:
                 input = input.contiguous(memory_format=torch.channels_last)
 
-            with amp_autocast():
-                output = model(input,hook=dict())
+            with amp_autocast('cuda'):
+                output = model(input)
             if isinstance(output, (tuple, list)):
                 output = output[0]
             if args.TET:
@@ -1779,6 +1824,9 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix="")
                 print(target)
             loss = loss_fn(output, target)
             functional.reset_net(model)
+            #for m in model.modules():
+            #    if hasattr(m, 'current_C_seq'):
+            #        m.current_C_seq = None # 显式释放计算图引用
 
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
 
