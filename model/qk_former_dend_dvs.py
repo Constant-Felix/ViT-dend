@@ -493,7 +493,7 @@ class vit_snn(nn.Module):
                  img_size_h=128, img_size_w=128, patch_size=16, in_channels=2, num_classes=11,
                  embed_dims=[64, 128, 256], num_heads=[1, 2, 4], mlp_ratios=[4, 4, 4], qkv_bias=False, qk_scale=None,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0., norm_layer=nn.LayerNorm,
-                 depths=[6, 8, 6], sr_ratios=[8, 4, 2], T=4, pretrained_cfg=None, pretrained_cfg_overlay=False, no_weight_decay = None, dend=False,integer=False,num_compartment=2,multi=False,sps_integer=False,bn_alter=False,TET=False,soma_astro=False
+                 depths=[6, 8, 6], sr_ratios=[8, 4, 2], T=4, pretrained_cfg=None, pretrained_cfg_overlay=False, no_weight_decay = None, dend=False,integer=False,num_compartment=2,multi=False,sps_integer=False,concat=False,bn_alter=False,TET=False,soma_astro=False
                  ):
         super().__init__()
         self.num_classes = num_classes

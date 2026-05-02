@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from spikingjelly.activation_based import neuron
 from spikingjelly.activation_based import surrogate
+from spikingjelly.activation_based.base import MemoryModule
 
 
 class BaseSoma(neuron.BaseNode):
@@ -83,7 +84,7 @@ def expand_tensor_cumulative(tensor, max_value=4):
     return binary
 
 
-class AstroSomaMixin:
+class AstroSomaMixin(MemoryModule):
     """Shared soma-side astrocyte state for spike-driven modulation."""
 
     def _init_astro_state(
@@ -103,7 +104,7 @@ class AstroSomaMixin:
         astro_trace_decay = torch.clamp(astro_trace_decay, 1e-3, 1.0 - 1e-3)
         self.astro_lambda_logit = nn.Parameter(torch.logit(astro_lambda))
         self.astro_trace_decay_logit = nn.Parameter(torch.logit(astro_trace_decay))
-        self.astro_gain = nn.Parameter(torch.tensor(astro_gain, dtype=torch.float32),requires_grad=False)
+        self.astro_gain = nn.Parameter(torch.tensor(astro_gain, dtype=torch.float32))
         self.astro_bias_gain = nn.Parameter(torch.tensor(astro_bias_gain, dtype=torch.float32))
         self.astro_spike_scale = float(astro_spike_scale)
         self.astro_pool_kernel = int(astro_pool_kernel)
