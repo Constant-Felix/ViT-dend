@@ -90,7 +90,7 @@ class AstroSomaMixin:
         self,
         astro_lambda: float = 0.1,
         astro_trace_decay: float = 0.9,
-        astro_gain: float = 0.1,
+        astro_gain: float = 1.0,
         astro_bias_gain: float = 0.0,
         astro_spike_scale: float = 1.0,
         astro_pool_kernel: int = 3,
@@ -103,7 +103,7 @@ class AstroSomaMixin:
         astro_trace_decay = torch.clamp(astro_trace_decay, 1e-3, 1.0 - 1e-3)
         self.astro_lambda_logit = nn.Parameter(torch.logit(astro_lambda))
         self.astro_trace_decay_logit = nn.Parameter(torch.logit(astro_trace_decay))
-        self.astro_gain = nn.Parameter(torch.tensor(astro_gain, dtype=torch.float32))
+        self.astro_gain = nn.Parameter(torch.tensor(astro_gain, dtype=torch.float32),requires_grad=False)
         self.astro_bias_gain = nn.Parameter(torch.tensor(astro_bias_gain, dtype=torch.float32))
         self.astro_spike_scale = float(astro_spike_scale)
         self.astro_pool_kernel = int(astro_pool_kernel)
@@ -396,7 +396,7 @@ class AstroIntergerSoma(IntergerSoma, AstroSomaMixin):
         decay_input: bool = True, step_mode='m', backend='torch', thre=4,
         surrogate_function: Callable = surrogate.Sigmoid(),
         astro_lambda: float = 0.1, astro_trace_decay: float = 0.9,
-        astro_gain: float = 0.1, astro_bias_gain: float = 0.0,
+        astro_gain: float = 1.0, astro_bias_gain: float = 0.0,
         astro_pool_kernel: int = 3, astro_pool_mode: str = "avg",
         store_c_seq: bool = False,
     ):
@@ -457,7 +457,7 @@ class AstroIntergerSoma_ssf(IntergerSoma_ssf, AstroSomaMixin):
         decay_input: bool = True, step_mode='m', backend='torch', thre=4,
         surrogate_function: Callable = surrogate.Sigmoid(),
         astro_lambda: float = 0.1, astro_trace_decay: float = 0.9,
-        astro_gain: float = 0.1, astro_bias_gain: float = 0.0,
+        astro_gain: float = 1.0, astro_bias_gain: float = 0.0,
         astro_pool_kernel: int = 3, astro_pool_mode: str = "avg",
         store_c_seq: bool = False,
     ):
@@ -883,7 +883,7 @@ class AstroLIFSoma(LIFSoma, AstroSomaMixin):
         backend: str = "torch",
         store_v_seq: bool = False, store_v_pre_spike: bool = False,
         astro_lambda: float = 0.1, astro_trace_decay: float = 0.9,
-        astro_gain: float = 0.1, astro_bias_gain: float = 0.0,
+        astro_gain: float = 1.0, astro_bias_gain: float = 0.0,
         astro_pool_kernel: int = 3, astro_pool_mode: str = "avg",
         store_c_seq: bool = False,
     ):
