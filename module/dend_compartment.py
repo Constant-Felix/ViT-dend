@@ -966,6 +966,171 @@ class AdvancedNGCUDendCompartment(BaseDendCompartment):
 
 
 
+class PureMultiScaleDendCompartment(BaseDendCompartment):
+    """Multi-branch dendritic integrator without astrocyte modulation.
+
+    This class keeps the dendritic part of :class:`AdvancedNGCUDendCompartment`:
+    independent branch time constants, causal passive integration, optional
+    branch normalization, and optional branch output gating. It intentionally
+    does not maintain a glial state and does not generate gain/bias modulation.
+    """
+
+    def __init__(
+        self,
+        num_branches,
+        c_sub=1,
+        init_tau=[1.2, 5.0],
+        soma_dim=3,
+        decay_input: bool = True,
+        bn=True,
+        res=False,
+        v_rest: float = 0.0,
+        step_mode: str = "m",
+        store_v_seq: bool = False,
+        no_filter=False,
+        last_sigmoid=True,
+        last_tanh=False,
+    ):
+        super().__init__(v_rest, step_mode, store_v_seq)
+        self.soma_dim = soma_dim
+        self.bn = bn
+        self.res = res
+        self.no_filter = no_filter
+        self.last_sigmoid = last_sigmoid
+        self.last_tanh = last_tanh
+        self.c_sub = c_sub
+        self.num_branches = num_branches
+        self.decay_input = decay_input
+        self.v_rest = v_rest
+        self.skip_weight = nn.Parameter(torch.tensor(0.01))
+
+        if init_tau is None:
+            tau_data = torch.linspace(2.0, 10.0, steps=num_branches)
+        elif isinstance(init_tau, (float, int)):
+            tau_data = torch.full((num_branches,), float(init_tau))
+        else:
+            tau_data = torch.as_tensor(init_tau, dtype=torch.float32)
+        if tau_data.numel() != num_branches:
+            if tau_data.numel() == 2:
+                tau_data = torch.linspace(float(tau_data[0]), float(tau_data[-1]), steps=num_branches)
+            else:
+                raise ValueError("init_tau must be scalar, length 2, or match num_branches")
+        self.tau_branches = nn.Parameter(tau_data.clone().detach().float())
+
+        if self.bn:
+            self.branch_bn = nn.BatchNorm2d(self.c_sub, affine=True, momentum=0.1) if self.soma_dim == 3 else nn.BatchNorm1d(self.c_sub, affine=True, momentum=0.1)
+            nn.init.constant_(self.branch_bn.weight, 1.0)
+            nn.init.constant_(self.branch_bn.bias, 0.0)
+            if last_sigmoid or last_tanh:
+                if self.soma_dim == 3:
+                    self.gate_alpha = nn.Parameter(torch.ones(1, 1, 1, 1, 1, num_branches))
+                    self.gate_beta = nn.Parameter(torch.zeros(1, 1, 1, 1, 1, num_branches))
+                else:
+                    self.gate_alpha = nn.Parameter(torch.ones(1, 1, 1, 1, num_branches))
+                    self.gate_beta = nn.Parameter(torch.zeros(1, 1, 1, 1, num_branches))
+        else:
+            if last_sigmoid or last_tanh:
+                self.gate_scale = nn.Parameter(torch.tensor(1.0))
+                self.gate_beta2 = nn.Parameter(torch.tensor(0.0))
+
+    def _build_tau_terms(self, T: int, device, dtype):
+        tau = torch.clamp(self.tau_branches, min=1.0 + 1e-5)
+        a = 1.0 - 1.0 / tau
+        t = torch.arange(T, device=device, dtype=dtype)
+        i = t[:, None]
+        j = t[None, :]
+        diff = i - j
+        mask = diff >= 0
+        tau_matrix = torch.zeros((len(tau), T, T), device=device, dtype=dtype)
+        for n in range(len(tau)):
+            tau_matrix[n] = tau_matrix[n].masked_scatter(mask, (a[n] ** diff[mask]).to(dtype))
+        tau_vec_init = a.unsqueeze(1) ** (t + 1.0)
+        tau_vec_rest = 1.0 - tau_vec_init
+        return tau_matrix, tau_vec_init, tau_vec_rest, tau
+
+    def single_step_forward(self, x: torch.Tensor):
+        tau = torch.clamp(self.tau_branches, min=1.0 + 1e-3)
+        if isinstance(self.v, float):
+            self.v = torch.full_like(x, self.v)
+
+        view_shape = [1] * x.dim()
+        view_shape[-1] = self.num_branches
+        tau = tau.view(*view_shape)
+        if self.decay_input:
+            v = self.v + (x - (self.v - self.v_rest)) / tau
+        else:
+            v = self.v - (self.v - self.v_rest) / tau + x
+        self.v = v.detach()
+        return v
+
+    def multi_step_forward(self, x_seq: torch.Tensor):
+        if self.soma_dim == 3:
+            T, B, C_sub, H, W, N = x_seq.shape
+        else:
+            T, B, C_sub, H, N = x_seq.shape
+
+        device, dtype = x_seq.device, x_seq.dtype
+        dend_input = x_seq
+
+        if not self.no_filter:
+            tau_matrix, tau_vec_init, tau_vec_rest, tau = self._build_tau_terms(T, device, dtype)
+            if self.decay_input:
+                div_tau = tau.view(1, 1, 1, 1, 1, N) if self.soma_dim == 3 else tau.view(1, 1, 1, 1, N)
+                dend_input = dend_input / div_tau
+
+            y_branches = []
+            for n in range(self.num_branches):
+                x_n = dend_input[..., n].reshape(T, -1)
+                y_n_flat = torch.matmul(tau_matrix[n], x_n)
+                y_n = y_n_flat.view(T, B, C_sub, H, W) if self.soma_dim == 3 else y_n_flat.view(T, B, C_sub, H)
+
+                t_init = tau_vec_init[n].view(T, 1, 1, 1, 1) if self.soma_dim == 3 else tau_vec_init[n].view(T, 1, 1, 1)
+                t_rest = tau_vec_rest[n].view(T, 1, 1, 1, 1) if self.soma_dim == 3 else tau_vec_rest[n].view(T, 1, 1, 1)
+                v_in = self.v[..., n].detach().unsqueeze(0) if isinstance(self.v, torch.Tensor) else self.v
+                y_n = y_n + (t_init * v_in) + (t_rest * self.v_rest)
+                y_branches.append(y_n)
+
+            y = torch.stack(y_branches, dim=-1)
+        else:
+            y = dend_input
+
+        if self.store_v_seq:
+            self.v_seq = y
+        self.v = y[-1].detach()
+
+        if self.bn:
+            if self.soma_dim == 3:
+                y_permuted = y.permute(0, 1, 5, 2, 3, 4).contiguous()
+                y_reshaped = y_permuted.view(T * B, N * C_sub, H, W)
+                y_normed = self.branch_bn(y_reshaped).view(T, B, N, C_sub, H, W)
+                y_out = y_normed.permute(0, 1, 3, 4, 5, 2).contiguous()
+            else:
+                y_permuted = y.permute(0, 1, 4, 2, 3).contiguous()
+                y_reshaped = y_permuted.view(T * B, N * C_sub, H)
+                y_normed = self.branch_bn(y_reshaped).view(T, B, N, C_sub, H)
+                y_out = y_normed.permute(0, 1, 3, 4, 2).contiguous()
+
+            if self.last_sigmoid:
+                gate = torch.sigmoid(self.gate_alpha * y_out + self.gate_beta)
+                y_out = y_out * gate
+            if self.last_tanh:
+                gate = torch.tanh(self.gate_alpha * y_out + self.gate_beta)
+                y_out = y_out * gate
+        else:
+            y_out = y
+            if self.last_sigmoid:
+                gate = torch.sigmoid(self.gate_scale * y_out + self.gate_beta2)
+                y_out = y_out * gate
+            if self.last_tanh:
+                gate = torch.tanh(self.gate_scale * y_out + self.gate_beta2)
+                y_out = y_out * gate
+
+        if self.res:
+            y_out = y_out + self.skip_weight * x_seq
+
+        return y_out
+
+
 class PAComponentDendCompartment(BaseDendCompartment):
     """Dendritic compartment with passive and active voltage components.
 

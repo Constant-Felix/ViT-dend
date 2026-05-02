@@ -10,9 +10,27 @@ from timm.models import create_model
 from module import dendrite,dend_compartment,soma,neuron,wiring
 
 
+def _make_dend_compartment(c_sub, num_compartment, multi=False, soma_astro=False):
+    if soma_astro:
+        return dend_compartment.PureMultiScaleDendCompartment(
+            num_compartment, step_mode='m', c_sub=c_sub
+        )
+    if multi == False:
+        return dend_compartment.PassiveDendCompartment(step_mode="m")
+    return dend_compartment.AdvancedNGCUDendCompartment(
+        num_compartment, step_mode='m', c_sub=c_sub
+    )
+
+
+def _make_soma(integer=False, soma_astro=False):
+    if soma_astro:
+        return soma.AstroIntergerSoma(step_mode='m') if integer else soma.AstroLIFSoma(step_mode='m')
+    return soma.IntergerSoma(step_mode='m') if integer else soma.LIFSoma(step_mode='m')
+
+
 class Token_dend_QK_Attention(nn.Module):   ###改成conv2d
     def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0., sr_ratio=1,dend=False,integer=False,concat=False,
-                 num_compartment=2,multi=False,bn_alter=False):
+                 num_compartment=2,multi=False,bn_alter=False,soma_astro=False):
         super().__init__()
         assert dim % num_heads == 0, f"dim {dim} should be divided by num_heads {num_heads}."
         self.concat = concat
@@ -26,16 +44,10 @@ class Token_dend_QK_Attention(nn.Module):   ###改成conv2d
         if dend==False:
             self.q_lif = MultiStepLIFNode(tau=2.0, detach_reset=True, backend='cupy')
         else:
-            if multi==False:
-                self.dc1 = dend_compartment.PassiveDendCompartment(step_mode="m")
-            else:
-                self.dc1 = dend_compartment.AdvancedNGCUDendCompartment(num_compartment,step_mode='m',c_sub=dim*num_compartment)    
+            self.dc1 = _make_dend_compartment(dim*num_compartment, num_compartment, multi=multi, soma_astro=soma_astro)
             self.wr1 = wiring.SegregatedDendWiring(num_compartment)
             self.dend1 = dendrite.SegregatedDend(step_mode='m',compartment=self.dc1,wiring=self.wr1)
-            if integer == False:
-                self.soma1 = soma.LIFSoma(step_mode='m')
-            else:
-                self.soma1 = soma.IntergerSoma(step_mode='m')
+            self.soma1 = _make_soma(integer=integer, soma_astro=soma_astro)
             if self.concat == False:    
                 self.q_lif = neuron.VActivationForwardDendNeuron(dend=self.dend1,soma=self.soma1,f_da=self.f_da,soma_shape=np.zeros((3,),int),forward_strength_learnable=True)
             else:
@@ -47,16 +59,10 @@ class Token_dend_QK_Attention(nn.Module):   ###改成conv2d
         if dend==False:
             self.k_lif = MultiStepLIFNode(tau=2.0, detach_reset=True, backend='cupy')
         else:
-            if multi==False:
-                self.dc2 = dend_compartment.PassiveDendCompartment(step_mode="m")
-            else:
-                self.dc2 = dend_compartment.AdvancedNGCUDendCompartment(num_compartment,step_mode='m',c_sub=dim*num_compartment)    
+            self.dc2 = _make_dend_compartment(dim*num_compartment, num_compartment, multi=multi, soma_astro=soma_astro)
             self.wr2 = wiring.SegregatedDendWiring(num_compartment)
             self.dend2 = dendrite.SegregatedDend(step_mode='m',compartment=self.dc2,wiring=self.wr2)
-            if integer == False:
-                self.soma2 = soma.LIFSoma(step_mode='m')
-            else:
-                self.soma2 = soma.IntergerSoma(step_mode='m')
+            self.soma2 = _make_soma(integer=integer, soma_astro=soma_astro)
             if self.concat == False:    
                 self.k_lif = neuron.VActivationForwardDendNeuron(dend=self.dend2,soma=self.soma2,f_da=self.f_da,soma_shape=np.zeros((3,),int),forward_strength_learnable=True)
             else:
@@ -73,16 +79,10 @@ class Token_dend_QK_Attention(nn.Module):   ###改成conv2d
         if dend==False:
             self.proj_lif = MultiStepLIFNode(tau=2.0, detach_reset=True, backend='cupy')
         else:
-            if multi==False:
-                self.dc3 = dend_compartment.PassiveDendCompartment(step_mode="m")
-            else:
-                self.dc3 = dend_compartment.AdvancedNGCUDendCompartment(num_compartment,step_mode='m',c_sub=dim*num_compartment)    
+            self.dc3 = _make_dend_compartment(dim*num_compartment, num_compartment, multi=multi, soma_astro=soma_astro)
             self.wr3 = wiring.SegregatedDendWiring(num_compartment)
             self.dend3 = dendrite.SegregatedDend(step_mode='m',compartment=self.dc3,wiring=self.wr3)
-            if integer == False:
-                self.soma3 = soma.LIFSoma(step_mode='m')
-            else:
-                self.soma3 = soma.IntergerSoma(step_mode='m')
+            self.soma3 = _make_soma(integer=integer, soma_astro=soma_astro)
             if self.concat == False:    
                 self.proj_lif = neuron.VActivationForwardDendNeuron(dend=self.dend3,soma=self.soma3,f_da=self.f_da,soma_shape=np.zeros((3,),int),forward_strength_learnable=True)
             else:
@@ -139,7 +139,7 @@ class Token_dend_QK_Attention(nn.Module):   ###改成conv2d
 
 class Spiking_dend_Self_Attention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0., sr_ratio=1,concat=False,
-                 dend=False,integer=False,num_compartment=2,multi=False,bn_alter=False):
+                 dend=False,integer=False,num_compartment=2,multi=False,bn_alter=False,soma_astro=False):
         
         super().__init__()
         assert dim % num_heads == 0, f"dim {dim} should be divided by num_heads {num_heads}."
@@ -156,16 +156,10 @@ class Spiking_dend_Self_Attention(nn.Module):
         if dend==False:
             self.q_lif = MultiStepLIFNode(tau=2.0, detach_reset=True, backend='cupy')
         else:
-            if multi==False:
-                self.dc1 = dend_compartment.PassiveDendCompartment(step_mode="m")
-            else:
-                self.dc1 = dend_compartment.AdvancedNGCUDendCompartment(num_compartment,step_mode='m',c_sub=dim*num_compartment)    
+            self.dc1 = _make_dend_compartment(dim*num_compartment, num_compartment, multi=multi, soma_astro=soma_astro)
             self.wr1 = wiring.SegregatedDendWiring(num_compartment)
             self.dend1 = dendrite.SegregatedDend(step_mode='m',compartment=self.dc1,wiring=self.wr1)
-            if integer == False:
-                self.soma1 = soma.LIFSoma(step_mode='m')
-            else:
-                self.soma1 = soma.IntergerSoma(step_mode='m')
+            self.soma1 = _make_soma(integer=integer, soma_astro=soma_astro)
             if self.concat == False:    
                 self.q_lif = neuron.VActivationForwardDendNeuron(dend=self.dend1,soma=self.soma1,f_da=self.f_da,soma_shape=np.zeros((3,),int),forward_strength_learnable=True)
             else:
@@ -177,16 +171,10 @@ class Spiking_dend_Self_Attention(nn.Module):
         if dend==False:
             self.k_lif = MultiStepLIFNode(tau=2.0, detach_reset=True, backend='cupy')
         else:
-            if multi==False:
-                self.dc2 = dend_compartment.PassiveDendCompartment(step_mode="m")
-            else:
-                self.dc2 = dend_compartment.AdvancedNGCUDendCompartment(num_compartment,step_mode='m',c_sub=dim*num_compartment)    
+            self.dc2 = _make_dend_compartment(dim*num_compartment, num_compartment, multi=multi, soma_astro=soma_astro)
             self.wr2 = wiring.SegregatedDendWiring(num_compartment)
             self.dend2 = dendrite.SegregatedDend(step_mode='m',compartment=self.dc2,wiring=self.wr2)
-            if integer == False:
-                self.soma2 = soma.LIFSoma(step_mode='m')
-            else:
-                self.soma2 = soma.IntergerSoma(step_mode='m')
+            self.soma2 = _make_soma(integer=integer, soma_astro=soma_astro)
             if self.concat == False:    
                 self.k_lif = neuron.VActivationForwardDendNeuron(dend=self.dend2,soma=self.soma2,f_da=self.f_da,soma_shape=np.zeros((3,),int),forward_strength_learnable=True)
             else:
@@ -198,16 +186,10 @@ class Spiking_dend_Self_Attention(nn.Module):
         if dend==False:
             self.v_lif = MultiStepLIFNode(tau=2.0, detach_reset=True, backend='cupy')
         else:
-            if multi==False:
-                self.dc3 = dend_compartment.PassiveDendCompartment(step_mode="m")
-            else:
-                self.dc3 = dend_compartment.AdvancedNGCUDendCompartment(num_compartment,step_mode='m',c_sub=dim*num_compartment)    
+            self.dc3 = _make_dend_compartment(dim*num_compartment, num_compartment, multi=multi, soma_astro=soma_astro)
             self.wr3 = wiring.SegregatedDendWiring(num_compartment)
             self.dend3 = dendrite.SegregatedDend(step_mode='m',compartment=self.dc3,wiring=self.wr3)
-            if integer == False:
-                self.soma3 = soma.LIFSoma(step_mode='m')
-            else:
-                self.soma3 = soma.IntergerSoma(step_mode='m')
+            self.soma3 = _make_soma(integer=integer, soma_astro=soma_astro)
             if self.concat == False:    
                 self.v_lif = neuron.VActivationForwardDendNeuron(dend=self.dend3,soma=self.soma3,f_da=self.f_da,soma_shape=np.zeros((3,),int),forward_strength_learnable=True)
             else:
@@ -224,16 +206,10 @@ class Spiking_dend_Self_Attention(nn.Module):
         if dend==False:
             self.proj_lif = MultiStepLIFNode(tau=2.0, detach_reset=True, backend='cupy')
         else:
-            if multi==False:
-                self.dc4 = dend_compartment.PassiveDendCompartment(step_mode="m")
-            else:
-                self.dc4 = dend_compartment.AdvancedNGCUDendCompartment(num_compartment,step_mode='m',c_sub=dim*num_compartment)    
+            self.dc4 = _make_dend_compartment(dim*num_compartment, num_compartment, multi=multi, soma_astro=soma_astro)
             self.wr4 = wiring.SegregatedDendWiring(num_compartment)
             self.dend4 = dendrite.SegregatedDend(step_mode='m',compartment=self.dc4,wiring=self.wr4)
-            if integer == False:
-                self.soma4 = soma.LIFSoma(step_mode='m')
-            else:
-                self.soma4 = soma.IntergerSoma(step_mode='m')
+            self.soma4 = _make_soma(integer=integer, soma_astro=soma_astro)
             if self.concat == False:    
                 self.proj_lif = neuron.VActivationForwardDendNeuron(dend=self.dend4,soma=self.soma4,f_da=self.f_da,soma_shape=np.zeros((3,),int),forward_strength_learnable=True)
             else:
@@ -300,7 +276,7 @@ class Spiking_dend_Self_Attention(nn.Module):
 
 class MLP(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, drop=0.,concat=False,
-                 dend = False,integer = False,multi = False,num_compartment=2,bn_alter=False):
+                 dend = False,integer = False,multi = False,num_compartment=2,bn_alter=False,soma_astro=False):
         super().__init__()
         self.f_da = lambda x:x
         out_features = out_features or in_features
@@ -315,16 +291,10 @@ class MLP(nn.Module):
         if dend==False:
             self.mlp1_lif = MultiStepLIFNode(tau=2.0, detach_reset=True, backend='cupy')
         else:
-            if multi==False:
-                self.dc1 = dend_compartment.PassiveDendCompartment(step_mode="m")
-            else:
-                self.dc1 = dend_compartment.AdvancedNGCUDendCompartment(num_compartment,step_mode='m',c_sub=hidden_features)    
+            self.dc1 = _make_dend_compartment(hidden_features, num_compartment, multi=multi, soma_astro=soma_astro)
             self.wr1 = wiring.SegregatedDendWiring(num_compartment)
             self.dend1 = dendrite.SegregatedDend(step_mode='m',compartment=self.dc1,wiring=self.wr1)
-            if integer == False:
-                self.soma1 = soma.LIFSoma(step_mode='m')
-            else:
-                self.soma1 = soma.IntergerSoma(step_mode='m')
+            self.soma1 = _make_soma(integer=integer, soma_astro=soma_astro)
             if self.concat == False:    
                 self.mlp1_lif = neuron.VActivationForwardDendNeuron(dend=self.dend1,soma=self.soma1,f_da=self.f_da,soma_shape=np.zeros((3,),int),forward_strength_learnable=True)
             else:
@@ -336,16 +306,10 @@ class MLP(nn.Module):
         if dend==False:
             self.mlp2_lif = MultiStepLIFNode(tau=2.0, detach_reset=True, backend='cupy')
         else:
-            if multi==False:
-                self.dc2 = dend_compartment.PassiveDendCompartment(step_mode="m")
-            else:
-                self.dc2 = dend_compartment.AdvancedNGCUDendCompartment(num_compartment,step_mode='m',c_sub=hidden_features*num_compartment)    
+            self.dc2 = _make_dend_compartment(hidden_features*num_compartment, num_compartment, multi=multi, soma_astro=soma_astro)
             self.wr2 = wiring.SegregatedDendWiring(num_compartment)
             self.dend2 = dendrite.SegregatedDend(step_mode='m',compartment=self.dc2,wiring=self.wr2)
-            if integer == False:
-                self.soma2 = soma.LIFSoma(step_mode='m')
-            else:
-                self.soma2 = soma.IntergerSoma(step_mode='m')
+            self.soma2 = _make_soma(integer=integer, soma_astro=soma_astro)
             if self.concat == False:    
                 self.mlp2_lif = neuron.VActivationForwardDendNeuron(dend=self.dend2,soma=self.soma2,f_da=self.f_da,soma_shape=np.zeros((3,),int),forward_strength_learnable=True)
             else:
@@ -381,12 +345,12 @@ class MLP(nn.Module):
 
 class TokenSpikingTransformer_dend(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., norm_layer=nn.LayerNorm, sr_ratio=1,dend=False,integer=False,num_compartment=2,multi=False,bn_alter=False,concat=False):
+                 drop_path=0., norm_layer=nn.LayerNorm, sr_ratio=1,dend=False,integer=False,num_compartment=2,multi=False,bn_alter=False,concat=False,soma_astro=False):
         super().__init__()
         self.tssa = Token_dend_QK_Attention(dim, num_heads,qkv_bias=qkv_bias,qk_scale=qk_scale,attn_drop=attn_drop,
-                                               proj_drop=drop_path,sr_ratio=sr_ratio, dend=dend,integer=integer,num_compartment=num_compartment,multi=multi,bn_alter=bn_alter,concat=concat)
+                                               proj_drop=drop_path,sr_ratio=sr_ratio, dend=dend,integer=integer,num_compartment=num_compartment,multi=multi,bn_alter=bn_alter,concat=concat,soma_astro=soma_astro)
         mlp_in_features = int(dim/num_compartment)
-        self.mlp = MLP(in_features= mlp_in_features, hidden_features=dim, drop=drop,dend=dend,integer=integer,num_compartment=num_compartment,multi=multi,bn_alter=bn_alter,concat=concat)
+        self.mlp = MLP(in_features= mlp_in_features, hidden_features=dim, drop=drop,dend=dend,integer=integer,num_compartment=num_compartment,multi=multi,bn_alter=bn_alter,concat=concat,soma_astro=soma_astro)
 
     def forward(self, x):
 
@@ -400,12 +364,12 @@ class TokenSpikingTransformer_dend(nn.Module):
 
 class SpikingTransformer_dend(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., norm_layer=nn.LayerNorm, sr_ratio=1,dend=False,integer=False,num_compartment=2,multi=False,bn_alter=False):
+                 drop_path=0., norm_layer=nn.LayerNorm, sr_ratio=1,dend=False,integer=False,num_compartment=2,multi=False,bn_alter=False,soma_astro=False):
         super().__init__()
         self.ssa = Spiking_dend_Self_Attention(dim, num_heads,qkv_bias=qkv_bias,qk_scale=qk_scale,attn_drop=attn_drop,
-                                               proj_drop=drop_path,sr_ratio=sr_ratio,dend=dend,integer=integer,num_compartment=num_compartment,multi=multi,bn_alter=bn_alter)
+                                               proj_drop=drop_path,sr_ratio=sr_ratio,dend=dend,integer=integer,num_compartment=num_compartment,multi=multi,bn_alter=bn_alter,soma_astro=soma_astro)
         mlp_in_features = int(dim/num_compartment)
-        self.mlp = MLP(in_features= mlp_in_features, hidden_features=dim, drop=drop,dend=dend,integer=integer,num_compartment=num_compartment,multi=multi,bn_alter=bn_alter)
+        self.mlp = MLP(in_features= mlp_in_features, hidden_features=dim, drop=drop,dend=dend,integer=integer,num_compartment=num_compartment,multi=multi,bn_alter=bn_alter,soma_astro=soma_astro)
 
     def forward(self, x):
 
@@ -532,7 +496,7 @@ class spiking_transformer_dend(nn.Module):
                  img_size_h=128, img_size_w=128, patch_size=16, in_channels=2, num_classes=11,
                  embed_dims=[64, 128, 256], num_heads=[8, 8, 8], mlp_ratios=[4, 4, 4], qkv_bias=False, qk_scale=None,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0., norm_layer=nn.LayerNorm,
-                 depths=[6, 8, 6], sr_ratios=[8, 4, 2], T=4, pretrained_cfg=None,dend=False,integer=False,num_compartment=2,multi=False,sps_integer=False,bn_alter=False,pretrained_cfg_overlay=False,catch_dir=False,**kwargs
+                 depths=[6, 8, 6], sr_ratios=[8, 4, 2], T=4, pretrained_cfg=None,dend=False,integer=False,num_compartment=2,multi=False,sps_integer=False,bn_alter=False,soma_astro=False,pretrained_cfg_overlay=False,catch_dir=False,**kwargs
                  ):
         super().__init__()
         self.num_classes = num_classes
@@ -551,7 +515,7 @@ class spiking_transformer_dend(nn.Module):
         stage1 = nn.ModuleList([TokenSpikingTransformer_dend(
             dim=embed_dims // 4, num_heads=num_heads[0], mlp_ratio=mlp_ratios, qkv_bias=qkv_bias,
             qk_scale=qk_scale, drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[j],
-            norm_layer=norm_layer, sr_ratio=sr_ratios,dend=dend,integer=integer,num_compartment=num_compartment,multi=multi,bn_alter=bn_alter)
+            norm_layer=norm_layer, sr_ratio=sr_ratios,dend=dend,integer=integer,num_compartment=num_compartment,multi=multi,bn_alter=bn_alter,soma_astro=soma_astro)
             for j in range(1)])
 
         patch_embed2 = PatchEmbeddingStage(img_size_h=img_size_h,
@@ -563,7 +527,7 @@ class spiking_transformer_dend(nn.Module):
         stage2 = nn.ModuleList([TokenSpikingTransformer_dend(
             dim=embed_dims // 2, num_heads=num_heads[1], mlp_ratio=mlp_ratios, qkv_bias=qkv_bias,
             qk_scale=qk_scale, drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[j],
-            norm_layer=norm_layer, sr_ratio=sr_ratios,dend=dend,integer=integer,num_compartment=num_compartment,multi=multi,bn_alter=bn_alter)
+            norm_layer=norm_layer, sr_ratio=sr_ratios,dend=dend,integer=integer,num_compartment=num_compartment,multi=multi,bn_alter=bn_alter,soma_astro=soma_astro)
             for j in range(1)])
 
         patch_embed3 = PatchEmbeddingStage(img_size_h=img_size_h,
@@ -575,7 +539,7 @@ class spiking_transformer_dend(nn.Module):
         stage3 = nn.ModuleList([SpikingTransformer_dend(
             dim=embed_dims, num_heads=num_heads[2], mlp_ratio=mlp_ratios, qkv_bias=qkv_bias,
             qk_scale=qk_scale, drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[j],
-            norm_layer=norm_layer, sr_ratio=sr_ratios,dend=dend,integer=integer,num_compartment=num_compartment,multi=multi,bn_alter=bn_alter)
+            norm_layer=norm_layer, sr_ratio=sr_ratios,dend=dend,integer=integer,num_compartment=num_compartment,multi=multi,bn_alter=bn_alter,soma_astro=soma_astro)
             for j in range(depths - 2)])
 
         setattr(self, f"patch_embed1", patch_embed1)

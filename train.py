@@ -806,6 +806,12 @@ parser.add_argument(
     action="store_true"
 )
 parser.add_argument(
+    "--soma_astro",
+    default=False,
+    action="store_true",
+    help="move astrocyte modulation from dendrite compartment to soma for dend QKFormer models",
+)
+parser.add_argument(
     "--concat",
     default=False,
     action="store_true"
@@ -1028,6 +1034,15 @@ def main():
     if args.dataset in ["cifar10-dvs-tet", "cifar10-dvs"]:
         args.dvs_mode = True
 
+    qkformer_extra_kwargs = {}
+    if args.soma_astro:
+        supported_soma_astro = {"QKFormer_dend", "QKFormer_dend_dvs"}
+        if (not args.dend) or (not args.qkformer) or args.model not in supported_soma_astro:
+            raise ValueError(
+                "--soma_astro is currently wired for dend QKFormer_dend and QKFormer_dend_dvs runs"
+            )
+        qkformer_extra_kwargs["soma_astro"] = True
+
     if args.dend == False:
         if args.qkformer == False:
             model = create_model(
@@ -1115,9 +1130,10 @@ def main():
                 multi = args.multi,
                 sps_integer = args.sps_integer,
                 bn_alter = args.bn_alter,
-                concat = args.concat
+                concat = args.concat,
+                **qkformer_extra_kwargs
             )  
-        print(f"compartment: {args.num_compartment}, dim: {args.dim}")
+        print(f"compartment: {args.num_compartment}, dim: {args.dim}, soma_astro: {args.soma_astro}")
         #print(f"model's in_channel is {model.in_channels}")        
     if args.local_rank == 0:
         _logger.info(f"Creating model {args.model}")

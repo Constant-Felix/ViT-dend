@@ -1,6 +1,7 @@
 from typing import Callable
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from spikingjelly.activation_based import neuron
 from spikingjelly.activation_based import surrogate
 
@@ -80,6 +81,109 @@ def expand_tensor_cumulative(tensor, max_value=4):
     binary = binary.permute(1, 0, 2, 3, 4, 5).reshape(T * max_value, B, C, H, W)
 
     return binary
+
+
+class AstroSomaMixin:
+    """Shared soma-side astrocyte state for spike-driven modulation."""
+
+    def _init_astro_state(
+        self,
+        astro_lambda: float = 0.1,
+        astro_trace_decay: float = 0.9,
+        astro_gain: float = 0.1,
+        astro_bias_gain: float = 0.0,
+        astro_spike_scale: float = 1.0,
+        astro_pool_kernel: int = 3,
+        astro_pool_mode: str = "avg",
+        store_c_seq: bool = False,
+    ):
+        astro_lambda = torch.as_tensor(astro_lambda, dtype=torch.float32)
+        astro_lambda = torch.clamp(astro_lambda, 1e-3, 1.0 - 1e-3)
+        astro_trace_decay = torch.as_tensor(astro_trace_decay, dtype=torch.float32)
+        astro_trace_decay = torch.clamp(astro_trace_decay, 1e-3, 1.0 - 1e-3)
+        self.astro_lambda_logit = nn.Parameter(torch.logit(astro_lambda))
+        self.astro_trace_decay_logit = nn.Parameter(torch.logit(astro_trace_decay))
+        self.astro_gain = nn.Parameter(torch.tensor(astro_gain, dtype=torch.float32))
+        self.astro_bias_gain = nn.Parameter(torch.tensor(astro_bias_gain, dtype=torch.float32))
+        self.astro_spike_scale = float(astro_spike_scale)
+        self.astro_pool_kernel = int(astro_pool_kernel)
+        self.astro_pool_mode = astro_pool_mode
+        self.register_memory("c", 0.0)
+        self.register_memory("astro_trace", 0.0)
+        self.store_c_seq = store_c_seq
+
+    @property
+    def store_c_seq(self) -> bool:
+        return self._store_c_seq
+
+    @store_c_seq.setter
+    def store_c_seq(self, val: bool):
+        self._store_c_seq = val
+        if val and (not hasattr(self, "c_seq")):
+            self.register_memory("c_seq", None)
+
+    def c_float_to_tensor(self, x: torch.Tensor):
+        if isinstance(self.c, float):
+            self.c = torch.zeros_like(x)
+        if isinstance(self.astro_trace, float):
+            self.astro_trace = torch.zeros_like(x)
+
+    def astro_decode(self):
+        c = torch.tanh(self.c)
+        gain = 1.0 + self.astro_gain * c
+        bias = self.astro_bias_gain * c
+        return gain, bias
+
+    def astro_modulate_membrane(self, membrane: torch.Tensor):
+        gain, bias = self.astro_decode()
+        return gain * membrane + bias
+
+    def astro_pool_spike(self, spike: torch.Tensor):
+        scale = max(self.astro_spike_scale, 1.0)
+        activity = torch.clamp(spike / scale, min=0.0, max=1.0)
+        kernel = self.astro_pool_kernel
+        if kernel <= 1:
+            return activity
+
+        padding = kernel // 2
+        if activity.dim() >= 4:
+            if self.astro_pool_mode == "max":
+                return F.max_pool2d(activity, kernel_size=kernel, stride=1, padding=padding)
+            return F.avg_pool2d(
+                activity, kernel_size=kernel, stride=1,
+                padding=padding, count_include_pad=False
+            )
+        if activity.dim() == 3:
+            if self.astro_pool_mode == "max":
+                return F.max_pool1d(activity, kernel_size=kernel, stride=1, padding=padding)
+            return F.avg_pool1d(
+                activity, kernel_size=kernel, stride=1,
+                padding=padding, count_include_pad=False
+            )
+        return activity
+
+    def astro_update(self, spike: torch.Tensor):
+        pooled_spike = self.astro_pool_spike(spike)
+        if isinstance(self.astro_trace, float):
+            self.astro_trace = torch.zeros_like(pooled_spike)
+        trace_decay = torch.sigmoid(self.astro_trace_decay_logit)
+        self.astro_trace = trace_decay * self.astro_trace + pooled_spike
+        write = torch.tanh(self.astro_trace)
+        lam = torch.sigmoid(self.astro_lambda_logit)
+        self.c = (1.0 - lam) * self.c + lam * write
+        return self.c
+
+    def reset_astro_state(self):
+        self.c = 0.0
+        self.astro_trace = 0.0
+        if hasattr(self, "c_seq"):
+            self.c_seq = None
+
+    def detach_astro_state(self):
+        if isinstance(self.c, torch.Tensor):
+            self.c = self.c.detach()
+        if isinstance(self.astro_trace, torch.Tensor):
+            self.astro_trace = self.astro_trace.detach()
 
 class MultiSpike8(nn.Module):
 
@@ -280,6 +384,128 @@ class IntergerSoma_ssf(neuron.BaseNode): # 假设基于 SpikingJelly 或类似�
             mem_old = mem.clone()
             output[i] = spike
             
+        return output
+
+
+class AstroIntergerSoma(IntergerSoma, AstroSomaMixin):
+    """Integer soma with spike-driven astrocyte modulation on membrane."""
+
+    def __init__(
+        self, tau: float = 2.,
+        v_threshold: float = 1., v_reset: float = 0., detach_reset: bool = False,
+        decay_input: bool = True, step_mode='m', backend='torch', thre=4,
+        surrogate_function: Callable = surrogate.Sigmoid(),
+        astro_lambda: float = 0.1, astro_trace_decay: float = 0.9,
+        astro_gain: float = 0.1, astro_bias_gain: float = 0.0,
+        astro_pool_kernel: int = 3, astro_pool_mode: str = "avg",
+        store_c_seq: bool = False,
+    ):
+        super().__init__(
+            tau=tau, v_threshold=v_threshold, v_reset=v_reset,
+            detach_reset=detach_reset, decay_input=decay_input,
+            step_mode=step_mode, backend=backend, thre=thre,
+            surrogate_function=surrogate_function,
+        )
+        self._init_astro_state(
+            astro_lambda=astro_lambda,
+            astro_trace_decay=astro_trace_decay,
+            astro_gain=astro_gain,
+            astro_bias_gain=astro_bias_gain,
+            astro_spike_scale=float(thre),
+            astro_pool_kernel=astro_pool_kernel,
+            astro_pool_mode=astro_pool_mode,
+            store_c_seq=store_c_seq,
+        )
+
+    def multi_step_forward(self, x: torch.Tensor):
+        self.c_float_to_tensor(x[0])
+        spike = torch.zeros_like(x[0]).to(x.device)
+        output = torch.zeros_like(x)
+        mem_old = 0
+        c_seq = [] if self.store_c_seq else None
+        tau = torch.clamp(self.tau, min=1 + 1e-3)
+
+        for i in range(x.shape[0]):
+            if i >= 1:
+                if self.decay_input == False:
+                    mem = (mem_old - spike.detach()) / tau + x[i]
+                else:
+                    mem = (mem_old - spike.detach()) / tau + x[i] * (1 - 1 / tau)
+            else:
+                mem = x[i]
+            mem = self.astro_modulate_membrane(mem)
+            spike = self.qtrick(mem)
+            self.astro_update(spike)
+            if self.store_c_seq:
+                c_seq.append(self.c)
+
+            mem_old = mem.clone()
+            output[i] = spike
+
+        self.v = mem_old.detach()
+        if self.store_c_seq:
+            self.c_seq = torch.stack(c_seq)
+        return output
+
+
+class AstroIntergerSoma_ssf(IntergerSoma_ssf, AstroSomaMixin):
+    """SSF integer soma with spike-driven astrocyte modulation on membrane."""
+
+    def __init__(
+        self, tau: float = 2.,
+        v_threshold: float = 1., v_reset: float = 0., detach_reset: bool = False,
+        decay_input: bool = True, step_mode='m', backend='torch', thre=4,
+        surrogate_function: Callable = surrogate.Sigmoid(),
+        astro_lambda: float = 0.1, astro_trace_decay: float = 0.9,
+        astro_gain: float = 0.1, astro_bias_gain: float = 0.0,
+        astro_pool_kernel: int = 3, astro_pool_mode: str = "avg",
+        store_c_seq: bool = False,
+    ):
+        super().__init__(
+            tau=tau, v_threshold=v_threshold, v_reset=v_reset,
+            detach_reset=detach_reset, decay_input=decay_input,
+            step_mode=step_mode, backend=backend, thre=thre,
+            surrogate_function=surrogate_function,
+        )
+        self._init_astro_state(
+            astro_lambda=astro_lambda,
+            astro_trace_decay=astro_trace_decay,
+            astro_gain=astro_gain,
+            astro_bias_gain=astro_bias_gain,
+            astro_spike_scale=float(thre),
+            astro_pool_kernel=astro_pool_kernel,
+            astro_pool_mode=astro_pool_mode,
+            store_c_seq=store_c_seq,
+        )
+
+    def multi_step_forward(self, x: torch.Tensor):
+        self.c_float_to_tensor(x[0])
+        spike = torch.zeros_like(x[0]).to(x.device)
+        output = torch.zeros_like(x)
+        mem_old = 0
+        c_seq = [] if self.store_c_seq else None
+        tau = torch.clamp(self.tau, min=1 + 1e-3)
+
+        for i in range(x.shape[0]):
+            if i >= 1:
+                if self.decay_input == False:
+                    mem = mem_old / tau + x[i]
+                else:
+                    mem = mem_old / tau + x[i] * (1 - 1 / tau)
+            else:
+                mem = x[i]
+            mem = self.astro_modulate_membrane(mem)
+            spike = self.qtrick(mem)
+            self.astro_update(spike)
+            if self.store_c_seq:
+                c_seq.append(self.c)
+
+            mem_old = mem.clone()
+            output[i] = spike
+
+        self.v = mem_old.detach()
+        if self.store_c_seq:
+            self.c_seq = torch.stack(c_seq)
         return output
 
 class LIFSoma(BaseSoma):
@@ -640,6 +866,83 @@ class LIFSoma(BaseSoma):
             if self.store_v_pre_spike:
                 self.v_pre_spike = v_pre_spike_seq
             return spike_seq
+
+
+class AstroLIFSoma(LIFSoma, AstroSomaMixin):
+    """LIF soma with spike-driven astrocyte state.
+
+    The previous astro state modulates the current membrane, while the
+    current spike updates the astro state for future time steps.
+    """
+
+    def __init__(
+        self, tau: float = 2., decay_input: bool = True,
+        v_threshold: float = 1., v_reset: float = 0.,
+        surrogate_function: Callable = surrogate.Sigmoid(),
+        detach_reset: bool = False, step_mode: str = "s",
+        backend: str = "torch",
+        store_v_seq: bool = False, store_v_pre_spike: bool = False,
+        astro_lambda: float = 0.1, astro_trace_decay: float = 0.9,
+        astro_gain: float = 0.1, astro_bias_gain: float = 0.0,
+        astro_pool_kernel: int = 3, astro_pool_mode: str = "avg",
+        store_c_seq: bool = False,
+    ):
+        super().__init__(
+            tau=tau, decay_input=decay_input, v_threshold=v_threshold,
+            v_reset=v_reset, surrogate_function=surrogate_function,
+            detach_reset=detach_reset, step_mode=step_mode, backend=backend,
+            store_v_seq=store_v_seq, store_v_pre_spike=store_v_pre_spike,
+        )
+        self._init_astro_state(
+            astro_lambda=astro_lambda,
+            astro_trace_decay=astro_trace_decay,
+            astro_gain=astro_gain,
+            astro_bias_gain=astro_bias_gain,
+            astro_spike_scale=1.0,
+            astro_pool_kernel=astro_pool_kernel,
+            astro_pool_mode=astro_pool_mode,
+            store_c_seq=store_c_seq,
+        )
+
+    def _single_step_forward(self, x: torch.Tensor):
+        self.v_float_to_tensor(x)
+        self.c_float_to_tensor(x)
+        self.neuronal_charge(x)
+        self.v = self.astro_modulate_membrane(self.v)
+        v_pre_spike = self.v
+        spike = self.neuronal_fire()
+        self.neuronal_reset(spike)
+        self.astro_update(spike)
+        return spike, v_pre_spike, self.c
+
+    def single_step_forward(self, x: torch.Tensor):
+        spike, v_pre_spike, _ = self._single_step_forward(x)
+        if self.store_v_pre_spike:
+            self.v_pre_spike = v_pre_spike
+        return spike
+
+    def multi_step_forward(self, x_seq: torch.Tensor):
+        T = x_seq.shape[0]
+        y_seq = []
+        v_pre_spike_seq = [] if self.store_v_pre_spike else None
+        v_seq = [] if self.store_v_seq else None
+        c_seq = [] if self.store_c_seq else None
+        for t in range(T):
+            y, v_pre_spike, c = self._single_step_forward(x_seq[t])
+            y_seq.append(y)
+            if self.store_v_pre_spike:
+                v_pre_spike_seq.append(v_pre_spike)
+            if self.store_v_seq:
+                v_seq.append(self.v)
+            if self.store_c_seq:
+                c_seq.append(c)
+        if self.store_v_seq:
+            self.v_seq = torch.stack(v_seq)
+        if self.store_v_pre_spike:
+            self.v_pre_spike = torch.stack(v_pre_spike_seq)
+        if self.store_c_seq:
+            self.c_seq = torch.stack(c_seq)
+        return torch.stack(y_seq)
 
 
 class IFSoma(BaseSoma):
