@@ -294,12 +294,13 @@ class vit_snn(nn.Module):
                  img_size_h=128, img_size_w=128, patch_size=16, in_channels=2, num_classes=11,
                  embed_dims=[64, 128, 256], num_heads=[1, 2, 4], mlp_ratios=[4, 4, 4], qkv_bias=False, qk_scale=None,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0., norm_layer=nn.LayerNorm,
-                 depths=[6, 8, 6], sr_ratios=[8, 4, 2], T=4, pretrained_cfg=None, in_chans = 3, no_weight_decay = None
+                 depths=[6, 8, 6], sr_ratios=[8, 4, 2], T=4, pretrained_cfg=None, in_chans = 3, no_weight_decay = None,TET=False
                  ):
         super().__init__()
         self.num_classes = num_classes
         self.depths = depths
         self.T = T
+        self.TET = TET
         num_heads = [16, 16, 16]
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depths)]  # stochastic depth decay rule
 
@@ -374,11 +375,14 @@ class vit_snn(nn.Module):
 
         return x.flatten(3).mean(3)
 
-    def forward(self, x):
+    def forward(self, x, hook=None):
         x = x.permute(1, 0, 2, 3, 4)  # [T, N, 2, *, *]
         x = self.forward_features(x)
-        x = self.head(x.mean(0))
-        return x
+        if not self.TET:
+            x = self.head(x.mean(0))
+        else:
+            x = self.head(x)
+        return x,hook
 
 
 @register_model

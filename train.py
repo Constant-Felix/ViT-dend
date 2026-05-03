@@ -1036,10 +1036,15 @@ def main():
 
     qkformer_extra_kwargs = {}
     if args.soma_astro:
-        supported_soma_astro = {"QKFormer_dend", "QKFormer_dend_dvs"}
+        supported_soma_astro = {
+            "QKFormer_dend",
+            "QKFormer_dend_dvs",
+            "QKFormer_dend_concat",
+            "QKFormer_dend_concat_dvs",
+        }
         if (not args.dend) or (not args.qkformer) or args.model not in supported_soma_astro:
             raise ValueError(
-                "--soma_astro is currently wired for dend QKFormer_dend and QKFormer_dend_dvs runs"
+                "--soma_astro is currently wired for dend QKFormer and QKFormer concat runs"
             )
         qkformer_extra_kwargs["soma_astro"] = True
 
@@ -1079,7 +1084,7 @@ def main():
                 patch_size=args.patch_size, embed_dims=args.dim, num_heads=args.num_heads, mlp_ratios=args.mlp_ratio,
                 in_channels=args.in_channels, num_classes=args.num_classes, qkv_bias=False,
                 depths=args.layer, sr_ratios=1,
-                T=args.time_steps
+                T=args.time_steps, TET=args.TET
             )    
     else:
         if args.qkformer==False:
@@ -1284,7 +1289,7 @@ def main():
             if args.local_rank == 0:
                 _logger.info("Using native Torch DistributedDataParallel.")
             model = NativeDDP(
-                model, device_ids=[args.local_rank], find_unused_parameters=True
+                model, device_ids=[args.local_rank]#, find_unused_parameters=True
             )  # can use device str in Torch >= 1.1
         # NOTE: EMA model does not need to be wrapped by DDP
 

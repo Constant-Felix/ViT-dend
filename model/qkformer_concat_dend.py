@@ -12,20 +12,26 @@ from torch import Tensor
 from typing import Tuple
 
 class dendneuron(nn.Module):
-    def __init__(self, channels, soma_shape, dend_model=True,multi=True,integer=True,num_compartment=2,concat=False):
+    def __init__(self, channels, soma_shape, dend_model=True,multi=True,integer=True,num_compartment=2,concat=False,soma_astro=False):
         super().__init__()
         self.soma_shape = np.zeros((3,),int)
         if dend_model==False:
             self.neuron = MultiStepLIFNode(tau=2.0, detach_reset=True)
         else:
-            if multi==False:
+            if soma_astro:
+                self.dc = dend_compartment.PureMultiScaleDendCompartment(num_compartment,step_mode='m',c_sub=channels)
+            elif multi==False:
                 self.dc = dend_compartment.PassiveDendCompartment(step_mode="m",c_sub=channels,soma_dim=2)
             else:
                 self.dc = dend_compartment.AdvancedNGCUDendCompartment(num_compartment,step_mode='m',c_sub=channels)   ###
             self.wr = wiring.SegregatedDendWiring(num_compartment)
             self.dend = dendrite.SegregatedDend(step_mode='m',compartment=self.dc,wiring=self.wr)
 
-            if integer == False:
+            if soma_astro and integer == False:
+                self.soma = soma.AstroLIFSoma(step_mode='m',detach_reset=True,v_reset=None)
+            elif soma_astro:
+                self.soma = soma.AstroIntergerSoma(step_mode='m')
+            elif integer == False:
                 self.soma = soma.LIFSoma(step_mode='m',detach_reset=True,v_reset=None)
             else:
                 self.soma = soma.IntergerSoma(step_mode='m')
@@ -33,20 +39,20 @@ class dendneuron(nn.Module):
             if concat == False:
                 self.neuron = neuron.VActivationForwardDendNeuron(dend=self.dend,soma=self.soma,soma_shape=self.soma_shape,psn=True,forward_strength_learnable=True)
             else:
-                self.neuron = neuron.VConcatForwardDendNeuron(dend=self.dend,soma=self.soma,soma_shape=self.soma_shape,forward_strength_learnable=True)             
+                self.neuron = neuron.VConcatForwardDendNeuron(dend=self.dend,soma=self.soma,soma_shape=self.soma_shape,forward_strength_learnable=True)
             self.neuron.forward_strength.data = torch.full((num_compartment,),1.0)
 
     def multi_step_forward(self, x_seq: Tensor, hook=None) -> Tensor:
         return self.neuron.multi_step_forward(x_seq, hook)
-    
+
     def forward(self, x: Tensor, hook=None) -> Tensor:
         return self.neuron.forward(x, hook)
-    
+
 
 
 class Token_dend_QK_Attention(nn.Module):   ###改成conv2d
     def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0., sr_ratio=1,dend=False,integer=False,concat=False,
-                 num_compartment=2,multi=False,bn_alter=False):
+                 num_compartment=2,multi=False,bn_alter=False,soma_astro=False):
         super().__init__()
         assert dim % num_heads == 0, f"dim {dim} should be divided by num_heads {num_heads}."
         self.concat = concat
@@ -57,20 +63,20 @@ class Token_dend_QK_Attention(nn.Module):   ###改成conv2d
         self.q_conv = nn.Conv2d(dim, dim, kernel_size=1, stride=1, bias=False)
         self.q_bn = nn.BatchNorm2d(dim)
 
-        self.q_lif = dendneuron(channels=dim, soma_shape=np.zeros((3,),int),dend_model=dend, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat)
+        self.q_lif = dendneuron(channels=dim, soma_shape=np.zeros((3,),int),dend_model=dend, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat, soma_astro=soma_astro)
 
         self.k_conv = nn.Conv2d(dim, dim, kernel_size=1, stride=1, bias=False)
         self.k_bn = nn.BatchNorm2d(dim)
-        self.k_lif = dendneuron(channels=dim, soma_shape=np.zeros((3,),int),dend_model=dend, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat)   
+        self.k_lif = dendneuron(channels=dim, soma_shape=np.zeros((3,),int),dend_model=dend, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat, soma_astro=soma_astro)
 
         if integer==False:
             self.attn_lif = MultiStepLIFNode(tau=2.0, v_threshold=0.5, detach_reset=True, backend='cupy')
         else:
-            self.attn_lif = soma.IntergerSoma()    
+            self.attn_lif = soma.IntergerSoma()
 
         self.proj_conv = nn.Conv2d(dim, dim, kernel_size=1, stride=1)
         self.proj_bn = nn.BatchNorm2d(dim)
-        self.proj_lif = dendneuron(channels=dim, soma_shape=np.zeros((3,),int),dend_model=dend, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat)
+        self.proj_lif = dendneuron(channels=dim, soma_shape=np.zeros((3,),int),dend_model=dend, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat, soma_astro=soma_astro)
 
 
     def forward(self, x):
@@ -114,7 +120,7 @@ class Token_dend_QK_Attention(nn.Module):   ###改成conv2d
         self.proj_lif.soma_shape[0] = x.shape[2]/self.num_compartment
         self.proj_lif.soma_shape[1] = x.shape[3]
         self.proj_lif.soma_shape[2] = x.shape[4]
-        
+
         x,_ = self.proj_lif(x)
 
         return x
@@ -122,8 +128,8 @@ class Token_dend_QK_Attention(nn.Module):   ###改成conv2d
 
 class Spiking_dend_Self_Attention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0., sr_ratio=1,concat=False,
-                 dend=False,integer=False,num_compartment=2,multi=False,bn_alter=False):
-        
+                 dend=False,integer=False,num_compartment=2,multi=False,bn_alter=False,soma_astro=False):
+
         super().__init__()
         assert dim % num_heads == 0, f"dim {dim} should be divided by num_heads {num_heads}."
         self.dim = dim
@@ -136,24 +142,24 @@ class Spiking_dend_Self_Attention(nn.Module):
         self.scale = 0.125
         self.q_conv = nn.Conv2d(dim, dim, kernel_size=1, stride=1,bias=False)
         self.q_bn = nn.BatchNorm2d(dim)
-        self.q_lif = dendneuron(channels=dim, soma_shape=np.zeros((3,),int),dend_model=dend, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat)   
+        self.q_lif = dendneuron(channels=dim, soma_shape=np.zeros((3,),int),dend_model=dend, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat, soma_astro=soma_astro)
 
         self.k_conv = nn.Conv2d(dim, dim, kernel_size=1, stride=1,bias=False)
         self.k_bn = nn.BatchNorm2d(dim)
-        self.k_lif = dendneuron(channels=dim, soma_shape=np.zeros((3,),int),dend_model=dend, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat)   
+        self.k_lif = dendneuron(channels=dim, soma_shape=np.zeros((3,),int),dend_model=dend, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat, soma_astro=soma_astro)
 
         self.v_conv = nn.Conv2d(dim, dim, kernel_size=1, stride=1,bias=False)
         self.v_bn = nn.BatchNorm2d(dim)
-        self.v_lif = dendneuron(channels=dim, soma_shape=np.zeros((3,),int),dend_model=dend, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat) 
+        self.v_lif = dendneuron(channels=dim, soma_shape=np.zeros((3,),int),dend_model=dend, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat, soma_astro=soma_astro)
 
         if integer==False:
             self.attn_lif = MultiStepLIFNode(tau=2.0, v_threshold=0.5, detach_reset=True, backend='cupy')
         else:
-            self.attn_lif = soma.IntergerSoma()    
+            self.attn_lif = soma.IntergerSoma()
 
         self.proj_conv = nn.Conv2d(dim, dim, kernel_size=1, stride=1)
         self.proj_bn = nn.BatchNorm2d(dim)
-        self.proj_lif = dendneuron(channels=dim, soma_shape=np.zeros((3,),int),dend_model=dend, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat)  
+        self.proj_lif = dendneuron(channels=dim, soma_shape=np.zeros((3,),int),dend_model=dend, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat, soma_astro=soma_astro)
 
         self.qkv_mp = nn.MaxPool1d(4)
 
@@ -215,7 +221,7 @@ class Spiking_dend_Self_Attention(nn.Module):
 
 class MLP(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, drop=0.,concat=False,
-                 dend = False,integer = False,multi = False,num_compartment=2,bn_alter=False):
+                 dend = False,integer = False,multi = False,num_compartment=2,bn_alter=False,soma_astro=False):
         super().__init__()
         self.f_da = lambda x:x
         out_features = out_features or in_features
@@ -228,11 +234,11 @@ class MLP(nn.Module):
         #hidden_features = hidden_features or in_features
         self.mlp1_conv = nn.Conv2d(in_features, hidden_features, kernel_size=1, stride=1)
         self.mlp1_bn = nn.BatchNorm2d(hidden_features)
-        self.mlp1_lif = dendneuron(channels=hidden_features, soma_shape=np.zeros((3,),int),dend_model=dend, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat)    
+        self.mlp1_lif = dendneuron(channels=hidden_features, soma_shape=np.zeros((3,),int),dend_model=dend, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat, soma_astro=soma_astro)
 
         self.mlp2_conv = nn.Conv2d(hidden_features, out_features, kernel_size=1, stride=1)
         self.mlp2_bn = nn.BatchNorm2d(out_features)
-        self.mlp2_lif = dendneuron(channels=out_features, soma_shape=np.zeros((3,),int),dend_model=dend, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat) 
+        self.mlp2_lif = dendneuron(channels=out_features, soma_shape=np.zeros((3,),int),dend_model=dend, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat, soma_astro=soma_astro)
 
         self.c_hidden = hidden_features
         self.c_output = out_features
@@ -263,12 +269,12 @@ class MLP(nn.Module):
 
 class TokenSpikingTransformer_dend(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., norm_layer=nn.LayerNorm, sr_ratio=1,dend=False,integer=False,num_compartment=2,multi=False,bn_alter=False,concat=False):
+                 drop_path=0., norm_layer=nn.LayerNorm, sr_ratio=1,dend=False,integer=False,num_compartment=2,multi=False,bn_alter=False,concat=False,soma_astro=False):
         super().__init__()
         self.tssa = Token_dend_QK_Attention(dim, num_heads,qkv_bias=qkv_bias,qk_scale=qk_scale,attn_drop=attn_drop,
-                                               proj_drop=drop_path,sr_ratio=sr_ratio, dend=dend,integer=integer,num_compartment=num_compartment,multi=multi,bn_alter=bn_alter,concat=concat)
+                                               proj_drop=drop_path,sr_ratio=sr_ratio, dend=dend,integer=integer,num_compartment=num_compartment,multi=multi,bn_alter=bn_alter,concat=concat,soma_astro=soma_astro)
         mlp_in_features = int(dim * mlp_ratio)
-        self.mlp = MLP(in_features= dim, hidden_features=mlp_in_features, drop=drop,dend=dend,integer=integer,num_compartment=num_compartment,multi=multi,bn_alter=bn_alter,concat=concat)
+        self.mlp = MLP(in_features= dim, hidden_features=mlp_in_features, drop=drop,dend=dend,integer=integer,num_compartment=num_compartment,multi=multi,bn_alter=bn_alter,concat=concat,soma_astro=soma_astro)
 
     def forward(self, x):
 
@@ -282,12 +288,12 @@ class TokenSpikingTransformer_dend(nn.Module):
 
 class SpikingTransformer_dend(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., norm_layer=nn.LayerNorm, sr_ratio=1,dend=False,integer=False,num_compartment=2,multi=False,bn_alter=False,concat=False):
+                 drop_path=0., norm_layer=nn.LayerNorm, sr_ratio=1,dend=False,integer=False,num_compartment=2,multi=False,bn_alter=False,concat=False,soma_astro=False):
         super().__init__()
         self.ssa = Spiking_dend_Self_Attention(dim, num_heads,qkv_bias=qkv_bias,qk_scale=qk_scale,attn_drop=attn_drop,
-                                               proj_drop=drop_path,sr_ratio=sr_ratio,dend=dend,integer=integer,num_compartment=num_compartment,multi=multi,bn_alter=bn_alter,concat=concat)
+                                               proj_drop=drop_path,sr_ratio=sr_ratio,dend=dend,integer=integer,num_compartment=num_compartment,multi=multi,bn_alter=bn_alter,concat=concat,soma_astro=soma_astro)
         mlp_in_features = int(dim*mlp_ratio)
-        self.mlp = MLP(in_features= dim, hidden_features=mlp_in_features, drop=drop,dend=dend,integer=integer,num_compartment=num_compartment,multi=multi,bn_alter=bn_alter,concat=concat)
+        self.mlp = MLP(in_features= dim, hidden_features=mlp_in_features, drop=drop,dend=dend,integer=integer,num_compartment=num_compartment,multi=multi,bn_alter=bn_alter,concat=concat,soma_astro=soma_astro)
 
     def forward(self, x):
 
@@ -313,7 +319,7 @@ class PatchEmbedInit(nn.Module):
         if sps_integer==False:
             self.proj_lif = MultiStepLIFNode(tau=2.0, detach_reset=True, backend='cupy')
         else:
-            self.proj_lif = soma.IntergerSoma()   
+            self.proj_lif = soma.IntergerSoma()
 
         self.proj1_conv = nn.Conv2d(embed_dims // 2, embed_dims // 1, kernel_size=3, stride=1, padding=1, bias=False)
         self.proj1_bn = nn.BatchNorm2d(embed_dims // 1)
@@ -414,7 +420,7 @@ class spiking_transformer_dend(nn.Module):
                  img_size_h=128, img_size_w=128, patch_size=16, in_channels=2, num_classes=11,
                  embed_dims=[64, 128, 256], num_heads=[8, 8, 8], mlp_ratios=[4, 4, 4], qkv_bias=False, qk_scale=None,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0., norm_layer=nn.LayerNorm,
-                 depths=[6, 8, 6], sr_ratios=[8, 4, 2], T=4, pretrained_cfg=None,dend=False,integer=False,num_compartment=2,multi=False,sps_integer=False,bn_alter=False,concat=False,pretrained_cfg_overlay=False,catch_dir=False,**kwargs
+                 depths=[6, 8, 6], sr_ratios=[8, 4, 2], T=4, pretrained_cfg=None,dend=False,integer=False,num_compartment=2,multi=False,sps_integer=False,bn_alter=False,concat=False,soma_astro=False,pretrained_cfg_overlay=False,catch_dir=False,**kwargs
                  ):
         super().__init__()
         self.num_classes = num_classes
@@ -433,7 +439,7 @@ class spiking_transformer_dend(nn.Module):
         stage1 = nn.ModuleList([TokenSpikingTransformer_dend(
             dim=embed_dims // 4, num_heads=num_heads[0], mlp_ratio=mlp_ratios, qkv_bias=qkv_bias,
             qk_scale=qk_scale, drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[j],
-            norm_layer=norm_layer, sr_ratio=sr_ratios,dend=dend,integer=integer,num_compartment=num_compartment,multi=multi,bn_alter=bn_alter,concat=concat)
+            norm_layer=norm_layer, sr_ratio=sr_ratios,dend=dend,integer=integer,num_compartment=num_compartment,multi=multi,bn_alter=bn_alter,concat=concat,soma_astro=soma_astro)
             for j in range(1)])
 
         patch_embed2 = PatchEmbeddingStage(img_size_h=img_size_h,
@@ -445,7 +451,7 @@ class spiking_transformer_dend(nn.Module):
         stage2 = nn.ModuleList([TokenSpikingTransformer_dend(
             dim=embed_dims // 2, num_heads=num_heads[1], mlp_ratio=mlp_ratios, qkv_bias=qkv_bias,
             qk_scale=qk_scale, drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[j],
-            norm_layer=norm_layer, sr_ratio=sr_ratios,dend=dend,integer=integer,num_compartment=num_compartment,multi=multi,bn_alter=bn_alter,concat=concat)
+            norm_layer=norm_layer, sr_ratio=sr_ratios,dend=dend,integer=integer,num_compartment=num_compartment,multi=multi,bn_alter=bn_alter,concat=concat,soma_astro=soma_astro)
             for j in range(1)])
 
         patch_embed3 = PatchEmbeddingStage(img_size_h=img_size_h,
@@ -457,7 +463,7 @@ class spiking_transformer_dend(nn.Module):
         stage3 = nn.ModuleList([SpikingTransformer_dend(
             dim=embed_dims, num_heads=num_heads[2], mlp_ratio=mlp_ratios, qkv_bias=qkv_bias,
             qk_scale=qk_scale, drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[j],
-            norm_layer=norm_layer, sr_ratio=sr_ratios,dend=dend,integer=integer,num_compartment=num_compartment,multi=multi,bn_alter=bn_alter,concat=concat)
+            norm_layer=norm_layer, sr_ratio=sr_ratios,dend=dend,integer=integer,num_compartment=num_compartment,multi=multi,bn_alter=bn_alter,concat=concat,soma_astro=soma_astro)
             for j in range(depths - 2)])
 
         setattr(self, f"patch_embed1", patch_embed1)

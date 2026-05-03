@@ -39,7 +39,7 @@ def parse_args():
     parser.add_argument('--dataset', default='cifar10dvs', help='dataset')
     parser.add_argument('--num-classes', type=int, default=10, metavar='N',
                         help='number of label classes (default: 1000)')
-    parser.add_argument('--data-path', default='data/cifar10-dvs/cifar10-dvs', help='dataset')
+    parser.add_argument('--data-path', default='/data/hyx/ViT-dend/data/cifar10-dvs/cifar10-dvs', help='dataset')
     parser.add_argument('--device', default='cuda', help='device')
     parser.add_argument('-b', '--batch-size', default=16, type=int)
     parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
@@ -227,16 +227,22 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, pri
         else:
             output = model(image)[0] ##
             loss = criterion(output, target)
-
+        
         optimizer.zero_grad()
 
         if scaler is not None:
             scaler.scale(loss).backward()
+            #for name, param in model.named_parameters():
+            #    if param.requires_grad and param.grad is None:
+            #        print(f"未使用到的参数: {name}")
             scaler.step(optimizer)
             scaler.update()
 
         else:
             loss.backward()
+            #for name, param in model.named_parameters():
+            #    if param.requires_grad and param.grad is None:
+            #        print(f"未使用到的参数: {name}")
             optimizer.step()
 
         functional.reset_net(model)

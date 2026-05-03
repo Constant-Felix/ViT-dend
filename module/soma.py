@@ -528,7 +528,7 @@ class LIFSoma(BaseSoma):
             v_threshold, v_reset, surrogate_function, detach_reset, 
             step_mode, backend, store_v_seq, store_v_pre_spike
         )
-        self.tau = nn.Parameter(torch.tensor(tau, dtype=torch.float32))
+        self.tau = nn.Parameter(torch.tensor(tau, dtype=torch.float32),requires_grad=False)
         self.decay_input = decay_input
 
     def extra_repr(self):

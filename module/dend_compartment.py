@@ -981,8 +981,8 @@ class PureMultiScaleDendCompartment(BaseDendCompartment):
         c_sub=1,
         init_tau=[1.2, 5.0],
         soma_dim=3,
-        decay_input: bool = True,
-        bn=True,
+        decay_input: bool = True, 
+        bn=True,  ##
         res=False,
         v_rest: float = 0.0,
         step_mode: str = "m",
@@ -1002,7 +1002,7 @@ class PureMultiScaleDendCompartment(BaseDendCompartment):
         self.num_branches = num_branches
         self.decay_input = decay_input
         self.v_rest = v_rest
-        self.skip_weight = nn.Parameter(torch.tensor(0.01))
+        self.skip_weight = nn.Parameter(torch.tensor(0.01),requires_grad=False)
 
         if init_tau is None:
             tau_data = torch.linspace(2.0, 10.0, steps=num_branches)

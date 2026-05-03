@@ -587,7 +587,10 @@ class vit_snn(nn.Module):
 @register_model
 def QKFormer_dend_dvs(pretrained=False, **kwargs):
     model = vit_snn(
-        **kwargs
+        patch_size=16, embed_dims=256, num_heads=16, mlp_ratios=1,
+        in_channels=2, num_classes=10, qkv_bias=False,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), depths=4, sr_ratios=1,dend=True,multi=True,soma_astro=True,
+        **kwargs #
     )
     model.default_cfg = _cfg()
     return model
