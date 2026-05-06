@@ -139,7 +139,7 @@ class PassiveDendCompartment(BaseDendCompartment):
 
         tau_data = torch.full((num_branches,), float(tau))
         
-        self.tau_branches = nn.Parameter(torch.tensor(tau_data, dtype=torch.float32))    
+        self.tau_branches = nn.Parameter(tau_data.clone().detach().float())
         self.decay_input = decay_input
         self.v_rest = v_rest
 
@@ -442,7 +442,7 @@ class MultiScaleDendCompartment(BaseDendCompartment):
         else:
             tau_data = torch.as_tensor(init_tau, dtype=torch.float32)
 
-        self.tau_branches = nn.Parameter(torch.tensor(tau_data, dtype=torch.float32))    
+        self.tau_branches = nn.Parameter(tau_data.clone().detach().float())    
         self.decay_input = decay_input
         self.v_rest = v_rest
 
@@ -719,10 +719,10 @@ class AdvancedNGCUDendCompartment(BaseDendCompartment):
         self,
         num_branches,
         c_sub=1,
-        init_tau=[1.2, 5.0],
+        init_tau=[2.0, 2.0],
         #init_tau=[1.2, 8.0],
         soma_dim=3,
-        decay_input: bool = True,
+        decay_input: bool = False,
         bn=True,
         res=False,
         v_rest: float = 0.0,
@@ -731,7 +731,11 @@ class AdvancedNGCUDendCompartment(BaseDendCompartment):
         no_filter=False,
         use_astro = True,
         last_sigmoid = True,
-        last_tanh = False
+        last_tanh = False,
+        use_event_write = True,
+        event_threshold: float = 0.1,
+        event_slope: float = 8.0,
+        event_delta_weight: float = 0.5,
     ):
         super().__init__(v_rest, step_mode, store_v_seq)
         self.soma_dim = soma_dim
@@ -741,6 +745,7 @@ class AdvancedNGCUDendCompartment(BaseDendCompartment):
         self.last_sigmoid = last_sigmoid
         self.last_tanh = last_tanh
         self.use_astro = use_astro
+        self.use_event_write = use_event_write
         self.c_sub = c_sub
         self.num_branches = num_branches
         self.decay_input = decay_input
@@ -754,7 +759,7 @@ class AdvancedNGCUDendCompartment(BaseDendCompartment):
             tau_data = torch.full((num_branches,), float(init_tau))
         else:
             tau_data = torch.as_tensor(init_tau, dtype=torch.float32)
-        self.tau_branches = nn.Parameter(torch.tensor(tau_data, dtype=torch.float32))    
+        self.tau_branches = nn.Parameter(tau_data.clone().detach().float())   
 
         if self.bn:
             self.branch_bn = nn.BatchNorm2d(self.c_sub, affine=True, momentum=0.1) if self.soma_dim == 3 else nn.BatchNorm1d(self.c_sub, affine=True, momentum=0.1)  
@@ -777,12 +782,15 @@ class AdvancedNGCUDendCompartment(BaseDendCompartment):
         # 1. 极性写入通道 (Upward Writing)
         self.theta_exc = nn.Parameter(torch.tensor(0.0),requires_grad=False) ##
         self.theta_inh = nn.Parameter(torch.tensor(0.0),requires_grad=False) ##
-        self.theta = nn.Parameter(torch.full((num_branches,), 0.5)) ##
+        self.theta = nn.Parameter(torch.full((num_branches,), 0.1)) ##
         #self.theta = nn.Parameter(torch.tensor((0.7, 0.3)))
         self.w_exc = nn.Parameter(torch.tensor(1.0))
         self.w_inh = nn.Parameter(torch.tensor(1.0))
         
-        self.lambda_local = nn.Parameter(torch.tensor(0.4)) ## 适当调大
+        self.lambda_local = nn.Parameter(torch.tensor(0.2)) ## 适当调大
+        self.event_threshold = nn.Parameter(torch.tensor(event_threshold, dtype=torch.float32))
+        self.event_delta_weight = nn.Parameter(torch.tensor(event_delta_weight, dtype=torch.float32))
+        self.event_slope = float(event_slope)
 
         # 4. 下行调制生成 (Downward Modulation)
         self.alpha = nn.Parameter(torch.tensor(0.5))
@@ -820,6 +828,7 @@ class AdvancedNGCUDendCompartment(BaseDendCompartment):
 
         G_seq, B_seq = [], []
         C_seq_list = []
+        event_gate_seq = []
 
         # 预计算 Sigmoid 约束的衰减率，确保其物理意义 (介于0到1之间)
         lam_l = self.lambda_local
@@ -841,14 +850,24 @@ class AdvancedNGCUDendCompartment(BaseDendCompartment):
             #Psi_t = torch.tanh(self.w_exc * E_t - self.w_inh * I_t)
             Psi_t = self.w_exc * E_t - self.w_inh * I_t  
             # 局部状态演化
-            C_local = (1 - lam_l) * C_local + lam_l * torch.tanh(F.relu(Psi_t - self.theta))  ####
+            write_t = torch.tanh(F.relu(Psi_t - self.theta))
+            if self.use_event_write:
+                branch_activity = Psi_t
+                delta_drive = (write_t - C_local).abs()
+                event_drive = branch_activity + self.event_delta_weight.abs() * delta_drive
+                event_gate = torch.sigmoid(self.event_slope * (event_drive - self.event_threshold.abs()))
+                #event_gate = event_gate * (event_drive > 0).to(event_gate.dtype)
+            else:
+                event_gate = torch.ones_like(write_t)
+            C_local = (1 - lam_l * event_gate) * C_local + lam_l * event_gate * write_t  ####
             #C_local = (1 - lam_l) * C_local + lam_l * F.relu(Psi_t - self.theta)
             C_seq_list.append(C_local)
+            event_gate_seq.append(event_gate.detach())
             # 5. 生成下行调制 (局部乘性增益 + 全局/局部混合偏置)
-            #G_t = 1.0 + self.alpha * torch.tanh(self.beta * C_local) # (B, N)
-            G_t = 1.0 + self.alpha * C_local
-            #B_t = torch.tanh(self.w_b * C_local) # (B, N)
-            B_t = self.w_b * C_local
+            G_t = 1.0 + self.alpha * torch.tanh(self.beta * C_local) # (B, N)
+            #G_t = 1.0 + self.alpha * C_local
+            B_t = torch.tanh(self.w_b * C_local) # (B, N)
+            #B_t = self.w_b * C_local
 
             G_seq.append(G_t)
             B_seq.append(B_t)
@@ -859,6 +878,7 @@ class AdvancedNGCUDendCompartment(BaseDendCompartment):
         B_seq = torch.stack(B_seq, dim=0) # (T, B, N)
         C_seq = torch.stack(C_seq_list, dim=0)
         self.current_C_seq = C_seq
+        self.current_event_gate_seq = torch.stack(event_gate_seq, dim=0)
 
         if self.soma_dim == 3:
             G_seq = G_seq.view(T, B, 1, 1, 1, N)
@@ -979,9 +999,9 @@ class PureMultiScaleDendCompartment(BaseDendCompartment):
         self,
         num_branches,
         c_sub=1,
-        init_tau=[1.2, 5.0],
+        init_tau=[1.1, 1.2],
         soma_dim=3,
-        decay_input: bool = True, 
+        decay_input: bool = False, 
         bn=True,  ##
         res=False,
         v_rest: float = 0.0,

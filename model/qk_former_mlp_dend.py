@@ -12,7 +12,7 @@ from torch import Tensor
 from typing import Tuple
 
 class dendneuron(nn.Module):
-    def __init__(self, channels, soma_shape, dend_model=True,multi=True,integer=True,num_compartment=2,concat=False,soma_astro=False):
+    def __init__(self, channels, soma_shape, dend_model=True,multi=True,integer=False,num_compartment=2,concat=False,soma_astro=False):
         super().__init__()
         self.soma_shape = np.zeros((3,),int)
         if dend_model==False:
@@ -63,20 +63,21 @@ class Token_dend_QK_Attention(nn.Module):   ###改成conv2d
         self.q_conv = nn.Conv2d(dim, dim, kernel_size=1, stride=1, bias=False)
         self.q_bn = nn.BatchNorm2d(dim)
 
-        self.q_lif = dendneuron(channels=dim, soma_shape=np.zeros((3,),int),dend_model=dend, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat, soma_astro=soma_astro)
+        self.q_lif = dendneuron(channels=dim, soma_shape=np.zeros((3,),int),dend_model=False, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat, soma_astro=soma_astro)
 
         self.k_conv = nn.Conv2d(dim, dim, kernel_size=1, stride=1, bias=False)
         self.k_bn = nn.BatchNorm2d(dim)
-        self.k_lif = dendneuron(channels=dim, soma_shape=np.zeros((3,),int),dend_model=dend, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat, soma_astro=soma_astro)
+        self.k_lif = dendneuron(channels=dim, soma_shape=np.zeros((3,),int),dend_model=False, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat, soma_astro=soma_astro)
 
         if integer==False:
             self.attn_lif = MultiStepLIFNode(tau=2.0, v_threshold=0.5, detach_reset=True, backend='cupy')
+            #self.attn_lif = MultiStepLIFNode(tau=2.0, detach_reset=True, backend='cupy')
         else:
             self.attn_lif = soma.IntergerSoma()
 
-        self.proj_conv = nn.Conv2d(dim, dim, kernel_size=1, stride=1)
-        self.proj_bn = nn.BatchNorm2d(dim)
-        self.proj_lif = dendneuron(channels=dim, soma_shape=np.zeros((3,),int),dend_model=dend, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat, soma_astro=soma_astro)
+        self.proj_conv = nn.Conv2d(dim, dim*num_compartment, kernel_size=1, stride=1)
+        self.proj_bn = nn.BatchNorm2d(dim*num_compartment)
+        self.proj_lif = dendneuron(channels=dim*num_compartment, soma_shape=np.zeros((3,),int),dend_model=dend, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat, soma_astro=soma_astro)
 
 
     def forward(self, x):
@@ -94,7 +95,7 @@ class Token_dend_QK_Attention(nn.Module):   ###改成conv2d
         self.q_lif.soma_shape[2] = q_conv_out.shape[4]
         #if self.bn_alter == True:
             #self.q_lif.dend.compartment.c_sub = q_conv_out.shape[2]
-        q_conv_out,_ = self.q_lif(q_conv_out)
+        q_conv_out = self.q_lif(q_conv_out)
         q = q_conv_out.unsqueeze(2).reshape(T, B, self.num_heads, C // self.num_heads, H, W)
 
         k_conv_out = self.k_conv(x_for_qkv)
@@ -105,7 +106,7 @@ class Token_dend_QK_Attention(nn.Module):   ###改成conv2d
         self.k_lif.soma_shape[2] = k_conv_out.shape[4]
         #if self.bn_alter == True:
             #self.k_lif.dend.compartment.c_sub = k_conv_out.shape[2]
-        k_conv_out,_ = self.k_lif(k_conv_out)
+        k_conv_out = self.k_lif(k_conv_out)
         k = k_conv_out.unsqueeze(2).reshape(T, B, self.num_heads, C // self.num_heads, H, W)
 
         q = torch.sum(q, dim = 3, keepdim = True)
@@ -142,24 +143,25 @@ class Spiking_dend_Self_Attention(nn.Module):
         self.scale = 0.125
         self.q_conv = nn.Conv2d(dim, dim, kernel_size=1, stride=1,bias=False)
         self.q_bn = nn.BatchNorm2d(dim)
-        self.q_lif = dendneuron(channels=dim, soma_shape=np.zeros((3,),int),dend_model=dend, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat, soma_astro=soma_astro)
+        self.q_lif = dendneuron(channels=dim, soma_shape=np.zeros((3,),int),dend_model=False, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat, soma_astro=soma_astro)
 
         self.k_conv = nn.Conv2d(dim, dim, kernel_size=1, stride=1,bias=False)
         self.k_bn = nn.BatchNorm2d(dim)
-        self.k_lif = dendneuron(channels=dim, soma_shape=np.zeros((3,),int),dend_model=dend, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat, soma_astro=soma_astro)
+        self.k_lif = dendneuron(channels=dim, soma_shape=np.zeros((3,),int),dend_model=False, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat, soma_astro=soma_astro)
 
         self.v_conv = nn.Conv2d(dim, dim, kernel_size=1, stride=1,bias=False)
         self.v_bn = nn.BatchNorm2d(dim)
-        self.v_lif = dendneuron(channels=dim, soma_shape=np.zeros((3,),int),dend_model=dend, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat, soma_astro=soma_astro)
+        self.v_lif = dendneuron(channels=dim, soma_shape=np.zeros((3,),int),dend_model=False, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat, soma_astro=soma_astro)
 
         if integer==False:
             self.attn_lif = MultiStepLIFNode(tau=2.0, v_threshold=0.5, detach_reset=True, backend='cupy')
+            #self.attn_lif = MultiStepLIFNode(tau=2.0, detach_reset=True, backend='cupy')
         else:
             self.attn_lif = soma.IntergerSoma()
 
-        self.proj_conv = nn.Conv2d(dim, dim, kernel_size=1, stride=1)
-        self.proj_bn = nn.BatchNorm2d(dim)
-        self.proj_lif = dendneuron(channels=dim, soma_shape=np.zeros((3,),int),dend_model=dend, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat, soma_astro=soma_astro)
+        self.proj_conv = nn.Conv2d(dim, dim*num_compartment, kernel_size=1, stride=1)
+        self.proj_bn = nn.BatchNorm2d(dim*num_compartment)
+        self.proj_lif = dendneuron(channels=dim*num_compartment, soma_shape=np.zeros((3,),int),dend_model=dend, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat, soma_astro=soma_astro)
 
         self.qkv_mp = nn.MaxPool1d(4)
 
@@ -178,7 +180,7 @@ class Spiking_dend_Self_Attention(nn.Module):
         self.q_lif.soma_shape[2] = q_conv_out.shape[4]
         #if self.bn_alter == True:
             #self.q_lif.dend.compartment.c_sub = q_conv_out.shape[2]
-        q_conv_out,_ = self.q_lif(q_conv_out)
+        q_conv_out = self.q_lif(q_conv_out)
         q = q_conv_out.flatten(3).transpose(-1, -2).reshape(T, B, N, self.num_heads, C//self.num_heads).permute(0, 1, 3, 2, 4).contiguous()
 
         k_conv_out = self.k_conv(x_for_qkv)
@@ -189,7 +191,7 @@ class Spiking_dend_Self_Attention(nn.Module):
         self.k_lif.soma_shape[2] = k_conv_out.shape[4]
         #if self.bn_alter == True:
             #self.k_lif.dend.compartment.c_sub = k_conv_out.shape[2]
-        k_conv_out,_ = self.k_lif(k_conv_out)
+        k_conv_out = self.k_lif(k_conv_out)
         k = k_conv_out.flatten(3).transpose(-1, -2).reshape(T, B, N, self.num_heads, C//self.num_heads).permute(0, 1, 3, 2, 4).contiguous()
 
         v_conv_out = self.v_conv(x_for_qkv)
@@ -200,7 +202,7 @@ class Spiking_dend_Self_Attention(nn.Module):
         self.v_lif.soma_shape[2] = v_conv_out.shape[4]
         #if self.bn_alter == True:
             #self.v_lif.dend.compartment.c_sub = v_conv_out.shape[2]
-        v_conv_out,_ = self.v_lif(v_conv_out)
+        v_conv_out = self.v_lif(v_conv_out)
         v = v_conv_out.flatten(3).transpose(-1, -2).reshape(T, B, N, self.num_heads, C//self.num_heads).permute(0, 1, 3, 2, 4).contiguous()
 
         x = k.transpose(-2,-1) @ v
@@ -236,9 +238,9 @@ class MLP(nn.Module):
         self.mlp1_bn = nn.BatchNorm2d(hidden_features)
         self.mlp1_lif = dendneuron(channels=hidden_features, soma_shape=np.zeros((3,),int),dend_model=dend, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat, soma_astro=soma_astro)
 
-        self.mlp2_conv = nn.Conv2d(hidden_features, out_features, kernel_size=1, stride=1)
-        self.mlp2_bn = nn.BatchNorm2d(out_features)
-        self.mlp2_lif = dendneuron(channels=out_features, soma_shape=np.zeros((3,),int),dend_model=dend, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat, soma_astro=soma_astro)
+        self.mlp2_conv = nn.Conv2d(hidden_features//num_compartment, out_features*num_compartment, kernel_size=1, stride=1)
+        self.mlp2_bn = nn.BatchNorm2d(out_features*num_compartment)
+        self.mlp2_lif = dendneuron(channels=out_features*num_compartment, soma_shape=np.zeros((3,),int),dend_model=dend, integer=integer, multi=multi, num_compartment=num_compartment, concat=concat, soma_astro=soma_astro)
 
         self.c_hidden = hidden_features
         self.c_output = out_features
@@ -539,11 +541,11 @@ class vit_snn(nn.Module):
 
 
 @register_model
-def QKFormer_dend_concat_dvs(pretrained=False, **kwargs):
+def QKFormer_dend_mlp_only_dvs(pretrained=False, **kwargs):
     model = vit_snn(
-        patch_size=16, embed_dims=256, num_heads=16, mlp_ratios=1,
-        in_channels=2, num_classes=10, qkv_bias=False,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6), depths=4, sr_ratios=1,dend=True,multi=True,soma_astro=True,concat=True,
+        #patch_size=16, embed_dims=256, num_heads=16, mlp_ratios=1,
+        #in_channels=2, num_classes=10, qkv_bias=False,
+        #norm_layer=partial(nn.LayerNorm, eps=1e-6), depths=4, sr_ratios=1,dend=True,multi=True,soma_astro=True,concat=True,
         **kwargs #
     )
     model.default_cfg = _cfg()

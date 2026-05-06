@@ -91,11 +91,15 @@ class AstroSomaMixin(MemoryModule):
         self,
         astro_lambda: float = 0.1,
         astro_trace_decay: float = 0.9,
-        astro_gain: float = 1.0,
+        astro_gain: float = 0.4,
         astro_bias_gain: float = 0.0,
         astro_spike_scale: float = 1.0,
         astro_pool_kernel: int = 3,
         astro_pool_mode: str = "avg",
+        astro_event_write: bool = True,
+        astro_event_threshold: float = 0.4,
+        astro_event_slope: float = 8.0,
+        astro_delta_weight: float = 0.5,
         store_c_seq: bool = False,
     ):
         astro_lambda = torch.as_tensor(astro_lambda, dtype=torch.float32)
@@ -109,8 +113,14 @@ class AstroSomaMixin(MemoryModule):
         self.astro_spike_scale = float(astro_spike_scale)
         self.astro_pool_kernel = int(astro_pool_kernel)
         self.astro_pool_mode = astro_pool_mode
+        self.astro_event_write = bool(astro_event_write)
+        self.astro_event_threshold = nn.Parameter(torch.tensor(astro_event_threshold, dtype=torch.float32))
+        self.astro_delta_weight = nn.Parameter(torch.tensor(astro_delta_weight, dtype=torch.float32))
+        self.astro_event_slope = float(astro_event_slope)
         self.register_memory("c", 0.0)
         self.register_memory("astro_trace", 0.0)
+        self.register_memory("astro_event_gate", 0.0)
+        self.register_memory("firing_rate", 0.0)
         self.store_c_seq = store_c_seq
 
     @property
@@ -128,6 +138,8 @@ class AstroSomaMixin(MemoryModule):
             self.c = torch.zeros_like(x)
         if isinstance(self.astro_trace, float):
             self.astro_trace = torch.zeros_like(x)
+        if isinstance(self.astro_event_gate, float):
+            self.astro_event_gate = torch.zeros_like(x)    
 
     def astro_decode(self):
         c = torch.tanh(self.c)
@@ -168,15 +180,30 @@ class AstroSomaMixin(MemoryModule):
         if isinstance(self.astro_trace, float):
             self.astro_trace = torch.zeros_like(pooled_spike)
         trace_decay = torch.sigmoid(self.astro_trace_decay_logit)
-        self.astro_trace = trace_decay * self.astro_trace + pooled_spike
-        write = torch.tanh(self.astro_trace)
+        next_trace = trace_decay * self.astro_trace + pooled_spike
+        write = torch.tanh(next_trace)
         lam = torch.sigmoid(self.astro_lambda_logit)
-        self.c = (1.0 - lam) * self.c + lam * write
+        if self.astro_event_write:
+            delta_drive = (write - self.c).abs()
+            activity_drive = pooled_spike.abs()
+            event_drive = activity_drive + self.astro_delta_weight.abs() * delta_drive
+            event_gate = torch.sigmoid(
+                self.astro_event_slope * (event_drive - self.astro_event_threshold.abs())
+            )
+            #event_gate = event_gate * (event_drive > 0).to(event_gate.dtype)
+        else:
+            event_gate = torch.ones_like(write)
+        self.astro_trace = next_trace
+        self.c = (1.0 - lam * event_gate) * self.c + lam * event_gate * write
+        self.astro_event_gate = event_gate.detach()
+        self.firing_rate = spike.float().mean()
         return self.c
 
     def reset_astro_state(self):
         self.c = 0.0
         self.astro_trace = 0.0
+        self.astro_event_gate = 0.0
+        self.firing_rate = 0.0
         if hasattr(self, "c_seq"):
             self.c_seq = None
 
@@ -266,7 +293,8 @@ class IntergerSoma(neuron.BaseNode):
             mem_old = mem.clone()
             output[i] = spike
         # print(output[0][0][0][0])
-        #h = hook    
+        #h = hook
+        self.firing_rate = output.float().mean(dim=0)    
         return output
 
 
@@ -399,6 +427,8 @@ class AstroIntergerSoma(IntergerSoma, AstroSomaMixin):
         astro_lambda: float = 0.1, astro_trace_decay: float = 0.9,
         astro_gain: float = 1.0, astro_bias_gain: float = 0.0,
         astro_pool_kernel: int = 3, astro_pool_mode: str = "avg",
+        astro_event_write: bool = True, astro_event_threshold: float = 0.05,
+        astro_event_slope: float = 10.0, astro_delta_weight: float = 0.5,
         store_c_seq: bool = False,
     ):
         super().__init__(
@@ -415,6 +445,10 @@ class AstroIntergerSoma(IntergerSoma, AstroSomaMixin):
             astro_spike_scale=float(thre),
             astro_pool_kernel=astro_pool_kernel,
             astro_pool_mode=astro_pool_mode,
+            astro_event_write=astro_event_write,
+            astro_event_threshold=astro_event_threshold,
+            astro_event_slope=astro_event_slope,
+            astro_delta_weight=astro_delta_weight,
             store_c_seq=store_c_seq,
         )
 
@@ -444,6 +478,7 @@ class AstroIntergerSoma(IntergerSoma, AstroSomaMixin):
             output[i] = spike
 
         self.v = mem_old.detach()
+        self.firing_rate = output.float().mean()
         if self.store_c_seq:
             self.c_seq = torch.stack(c_seq)
         return output
@@ -460,6 +495,8 @@ class AstroIntergerSoma_ssf(IntergerSoma_ssf, AstroSomaMixin):
         astro_lambda: float = 0.1, astro_trace_decay: float = 0.9,
         astro_gain: float = 1.0, astro_bias_gain: float = 0.0,
         astro_pool_kernel: int = 3, astro_pool_mode: str = "avg",
+        astro_event_write: bool = True, astro_event_threshold: float = 0.05,
+        astro_event_slope: float = 10.0, astro_delta_weight: float = 0.5,
         store_c_seq: bool = False,
     ):
         super().__init__(
@@ -476,6 +513,10 @@ class AstroIntergerSoma_ssf(IntergerSoma_ssf, AstroSomaMixin):
             astro_spike_scale=float(thre),
             astro_pool_kernel=astro_pool_kernel,
             astro_pool_mode=astro_pool_mode,
+            astro_event_write=astro_event_write,
+            astro_event_threshold=astro_event_threshold,
+            astro_event_slope=astro_event_slope,
+            astro_delta_weight=astro_delta_weight,
             store_c_seq=store_c_seq,
         )
 
@@ -505,6 +546,7 @@ class AstroIntergerSoma_ssf(IntergerSoma_ssf, AstroSomaMixin):
             output[i] = spike
 
         self.v = mem_old.detach()
+        self.firing_rate = output.float().mean()
         if self.store_c_seq:
             self.c_seq = torch.stack(c_seq)
         return output
@@ -528,7 +570,7 @@ class LIFSoma(BaseSoma):
             v_threshold, v_reset, surrogate_function, detach_reset, 
             step_mode, backend, store_v_seq, store_v_pre_spike
         )
-        self.tau = nn.Parameter(torch.tensor(tau, dtype=torch.float32),requires_grad=False)
+        self.tau = nn.Parameter(torch.tensor(tau, dtype=torch.float32))
         self.decay_input = decay_input
 
     def extra_repr(self):
@@ -864,6 +906,7 @@ class LIFSoma(BaseSoma):
                                 self.v_reset, tau
                             )
                         )
+            self.firing_rate = spike_seq.float().mean(dim=0)            
             if self.store_v_pre_spike:
                 self.v_pre_spike = v_pre_spike_seq
             return spike_seq
@@ -884,8 +927,10 @@ class AstroLIFSoma(LIFSoma, AstroSomaMixin):
         backend: str = "torch",
         store_v_seq: bool = False, store_v_pre_spike: bool = False,
         astro_lambda: float = 0.1, astro_trace_decay: float = 0.9,
-        astro_gain: float = 1.0, astro_bias_gain: float = 0.0,
+        astro_gain: float = 0.5, astro_bias_gain: float = 0.0,
         astro_pool_kernel: int = 3, astro_pool_mode: str = "avg",
+        astro_event_write: bool = True, astro_event_threshold: float = 0.4,
+        astro_event_slope: float = 8.0, astro_delta_weight: float = 0.5,
         store_c_seq: bool = False,
     ):
         super().__init__(
@@ -902,6 +947,10 @@ class AstroLIFSoma(LIFSoma, AstroSomaMixin):
             astro_spike_scale=1.0,
             astro_pool_kernel=astro_pool_kernel,
             astro_pool_mode=astro_pool_mode,
+            astro_event_write=astro_event_write,
+            astro_event_threshold=astro_event_threshold,
+            astro_event_slope=astro_event_slope,
+            astro_delta_weight=astro_delta_weight,
             store_c_seq=store_c_seq,
         )
 
@@ -920,6 +969,7 @@ class AstroLIFSoma(LIFSoma, AstroSomaMixin):
         spike, v_pre_spike, _ = self._single_step_forward(x)
         if self.store_v_pre_spike:
             self.v_pre_spike = v_pre_spike
+        #self.firing_rate = spike.float().mean()    
         return spike
 
     def multi_step_forward(self, x_seq: torch.Tensor):
@@ -943,7 +993,9 @@ class AstroLIFSoma(LIFSoma, AstroSomaMixin):
             self.v_pre_spike = torch.stack(v_pre_spike_seq)
         if self.store_c_seq:
             self.c_seq = torch.stack(c_seq)
-        return torch.stack(y_seq)
+        spike_seq = torch.stack(y_seq)
+        self.firing_rate = spike_seq.float().mean()
+        return spike_seq
 
 
 class IFSoma(BaseSoma):

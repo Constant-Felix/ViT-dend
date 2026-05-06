@@ -53,7 +53,7 @@ class MLP(nn.Module):
             self.mlp1_lif = neuron.VActivationForwardDendNeuron(dend=self.dend1,soma=self.soma1,f_da=self.f_da,soma_shape=np.zeros((3,),int),forward_strength_learnable=True)
             #self.mlp1_lif.forward_strength.data = torch.full((num_compartment,),1.0)    
 
-        self.mlp2_conv = nn.Conv2d(in_features, num_compartment*hidden_features, kernel_size=1, stride=1)
+        self.mlp2_conv = nn.Conv2d(in_features//num_compartment, num_compartment*hidden_features, kernel_size=1, stride=1)
         self.mlp2_bn = nn.BatchNorm2d(num_compartment*hidden_features)
         if dend==False:
             self.mlp2_lif = MultiStepLIFNode(tau=2.0, detach_reset=True)
@@ -129,6 +129,7 @@ class Token_dend_QK_Attention(nn.Module):   ###改成conv2d
 
         if integer==False:
             self.attn_lif = MultiStepLIFNode(tau=2.0, v_threshold=0.5, detach_reset=True)
+            #self.attn_lif = MultiStepLIFNode(tau=2.0, detach_reset=True)
         else:
             self.attn_lif = soma.IntergerSoma_ssf()    
 
@@ -242,6 +243,7 @@ class Spiking_dend_Self_Attention(nn.Module):
 
         if integer==False:
             self.attn_lif = MultiStepLIFNode(tau=2.0, v_threshold=0.5, detach_reset=True)
+            #self.attn_lif = MultiStepLIFNode(tau=2.0, detach_reset=True)
         else:
             self.attn_lif = soma.IntergerSoma_ssf()    
 
@@ -321,7 +323,7 @@ class TokenSpikingTransformer_dend(nn.Module):
         super().__init__()
         self.tssa = Token_dend_QK_Attention(dim, num_heads,qkv_bias=qkv_bias,qk_scale=qk_scale,attn_drop=attn_drop,
                                                proj_drop=drop_path,sr_ratio=sr_ratio, dend=dend,integer=integer,num_compartment=num_compartment,multi=multi,bn_alter=bn_alter,soma_astro=soma_astro)
-        mlp_in_features = int(dim/num_compartment)
+        mlp_in_features = int(dim)
         self.mlp = MLP(in_features= mlp_in_features, hidden_features=dim, drop=drop,dend=dend,integer=integer,num_compartment=num_compartment,multi=multi,bn_alter=bn_alter,soma_astro=soma_astro)
 
     def forward(self, x):
@@ -339,7 +341,7 @@ class SpikingTransformer_dend(nn.Module):
         super().__init__()
         self.ssa = Spiking_dend_Self_Attention(dim, num_heads,qkv_bias=qkv_bias,qk_scale=qk_scale,attn_drop=attn_drop,
                                                proj_drop=drop_path,sr_ratio=sr_ratio,dend=dend,integer=integer,num_compartment=num_compartment,multi=multi,bn_alter=bn_alter,soma_astro=soma_astro)
-        mlp_in_features = int(dim/num_compartment)
+        mlp_in_features = int(dim)
         self.mlp = MLP(in_features= mlp_in_features, hidden_features=dim, drop=drop,dend=dend,integer=integer,num_compartment=num_compartment,multi=multi,bn_alter=bn_alter,soma_astro=soma_astro)
 
     def forward(self, x):
@@ -587,9 +589,9 @@ class vit_snn(nn.Module):
 @register_model
 def QKFormer_dend_dvs(pretrained=False, **kwargs):
     model = vit_snn(
-        patch_size=16, embed_dims=256, num_heads=16, mlp_ratios=1,
-        in_channels=2, num_classes=10, qkv_bias=False,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6), depths=4, sr_ratios=1,dend=True,multi=True,soma_astro=True,
+        #patch_size=16, embed_dims=256, num_heads=16, mlp_ratios=1,
+        #in_channels=2, num_classes=10, qkv_bias=False,
+        #norm_layer=partial(nn.LayerNorm, eps=1e-6), depths=4, sr_ratios=1,dend=True,multi=True,soma_astro=True,
         **kwargs #
     )
     model.default_cfg = _cfg()

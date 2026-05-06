@@ -391,6 +391,18 @@ parser.add_argument(
     default="norm",
     help='Gradient clipping mode. One of ("norm", "value", "agc")',
 )
+parser.add_argument(
+    "--astro-lr-scale",
+    type=float,
+    default=0.1,
+    help="learning-rate multiplier for astro/NGCU parameters",
+)
+parser.add_argument(
+    "--astro-clip-grad",
+    type=float,
+    default=None,
+    help="optional extra gradient clipping value for astro/NGCU parameters",
+)
 
 # Learning rate schedule parameters
 parser.add_argument(
@@ -812,6 +824,42 @@ parser.add_argument(
     help="move astrocyte modulation from dendrite compartment to soma for dend QKFormer models",
 )
 parser.add_argument(
+    "--ngcu-loss",
+    default=False,
+    action="store_true",
+    help="enable NGCULoss for C bound, C drift, firing-rate and trace regularization",
+)
+parser.add_argument(
+    "--ngcu-c-max-threshold",
+    type=float,
+    default=0.9,
+    help="upper magnitude bound for astro/NGCU C state regularization",
+)
+parser.add_argument(
+    "--ngcu-eta-bound",
+    type=float,
+    default=0.01,
+    help="NGCULoss coefficient for C upper-bound penalty",
+)
+parser.add_argument(
+    "--ngcu-eta-stable",
+    type=float,
+    default=0.005,
+    help="NGCULoss coefficient for temporal C drift penalty",
+)
+parser.add_argument(
+    "--ngcu-eta-energy",
+    type=float,
+    default=0.01,
+    help="NGCULoss coefficient for firing-rate / astro-trace energy penalty",
+)
+parser.add_argument(
+    "--ngcu-target-rate",
+    type=float,
+    default=0.1,
+    help="target mean firing rate used by NGCULoss",
+)
+parser.add_argument(
     "--concat",
     default=False,
     action="store_true"
@@ -933,6 +981,120 @@ stream_handler.setFormatter(logging.Formatter(format_str))
 _logger.addHandler(stream_handler)
 _logger.propagate = False
 
+ASTRO_PARAM_NAMES = {
+    "lambda_local",
+    #"theta_exc",
+    #"theta_inh",
+    "w_exc",
+    "w_inh",
+    "alpha",
+    "beta",
+    "w_b",
+    "event_threshold",
+    "event_delta_weight",
+}
+
+
+def is_astro_param_name(name):
+    leaf_name = name.rsplit(".", 1)[-1]
+    return leaf_name.startswith("astro_") or leaf_name in ASTRO_PARAM_NAMES
+
+
+def unwrap_model(model):
+    return model.module if hasattr(model, "module") else model
+
+
+def set_ngcu_monitoring(model, enabled):
+    for module in unwrap_model(model).modules():
+        if hasattr(module, "store_c_seq"):
+            module.store_c_seq = enabled
+
+
+def collect_ngcu_regularizers(model):
+    c_states = []
+    firing_rates = []
+    astro_traces = []
+    for module in unwrap_model(model).modules():
+        current_c = getattr(module, "current_C_seq", None)
+        if torch.is_tensor(current_c):
+            c_states.append(current_c)
+        c_seq = getattr(module, "c_seq", None)
+        if torch.is_tensor(c_seq):
+            c_states.append(c_seq)
+        firing_rate = getattr(module, "firing_rate", None)
+        if torch.is_tensor(firing_rate):
+            firing_rates.append(firing_rate)
+        astro_trace = getattr(module, "astro_trace", None)
+        if torch.is_tensor(astro_trace):
+            astro_traces.append(astro_trace)
+    return c_states, firing_rates, astro_traces
+
+
+def clear_ngcu_runtime_states(model):
+    for module in unwrap_model(model).modules():
+        if hasattr(module, "current_C_seq"):
+            module.current_C_seq = None
+        if hasattr(module, "current_event_gate_seq"):
+            module.current_event_gate_seq = None
+
+
+def get_astro_clip_params(model):
+    return getattr(
+        model,
+        "_astro_clip_params",
+        getattr(unwrap_model(model), "_astro_clip_params", []),
+    )
+
+
+def create_optimizer_with_astro_groups(model, args):
+    opt_kwargs = optimizer_kwargs(cfg=args)
+    base_decay = []
+    base_no_decay = []
+    astro_decay = []
+    astro_no_decay = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        no_decay = param.ndim <= 1 or name.endswith(".bias")
+        if is_astro_param_name(name):
+            if no_decay:
+                astro_no_decay.append(param)
+            else:
+                astro_decay.append(param)
+        else:
+            if no_decay:
+                base_no_decay.append(param)
+            else:
+                base_decay.append(param)
+
+    astro_params = astro_decay + astro_no_decay
+    if not astro_params:
+        optimizer = create_optimizer_v2(model, **opt_kwargs)
+        model._astro_clip_params = []
+        return optimizer
+
+    base_lr = opt_kwargs.get("lr", args.lr)
+    astro_lr = base_lr * args.astro_lr_scale
+    weight_decay = opt_kwargs.get("weight_decay", args.weight_decay)
+    param_groups = []
+    if base_decay:
+        param_groups.append({"params": base_decay, "weight_decay": weight_decay})
+    if base_no_decay:
+        param_groups.append({"params": base_no_decay, "weight_decay": 0.0})
+    if astro_decay:
+        param_groups.append({"params": astro_decay, "lr": astro_lr, "weight_decay": weight_decay})
+    if astro_no_decay:
+        param_groups.append({"params": astro_no_decay, "lr": astro_lr, "weight_decay": 0.0})
+    opt_kwargs["weight_decay"] = 0.0
+    optimizer = create_optimizer_v2(param_groups, **opt_kwargs)
+    model._astro_clip_params = astro_params
+    if args.local_rank == 0:
+        _logger.info(
+            "Astro/NGCU param group: %d tensors, lr %.3e (scale %.3g)"
+            % (len(astro_params), astro_lr, args.astro_lr_scale)
+        )
+    return optimizer
+
 
 def _parse_args():
     # Do we have a config file to parse?
@@ -1041,6 +1203,7 @@ def main():
             "QKFormer_dend_dvs",
             "QKFormer_dend_concat",
             "QKFormer_dend_concat_dvs",
+            "QKFormer_dend_combine_dvs"
         }
         if (not args.dend) or (not args.qkformer) or args.model not in supported_soma_astro:
             raise ValueError(
@@ -1084,7 +1247,7 @@ def main():
                 patch_size=args.patch_size, embed_dims=args.dim, num_heads=args.num_heads, mlp_ratios=args.mlp_ratio,
                 in_channels=args.in_channels, num_classes=args.num_classes, qkv_bias=False,
                 depths=args.layer, sr_ratios=1,
-                T=args.time_steps, TET=args.TET
+                T=args.time_steps
             )    
     else:
         if args.qkformer==False:
@@ -1212,6 +1375,7 @@ def main():
 
     # move model to GPU, enable channels last layout if set
     model.cuda()
+    set_ngcu_monitoring(model, args.ngcu_loss)
     if args.channels_last:
         model = model.to(memory_format=torch.channels_last)
 
@@ -1234,7 +1398,7 @@ def main():
         assert not args.sync_bn, "Cannot use SyncBatchNorm with torchscripted model"
         model = torch.jit.script(model)
 
-    optimizer = create_optimizer_v2(model, **optimizer_kwargs(cfg=args))
+    optimizer = create_optimizer_with_astro_groups(model, args)
 
    
     # setup automatic mixed-precision (AMP) loss scaling and op casting
@@ -1253,6 +1417,16 @@ def main():
     else:
         if args.local_rank == 0:
             _logger.info("AMP not enabled. Training in float32.")
+    if (
+        loss_scaler is not None
+        and args.astro_clip_grad is not None
+        and not hasattr(loss_scaler, "_scaler")
+        and args.local_rank == 0
+    ):
+        _logger.warning(
+            "--astro-clip-grad is applied for native AMP and non-AMP; "
+            "Apex AMP still uses scaler-managed global clipping."
+        )
 
     # optionally resume from a checkpoint
     resume_epoch = None
@@ -1289,7 +1463,7 @@ def main():
             if args.local_rank == 0:
                 _logger.info("Using native Torch DistributedDataParallel.")
             model = NativeDDP(
-                model, device_ids=[args.local_rank]#, find_unused_parameters=True
+                model, device_ids=[args.local_rank] , find_unused_parameters=True
             )  # can use device str in Torch >= 1.1
         # NOTE: EMA model does not need to be wrapped by DDP
 
@@ -1513,15 +1687,18 @@ def main():
     else:
         train_fn = nn.CrossEntropyLoss()
 
-    train_loss_fn = train_fn.cuda()
-    #train_loss_fn = NGCULoss(
-    #    train_fn,
-    #    c_max_threshold=0.9, 
-    #    eta1=0.01,           
-    #    eta2=0.005,           
-    #    eta3=0.01,           
-    #    target_rate=0.1      
-    #).cuda()
+    train_fn = train_fn.cuda()
+    if args.ngcu_loss:
+        train_loss_fn = NGCULoss(
+            train_fn,
+            c_max_threshold=args.ngcu_c_max_threshold,
+            eta1=args.ngcu_eta_bound,
+            eta2=args.ngcu_eta_stable,
+            eta3=args.ngcu_eta_energy,
+            target_rate=args.ngcu_target_rate,
+        ).cuda()
+    else:
+        train_loss_fn = train_fn
 
     validate_loss_fn = nn.CrossEntropyLoss().cuda()
 
@@ -1658,6 +1835,7 @@ def train_one_epoch(
 
     model.train()
     functional.reset_net(model)
+    clear_ngcu_runtime_states(model)
 
     end = time.time()
     last_idx = len(loader) - 1
@@ -1682,26 +1860,25 @@ def train_one_epoch(
 
         with amp_autocast('cuda'):
             output = model(input)[0] #
-            c_states = []
-            firing_rates = []
-            #for m in model.modules():
-                # 收集 AdvancedNGCUDendCompartment 产生的 (T, B, N) 序列
-            #    if hasattr(m, 'current_C_seq'):
-            #        c_states.append(m.current_C_seq)
-                # 收集神经元的平均放电率 (需确保你的 LIF 类记录了该属性)
-            #    if hasattr(m, 'firing_rate'):
-            #        firing_rates.append(m.firing_rate)
+            c_states, firing_rates, astro_traces = collect_ngcu_regularizers(model)
 
             if args.TET:
-                #loss = criterion.TET_loss(
-                #    output, target, loss_fn, means=args.TET_means, lamb=args.TET_lamb,c_states=c_states,firing_rates=firing_rates
-                #)
+                task_loss_fn = loss_fn.task_loss if isinstance(loss_fn, NGCULoss) else loss_fn
                 loss = criterion.TET_loss(
-                    output, target, loss_fn, means=args.TET_means, lamb=args.TET_lamb
+                    output, target, task_loss_fn, means=args.TET_means, lamb=args.TET_lamb
                 )
+                if isinstance(loss_fn, NGCULoss):
+                    loss = loss + loss_fn.regularization_loss(
+                        c_states_seq_list=c_states,
+                        firing_rates_list=firing_rates,
+                        astro_traces_list=astro_traces,
+                        ref_tensor=output,
+                    )
             else:
-                #loss = loss_fn(output, target, c_states, firing_rates)
-                loss = loss_fn(output, target)
+                if isinstance(loss_fn, NGCULoss):
+                    loss = loss_fn(output, target, c_states, firing_rates, astro_traces)
+                else:
+                    loss = loss_fn(output, target)
         sample_number += input.shape[0]
         #if not args.distributed:
         if args.distributed:
@@ -1712,35 +1889,64 @@ def train_one_epoch(
         losses_m.update(reduced_loss.item(), input.size(0))                
 
         optimizer.zero_grad()
+        astro_clip_params = get_astro_clip_params(model)
         if loss_scaler is not None:
-            loss_scaler(
-                loss,
-                optimizer,
-                clip_grad=args.clip_grad,
-                clip_mode=args.clip_mode,
-                parameters=model_parameters(
-                    model, exclude_head="agc" in args.clip_mode
-                ),
-                create_graph=second_order,
-            )
+            if args.astro_clip_grad is not None and astro_clip_params and hasattr(loss_scaler, "_scaler"):
+                loss_scaler._scaler.scale(loss).backward(create_graph=second_order)
+                #for name, param in model.named_parameters():
+                #    if param.requires_grad and param.grad is None:
+                #        print(f"未使用到的参数: {name}")
+                loss_scaler._scaler.unscale_(optimizer)
+                if args.clip_grad is not None:
+                    dispatch_clip_grad(
+                        model_parameters(model, exclude_head="agc" in args.clip_mode),
+                        value=args.clip_grad,
+                        mode=args.clip_mode,
+                    )
+                dispatch_clip_grad(
+                    astro_clip_params,
+                    value=args.astro_clip_grad,
+                    mode=args.clip_mode,
+                )
+                loss_scaler._scaler.step(optimizer)
+                loss_scaler._scaler.update()
+            else:
+                loss_scaler(
+                    loss,
+                    optimizer,
+                    clip_grad=args.clip_grad,
+                    clip_mode=args.clip_mode,
+                    parameters=model_parameters(
+                        model, exclude_head="agc" in args.clip_mode
+                    ),
+                    create_graph=second_order,
+                )
         else:
             # loss.backward()
             loss.backward(create_graph=second_order)
+            #for name, param in model.named_parameters():
+            #    if param.requires_grad and param.grad is None:
+            #        print(f"未使用到的参数: {name}")
             if args.clip_grad is not None:
                 dispatch_clip_grad(
                     model_parameters(model, exclude_head="agc" in args.clip_mode),
                     value=args.clip_grad,
                     mode=args.clip_mode,
                 )
+            if args.astro_clip_grad is not None and astro_clip_params:
+                dispatch_clip_grad(
+                    astro_clip_params,
+                    value=args.astro_clip_grad,
+                    mode=args.clip_mode,
+                )
             optimizer.step()
 
         functional.reset_net(model)
-        #for m in model.modules():
-        #    if hasattr(m, 'current_C_seq'):
-        #        m.current_C_seq = None # 显式释放计算图引用
+        clear_ngcu_runtime_states(model)
         if model_ema is not None:
             model_ema.update(model)
             functional.reset_net(model_ema)
+            clear_ngcu_runtime_states(model_ema)
 
         torch.cuda.synchronize()
         num_updates += 1
@@ -1845,9 +2051,7 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix="")
                 print(target)
             loss = loss_fn(output, target)
             functional.reset_net(model)
-            #for m in model.modules():
-            #    if hasattr(m, 'current_C_seq'):
-            #        m.current_C_seq = None # 显式释放计算图引用
+            clear_ngcu_runtime_states(model)
 
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
 

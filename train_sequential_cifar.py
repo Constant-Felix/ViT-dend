@@ -301,32 +301,39 @@ class MaskedSlidingPSN(nn.Module):
             raise NotImplementedError(self.backend)
 
 class dendneuron(nn.Module):
-    def __init__(self, channels, soma_shape, dend_model=True,multi=True,integer=True,num_compartment=2,spsn=False,concat=False):
+    def __init__(self, channels, soma_shape, dend_model=True,multi=True,integer=True,num_compartment=2,concat=False,soma_astro=False):
         super().__init__()
+        self.soma_shape = np.zeros((3,),int)
         if dend_model==False:
             self.neuron = MultiStepLIFNode(tau=2.0, detach_reset=True)
         else:
-            if multi==False:
-                self.dc = dend_compartment.PassiveDendCompartment(step_mode="m",c_sub=channels,soma_dim=2)
+            if soma_astro:
+                self.dc = dend_compartment.PureMultiScaleDendCompartment(num_compartment,step_mode='m',c_sub=channels)
+            elif multi==False:
+                self.dc = dend_compartment.PassiveDendCompartment(step_mode="m",c_sub=channels)
             else:
-                self.dc = dend_compartment.AdvancedNGCUDendCompartment(num_compartment,step_mode='m',c_sub=channels,soma_dim=2)   ###
+                self.dc = dend_compartment.AdvancedNGCUDendCompartment(num_compartment,step_mode='m',c_sub=channels)   ###
             self.wr = wiring.SegregatedDendWiring(num_compartment)
             self.dend = dendrite.SegregatedDend(step_mode='m',compartment=self.dc,wiring=self.wr)
-            if spsn == True:
-                self.soma = MaskedSlidingPSN(order=32,surrogate_function=surrogate.ATan(),exp_init=False)
+
+            if soma_astro and integer == False:
+                self.soma = soma.AstroLIFSoma(step_mode='m',detach_reset=True,v_reset=None)
+            elif soma_astro:
+                self.soma = soma.AstroIntergerSoma(step_mode='m')
             elif integer == False:
                 self.soma = soma.LIFSoma(step_mode='m',detach_reset=True,v_reset=None)
             else:
-                self.soma = soma.IntergerSoma_ssf(step_mode='m')
+                self.soma = soma.IntergerSoma(step_mode='m')
+
             if concat == False:
-                self.neuron = neuron.VActivationForwardDendNeuron(dend=self.dend,soma=self.soma,soma_shape=soma_shape,psn=True,forward_strength_learnable=True)
+                self.neuron = neuron.VActivationForwardDendNeuron(dend=self.dend,soma=self.soma,soma_shape=self.soma_shape,psn=True,forward_strength_learnable=True)
             else:
-                self.neuron = neuron.VConcatForwardDendNeuron(dend=self.dend,soma=self.soma,soma_shape=soma_shape,forward_strength_learnable=True)             
+                self.neuron = neuron.VConcatForwardDendNeuron(dend=self.dend,soma=self.soma,soma_shape=self.soma_shape,forward_strength_learnable=True)
             self.neuron.forward_strength.data = torch.full((num_compartment,),1.0)
 
     def multi_step_forward(self, x_seq: Tensor, hook=None) -> Tensor:
         return self.neuron.multi_step_forward(x_seq, hook)
-    
+
     def forward(self, x: Tensor, hook=None) -> Tensor:
         return self.neuron.forward(x, hook)
     
