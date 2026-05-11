@@ -717,7 +717,7 @@ class VActivationForwardDendNeuron(VForwardDendNeuron):
             self.soma.step_mode = "m"
         soma_spike_seq = self.soma(input2soma_seq)
         #if hook==None:   ##
-            #return soma_spike_seq ##
+        #    return soma_spike_seq ##
         if self.store_v_dend_seq:
             self.v_dend_seq = self.dend.compartment.v_seq
         if self.store_v_soma_seq:

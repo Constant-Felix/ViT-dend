@@ -1,4 +1,4 @@
-epochs: 100
+epochs: 100 #100
 time_steps: 16
 dim: 256
 num_heads: 16
@@ -36,13 +36,13 @@ batch_size: 16
 val_batch_size: 16
 decay_rate: 0.1
 lr: 5e-3 #5e-3
-min_lr: 1e-5
+min_lr: 1e-5 #1e-5
 sched: cosine
 weight_decay: 6e-2
 cooldown_epochs: 10
-warmup_epochs: 10
+warmup_epochs: 10 #10
 decay_epochs: 20
-warmup_lr: 0.00001
+warmup_lr: 1e-5  #0.00001
 opt: adamw
 smoothing: 0.1
 workers: 4

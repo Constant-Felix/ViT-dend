@@ -301,18 +301,18 @@ class MaskedSlidingPSN(nn.Module):
             raise NotImplementedError(self.backend)
 
 class dendneuron(nn.Module):
-    def __init__(self, channels, soma_shape, dend_model=True,multi=True,integer=True,num_compartment=2,concat=False,soma_astro=False):
+    def __init__(self, channels, soma_shape, dend_model=True,multi=True,integer=False,num_compartment=2,concat=False,soma_astro=False):
         super().__init__()
-        self.soma_shape = np.zeros((3,),int)
+        self.soma_shape = soma_shape
         if dend_model==False:
             self.neuron = MultiStepLIFNode(tau=2.0, detach_reset=True)
         else:
             if soma_astro:
-                self.dc = dend_compartment.PureMultiScaleDendCompartment(num_compartment,step_mode='m',c_sub=channels)
+                self.dc = dend_compartment.PureMultiScaleDendCompartment(num_compartment,step_mode='m',c_sub=channels,soma_dim=2)
             elif multi==False:
                 self.dc = dend_compartment.PassiveDendCompartment(step_mode="m",c_sub=channels)
             else:
-                self.dc = dend_compartment.AdvancedNGCUDendCompartment(num_compartment,step_mode='m',c_sub=channels)   ###
+                self.dc = dend_compartment.AdvancedNGCUDendCompartment(num_compartment,step_mode='m',c_sub=channels, soma_dim=2)   ###
             self.wr = wiring.SegregatedDendWiring(num_compartment)
             self.dend = dendrite.SegregatedDend(step_mode='m',compartment=self.dc,wiring=self.wr)
 
@@ -321,7 +321,7 @@ class dendneuron(nn.Module):
             elif soma_astro:
                 self.soma = soma.AstroIntergerSoma(step_mode='m')
             elif integer == False:
-                self.soma = soma.LIFSoma(step_mode='m',detach_reset=True,v_reset=None)
+                self.soma = soma.LIFSoma(decay_input=True, detach_reset=True,step_mode='m')
             else:
                 self.soma = soma.IntergerSoma(step_mode='m')
 
@@ -351,7 +351,7 @@ class CIFAR10Net(nn.Module):
                         in_channels = channels   
                     conv.append(layer.Conv1d(in_channels, channels*num_compartment, kernel_size=3, padding=1, bias=False)) #
                     conv.append(layer.BatchNorm1d(channels*num_compartment))
-                    conv.append(dendneuron(channels=channels*num_compartment,num_compartment=num_compartment,soma_shape=np.array((channels,length),dtype=int),spsn=spsn))
+                    conv.append(dendneuron(channels=channels*num_compartment,num_compartment=num_compartment,soma_shape=np.array((channels,length),dtype=int)))
                 conv.append(layer.AvgPool1d(2))
                 length = length/2    
         else:
@@ -363,7 +363,7 @@ class CIFAR10Net(nn.Module):
                         in_channels = channels   
                     conv.append(layer.Conv1d(in_channels, channels, kernel_size=3, padding=1, bias=False)) #
                     conv.append(layer.BatchNorm1d(channels))
-                    conv.append(dendneuron(channels=channels,num_compartment=num_compartment,soma_shape=np.array((channels/num_compartment,length),dtype=int),spsn=spsn,concat=True))            
+                    conv.append(dendneuron(channels=channels,num_compartment=num_compartment,soma_shape=np.array((channels/num_compartment,length),dtype=int),concat=True))            
 
                 conv.append(layer.AvgPool1d(2))
                 length = length/2
@@ -377,8 +377,8 @@ class CIFAR10Net(nn.Module):
             layer.Linear(channels * 8, channels*2),
             #IFNode5(32,surrogate.ATan()),
             #dendneuron(channels*num_compartment,num_compartment=num_compartment,soma_shape=np.array((channels,))),
-            soma.IntergerSoma_ssf(step_mode='m') if self.spsn==False else MaskedSlidingPSN(order=32,surrogate_function=surrogate.ATan(),exp_init=False),
-            #MultiStepLIFNode(tau=2.0, detach_reset=True,v_reset=None),
+            #soma.IntergerSoma_ssf(step_mode='m') if self.spsn==False else MaskedSlidingPSN(order=32,surrogate_function=surrogate.ATan(),exp_init=False),
+            MultiStepParametricLIFNode(decay_input=True, detach_reset=True),
             layer.Linear(channels*2, class_num),
         )
 
@@ -390,7 +390,7 @@ class CIFAR10Net(nn.Module):
         x_seq = self.fc(self.conv(x_seq))  # [W, N, C]
         return x_seq.mean(0)
 
-# python train_sequential_cifar.py -data-dir data/cifar10 -amp -opt sgd -channels 128 -epochs 310 -lr 0.05 
+# python train_sequential_cifar.py -data-dir /data/hyx/ViT-dend/data/cifar10 -amp -opt sgd -channels 128 -epochs 256 
 
 from datetime import datetime
 def main():

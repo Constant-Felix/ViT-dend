@@ -17,6 +17,7 @@ import torchvision.utils
 import torchvision.transforms as transforms
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
 import torchinfo
+import autoaugment
 from timm.data import (
     create_dataset,
     create_loader,
@@ -622,32 +623,32 @@ parser.add_argument(
     help="cutmix alpha, cutmix enabled if > 0. (default: 0.)",
 )
 parser.add_argument(
-    "--cutmix_minmax",
+    "--cutmix-minmax",
     type=float,
     nargs="+",
     default=None,
     help="cutmix min/max ratio, overrides alpha and enables cutmix if set (default: None)",
 )
 parser.add_argument(
-    "--mixup_prob",
+    "--mixup-prob",
     type=float,
     default=1.0,
     help="Probability of performing mixup or cutmix when either/both is enabled",
 )
 parser.add_argument(
-    "--mixup_switch_prob",
+    "--mixup-switch-prob",
     type=float,
     default=0.5,
     help="Probability of switching to cutmix when both mixup and cutmix enabled",
 )
 parser.add_argument(
-    "--mixup_mode",
+    "--mixup-mode",
     type=str,
     default="batch",
     help='How to apply mixup/cutmix params. Per "batch", "pair", or "elem"',
 )
 parser.add_argument(
-    "--mixup_off_epoch",
+    "--mixup-off-epoch",
     default=0,
     type=int,
     metavar="N",
@@ -990,6 +991,7 @@ ASTRO_PARAM_NAMES = {
     "alpha",
     "beta",
     "w_b",
+    "theta",
     "event_threshold",
     "event_delta_weight",
 }
@@ -1317,7 +1319,7 @@ def main():
              _logger.info(
                 str(
                     torchinfo.summary(
-                        model, (7, 2, args.in_channels, args.img_size, args.img_size)
+                        model, (16, 16, args.in_channels, args.img_size, args.img_size)  ##
                     )
                 )
             )   
@@ -1503,13 +1505,21 @@ def main():
             transform=False
         )
     elif args.dataset == "cifar10-dvs":
-        dataset = CIFAR10DVS(
-            args.data_dir,
-            data_type="frame",
-            frames_number=args.time_steps,
-            split_by="number",
-            transform=dvs_utils.Resize(64),
-        )
+        if args.qkformer == False:
+            dataset = CIFAR10DVS(
+                args.data_dir,
+                data_type="frame",
+                frames_number=args.time_steps,
+                split_by="number",
+                transform=dvs_utils.Resize(64),
+            )
+        else:
+            dataset = CIFAR10DVS(
+                args.data_dir,
+                data_type="frame",
+                frames_number=args.time_steps,
+                split_by="number"
+            )    
         dataset_train, dataset_eval = dvs_utils.split_to_train_test_set(
             0.9, dataset, 10
         )
@@ -1554,11 +1564,20 @@ def main():
     train_dvs_aug, train_dvs_trival_aug = None, None
     if args.dvs_aug:
         #train_dvs_aug = dvs_utils.Cutout(n_holes=1, length=16)
-        train_dvs_aug = transforms.Compose([
-                    transforms.RandomHorizontalFlip(p=0.5)
-                    ])
+        if args.qkformer == False:
+            train_dvs_aug = transforms.Compose([
+                        #transforms.RandomHorizontalFlip(p=0.5)
+                        dvs_utils.Cutout(n_holes=1, length=16)
+                        ])
+        else:
+            train_dvs_aug = transforms.Compose([
+                        transforms.RandomHorizontalFlip(p=0.5)
+                        ])    
     if args.dvs_trival_aug:
-        train_dvs_trival_aug = dvs_utils.SNNAugmentWide()
+        if args.qkformer == False:
+            train_dvs_trival_aug = dvs_utils.SNNAugmentWide()
+        else:
+            train_dvs_trival_aug = autoaugment.SNNAugmentWide()  
     mixup_fn = None
     mixup_active = args.mixup > 0 or args.cutmix > 0.0 or args.cutmix_minmax is not None
     if mixup_active:

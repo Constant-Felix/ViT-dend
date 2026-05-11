@@ -8,7 +8,7 @@ class NGCULoss(nn.Module):
                  c_max_threshold=0.9, 
                  eta1=0.01,   # L_bound 系数
                  eta2=0.001,  # L_stable 系数
-                 eta3=0.05,   # L_metabolic 系数
+                 eta3=0.01,   # L_metabolic 系数
                  target_rate=0.1): # 目标极低放电率 (10%)
         super().__init__()
         self.fn_loss = train_fn

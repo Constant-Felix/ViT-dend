@@ -719,11 +719,12 @@ class AdvancedNGCUDendCompartment(BaseDendCompartment):
         self,
         num_branches,
         c_sub=1,
-        init_tau=[2.0, 2.0],
+        init_tau=[1.5, 6.0],
         #init_tau=[1.2, 8.0],
         soma_dim=3,
         decay_input: bool = False,
         bn=True,
+        bn_old=False,
         res=False,
         v_rest: float = 0.0,
         step_mode: str = "m",
@@ -733,19 +734,26 @@ class AdvancedNGCUDendCompartment(BaseDendCompartment):
         last_sigmoid = True,
         last_tanh = False,
         use_event_write = True,
-        event_threshold: float = 0.1,
+        event_threshold: float = 0.3,
         event_slope: float = 8.0,
         event_delta_weight: float = 0.5,
+        spatial_astro: bool = True,
+        astro_pool_kernel: int = 3,
+        astro_active_eps: float = 1e-6,
     ):
         super().__init__(v_rest, step_mode, store_v_seq)
         self.soma_dim = soma_dim
         self.bn = bn
+        self.bn_old = bn_old
         self.res = res
         self.no_filter = no_filter
         self.last_sigmoid = last_sigmoid
         self.last_tanh = last_tanh
         self.use_astro = use_astro
         self.use_event_write = use_event_write
+        self.spatial_astro = spatial_astro
+        self.astro_pool_kernel = int(astro_pool_kernel)
+        self.astro_active_eps = float(astro_active_eps)
         self.c_sub = c_sub
         self.num_branches = num_branches
         self.decay_input = decay_input
@@ -761,18 +769,22 @@ class AdvancedNGCUDendCompartment(BaseDendCompartment):
             tau_data = torch.as_tensor(init_tau, dtype=torch.float32)
         self.tau_branches = nn.Parameter(tau_data.clone().detach().float())   
 
-        if self.bn:
-            self.branch_bn = nn.BatchNorm2d(self.c_sub, affine=True, momentum=0.1) if self.soma_dim == 3 else nn.BatchNorm1d(self.c_sub, affine=True, momentum=0.1)  
+        if self.bn or self.bn_old:
+            if self.bn and not self.bn_old:
+                self.branch_bn = nn.BatchNorm2d(self.c_sub, affine=True, momentum=0.1) if self.soma_dim == 3 else nn.BatchNorm1d(self.c_sub, affine=True, momentum=0.1)
+            if self.bn_old and not self.bn:
+                self.branch_bn = nn.BatchNorm1d(num_branches, affine=True, momentum=0.1)      
             nn.init.constant_(self.branch_bn.weight, 1.0)
             nn.init.constant_(self.branch_bn.bias, 0.0)
             if last_sigmoid == True or last_tanh == True:
                 if self.soma_dim == 3:
-                        # BN + Gating 模式 (静态图/DVS通用)
+                            # BN + Gating 模式 (静态图/DVS通用)
                     self.gate_alpha = nn.Parameter(torch.ones(1, 1, 1, 1, 1, num_branches))
                     self.gate_beta = nn.Parameter(torch.zeros(1, 1, 1, 1, 1, num_branches))
                 else:
                     self.gate_alpha = nn.Parameter(torch.ones(1, 1, 1, 1, num_branches))
                     self.gate_beta = nn.Parameter(torch.zeros(1, 1, 1, 1, num_branches))
+
         else:
             if last_sigmoid == True or last_tanh == True:   
                 self.gate_scale = nn.Parameter(torch.tensor(1.0))
@@ -782,12 +794,12 @@ class AdvancedNGCUDendCompartment(BaseDendCompartment):
         # 1. 极性写入通道 (Upward Writing)
         self.theta_exc = nn.Parameter(torch.tensor(0.0),requires_grad=False) ##
         self.theta_inh = nn.Parameter(torch.tensor(0.0),requires_grad=False) ##
-        self.theta = nn.Parameter(torch.full((num_branches,), 0.1)) ##
+        self.theta = nn.Parameter(torch.full((num_branches,), 0.15)) ##
         #self.theta = nn.Parameter(torch.tensor((0.7, 0.3)))
         self.w_exc = nn.Parameter(torch.tensor(1.0))
         self.w_inh = nn.Parameter(torch.tensor(1.0))
         
-        self.lambda_local = nn.Parameter(torch.tensor(0.2)) ## 适当调大
+        self.lambda_local = nn.Parameter(torch.tensor(0.4)) ## 适当调大
         self.event_threshold = nn.Parameter(torch.tensor(event_threshold, dtype=torch.float32))
         self.event_delta_weight = nn.Parameter(torch.tensor(event_delta_weight, dtype=torch.float32))
         self.event_slope = float(event_slope)
@@ -813,6 +825,56 @@ class AdvancedNGCUDendCompartment(BaseDendCompartment):
         tau_vec_rest = 1.0 - tau_vec_init
         return tau_matrix, tau_vec_init, tau_vec_rest, tau
 
+    def _local_active_mean(self, x: torch.Tensor):
+        """Channel-collapsed local active mean for astro microdomains."""
+        kernel = self.astro_pool_kernel
+        energy = x.mean(dim=1, keepdim=True)
+        if kernel <= 1:
+            return energy
+
+        mask = (energy > 0).to(energy.dtype)
+        padding = kernel // 2
+        if self.soma_dim == 3:
+            B, _, H, W, N = energy.shape
+            energy_flat = energy.permute(0, 4, 1, 2, 3).reshape(B * N, 1, H, W)
+            mask_flat = mask.permute(0, 4, 1, 2, 3).reshape(B * N, 1, H, W)
+            numerator = F.avg_pool2d(
+                energy_flat * mask_flat,
+                kernel_size=kernel,
+                stride=1,
+                padding=padding,
+                count_include_pad=False,
+            )
+            denominator = F.avg_pool2d(
+                mask_flat,
+                kernel_size=kernel,
+                stride=1,
+                padding=padding,
+                count_include_pad=False,
+            ).clamp_min(self.astro_active_eps)
+            pooled = numerator / denominator
+            return pooled.view(B, N, 1, H, W).permute(0, 2, 3, 4, 1).contiguous()
+
+        B, _, H, N = energy.shape
+        energy_flat = energy.permute(0, 3, 1, 2).reshape(B * N, 1, H)
+        mask_flat = mask.permute(0, 3, 1, 2).reshape(B * N, 1, H)
+        numerator = F.avg_pool1d(
+            energy_flat * mask_flat,
+            kernel_size=kernel,
+            stride=1,
+            padding=padding,
+            count_include_pad=False,
+        )
+        denominator = F.avg_pool1d(
+            mask_flat,
+            kernel_size=kernel,
+            stride=1,
+            padding=padding,
+            count_include_pad=False,
+        ).clamp_min(self.astro_active_eps)
+        pooled = numerator / denominator
+        return pooled.view(B, N, 1, H).permute(0, 2, 3, 1).contiguous()
+
     def _compute_ngcu_modulation(self, y_seq):
         """
         核心物理引擎：计算胶质微结构域扩散、蓝斑核唤醒、以及向心全局记忆积分。
@@ -823,7 +885,15 @@ class AdvancedNGCUDendCompartment(BaseDendCompartment):
         device = y_seq.device
         
         # 初始化胶质状态
-        C_local = torch.zeros((B, N), device=device)   # 微结构域状态 (各分支独立)
+        if self.spatial_astro:
+            if self.soma_dim == 3:
+                H, W = y_seq.shape[3], y_seq.shape[4]
+                C_local = torch.zeros((B, 1, H, W, N), device=device, dtype=y_seq.dtype)
+            else:
+                H = y_seq.shape[3]
+                C_local = torch.zeros((B, 1, H, N), device=device, dtype=y_seq.dtype)
+        else:
+            C_local = torch.zeros((B, N), device=device, dtype=y_seq.dtype)   # 微结构域状态 (各分支独立)
         #C_astro = torch.zeros((B, 1), device=device)   # 胶质胞体宏观状态 (全局唯一)
 
         G_seq, B_seq = [], []
@@ -839,18 +909,24 @@ class AdvancedNGCUDendCompartment(BaseDendCompartment):
             I_raw = F.relu(-y_seq[t] - self.theta_inh) ##
 
             # 2. 然后再进行降维聚合
-            if self.soma_dim == 3:
-                E_t = E_raw.mean(dim=(1, 2, 3)) # (B, N)
-                I_t = I_raw.mean(dim=(1, 2, 3)) # (B, N)
+            if self.spatial_astro:
+                E_t = self._local_active_mean(E_raw)
+                I_t = self._local_active_mean(I_raw)
+                theta = self.theta.view(1, 1, 1, 1, N) if self.soma_dim == 3 else self.theta.view(1, 1, 1, N)
             else:
-                E_t = E_raw.mean(dim=(1, 2))
-                I_t = I_raw.mean(dim=(1, 2))
+                if self.soma_dim == 3:
+                    E_t = E_raw.mean(dim=(1, 2, 3)) # (B, N)
+                    I_t = I_raw.mean(dim=(1, 2, 3)) # (B, N)
+                else:
+                    E_t = E_raw.mean(dim=(1, 2))
+                    I_t = I_raw.mean(dim=(1, 2))
+                theta = self.theta
 
             # 3. 计算有饱和约束的写入量
             #Psi_t = torch.tanh(self.w_exc * E_t - self.w_inh * I_t)
-            Psi_t = self.w_exc * E_t - self.w_inh * I_t  
+            Psi_t = self.w_exc * E_t + self.w_inh * I_t  
             # 局部状态演化
-            write_t = torch.tanh(F.relu(Psi_t - self.theta))
+            write_t = torch.tanh(F.relu(Psi_t - theta.abs()))
             if self.use_event_write:
                 branch_activity = Psi_t
                 delta_drive = (write_t - C_local).abs()
@@ -874,11 +950,14 @@ class AdvancedNGCUDendCompartment(BaseDendCompartment):
 
 
         # 堆叠回 T 维度并调整形状以准备广播相乘
-        G_seq = torch.stack(G_seq, dim=0) # (T, B, N)
-        B_seq = torch.stack(B_seq, dim=0) # (T, B, N)
+        G_seq = torch.stack(G_seq, dim=0)
+        B_seq = torch.stack(B_seq, dim=0)
         C_seq = torch.stack(C_seq_list, dim=0)
         self.current_C_seq = C_seq
         self.current_event_gate_seq = torch.stack(event_gate_seq, dim=0)
+
+        if self.spatial_astro:
+            return G_seq, B_seq
 
         if self.soma_dim == 3:
             G_seq = G_seq.view(T, B, 1, 1, 1, N)
@@ -944,22 +1023,28 @@ class AdvancedNGCUDendCompartment(BaseDendCompartment):
         if self.use_astro:
             G_mod, B_mod = self._compute_ngcu_modulation(y)
             # 计算高级 NGCU 调制 (包含所有时空动力学)
-            y = G_mod * y + B_mod
-        if self.bn:
-            if self.soma_dim == 3:
-                y_permuted = y.permute(0, 1, 5, 2, 3, 4).contiguous()
-                y_reshaped = y_permuted.view(T * B, N * C_sub, H, W)
-                y_normed = self.branch_bn(y_reshaped).view(T, B, N, C_sub, H, W)
-                y_normed = y_normed.permute(0, 1, 3, 4, 5, 2).contiguous()
-            else:
-                y_permuted = y.permute(0, 1, 4, 2, 3).contiguous()
-                y_reshaped = y_permuted.view(T * B, N * C_sub, H)
-                y_normed = self.branch_bn(y_reshaped).view(T, B, N, C_sub, H)
-                y_normed = y_normed.permute(0, 1, 3, 4, 2).contiguous()        
+            #y = G_mod * y + B_mod
+        if self.bn or self.bn_old:    
+            if self.bn and not self.bn_old:
+                if self.soma_dim == 3:
+                    y_permuted = y.permute(0, 1, 5, 2, 3, 4).contiguous()
+                    y_reshaped = y_permuted.view(T * B, N * C_sub, H, W)
+                    y_normed = self.branch_bn(y_reshaped).view(T, B, N, C_sub, H, W)
+                    y_normed = y_normed.permute(0, 1, 3, 4, 5, 2).contiguous()
+                else:
+                    y_permuted = y.permute(0, 1, 4, 2, 3).contiguous()
+                    y_reshaped = y_permuted.view(T * B, N * C_sub, H)
+                    y_normed = self.branch_bn(y_reshaped).view(T, B, N, C_sub, H)
+                    y_normed = y_normed.permute(0, 1, 3, 4, 2).contiguous()
 
-            # 应用三方突触调制: y_out = G * y_bn + B
+            if self.bn_old and not self.bn:
+                
+                y_normed = self.branch_bn(y.view(-1,N))                
+                y_normed = y_normed.reshape(y.shape)
+                # 应用三方突触调制: y_out = G * y_bn + B
             y_out = y_normed
-            #y_out = y_normed
+            y_out = G_mod * y_out + B_mod
+                #y_out = y_normed
             if self.last_sigmoid == True:
                 gate = torch.sigmoid(self.gate_alpha * y_out + self.gate_beta)
                 y_out = y_out * gate
@@ -967,8 +1052,8 @@ class AdvancedNGCUDendCompartment(BaseDendCompartment):
                 gate = torch.tanh(self.gate_alpha * y_out + self.gate_beta)
                 y_out = y_out * gate    
         else:
-            #y_out = G_mod * y + B_mod
-            y_out = y
+            y_out = G_mod * y + B_mod
+            #y_out = y
             if self.last_sigmoid == True:
                 gate_factor = torch.sigmoid(self.gate_scale * y_out + self.gate_beta2)
                 y_out = y_out * gate_factor

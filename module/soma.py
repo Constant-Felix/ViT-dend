@@ -557,7 +557,7 @@ class LIFSoma(BaseSoma):
         self, tau: float = 2., decay_input: bool = True, 
         v_threshold: float = 1., v_reset: float = 0., 
         surrogate_function: Callable = surrogate.Sigmoid(), 
-        detach_reset: bool = False, step_mode: str = "s", 
+        detach_reset: bool = True, step_mode: str = "s", 
         backend: str = "torch", 
         store_v_seq: bool = False, store_v_pre_spike: bool = False
     ):

@@ -19,9 +19,9 @@ from timm.optim import create_optimizer
 from timm.scheduler import create_scheduler
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 import autoaugment
-_seed_ = 2021
+_seed_ = 2026
 import random
-random.seed(2021)
+random.seed(2026)
 root_path = os.path.abspath(__file__)
 
 torch.manual_seed(_seed_)  # use torch.manual_seed() to seed the RNG for all devices (both CPU and CUDA)
