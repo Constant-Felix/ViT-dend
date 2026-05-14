@@ -28,7 +28,7 @@ def _make_dend_compartment(c_sub, num_compartment, multi=False, soma_astro=False
 def _make_soma(integer=False, soma_astro=False):
     if soma_astro:
         return soma.AstroIntergerSoma(step_mode='m') if integer else soma.AstroLIFSoma(step_mode='m')
-    return soma.IntergerSoma(step_mode='m') if integer else MultiStepParametricLIFNode(decay_input=True, detach_reset=True, surrogate_function=surrogate.ATan())
+    return soma.IntergerSoma(step_mode='m') if integer else soma.LIFSoma(decay_input=True, detach_reset=True, surrogate_function=surrogate.ATan())
 
 
 class MLP(nn.Module):
@@ -137,7 +137,7 @@ class Token_dend_QK_Attention(nn.Module):   ###改成conv2d
             #self.k_lif.forward_strength.data = torch.full((num_compartment,),1.0)    
 
         if integer==False:
-            self.attn_lif = MultiStepParametricLIFNode(init_tau=2.0, v_threshold=0.5, detach_reset=True, surrogate_function=surrogate.ATan())
+            self.attn_lif = MultiStepLIFNode(tau=2.0, v_threshold=0.5, detach_reset=True, surrogate_function=surrogate.ATan())
             #self.attn_lif = MultiStepLIFNode(tau=2.0, detach_reset=True)
         else:
             self.attn_lif = soma.IntergerSoma_ssf()    
@@ -259,7 +259,7 @@ class Spiking_dend_Self_Attention(nn.Module):
             #self.v_lif.forward_strength.data = torch.full((num_compartment,),1.0)    
 
         if integer==False:
-            self.attn_lif = MultiStepParametricLIFNode(init_tau=2.0, v_threshold=0.5, detach_reset=True,surrogate_function=surrogate.ATan())
+            self.attn_lif = MultiStepLIFNode(tau=2.0, v_threshold=0.5, detach_reset=True,surrogate_function=surrogate.ATan())
             #self.attn_lif = MultiStepLIFNode(tau=2.0, detach_reset=True)
         else:
             self.attn_lif = soma.IntergerSoma_ssf()    
@@ -607,9 +607,9 @@ class vit_snn(nn.Module):
 @register_model
 def QKFormer_dend_dvs(pretrained=False, **kwargs):
     model = vit_snn(
-        #patch_size=16, embed_dims=256, num_heads=16, mlp_ratios=1,
-        #in_channels=2, num_classes=10, qkv_bias=False,
-        #norm_layer=partial(nn.LayerNorm, eps=1e-6), depths=4, sr_ratios=1,dend=True,multi=True,
+        patch_size=16, embed_dims=256, num_heads=16, mlp_ratios=1,
+        in_channels=2, num_classes=10, qkv_bias=False,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), depths=4, sr_ratios=1,dend=True,multi=True,num_compartment=2,
         **kwargs #
     )
     model.default_cfg = _cfg()

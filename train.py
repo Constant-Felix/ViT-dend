@@ -796,6 +796,7 @@ parser.add_argument(
 parser.add_argument(
     "--num_compartment",
     type=int,
+    default=2,
     help=""
 )
 parser.add_argument(
@@ -1518,7 +1519,8 @@ def main():
                 args.data_dir,
                 data_type="frame",
                 frames_number=args.time_steps,
-                split_by="number"
+                split_by="number",
+                transform=dvs_utils.Resize(64)  ###
             )    
         dataset_train, dataset_eval = dvs_utils.split_to_train_test_set(
             0.9, dataset, 10

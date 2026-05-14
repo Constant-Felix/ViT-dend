@@ -28,11 +28,11 @@ class dendneuron(nn.Module):
             self.dend = dendrite.SegregatedDend(step_mode='m',compartment=self.dc,wiring=self.wr)
 
             if soma_astro and integer == False:
-                self.soma = soma.AstroLIFSoma(step_mode='m',detach_reset=True,v_reset=None)
+                self.soma = soma.AstroLIFSoma(step_mode='m',detach_reset=True)
             elif soma_astro:
                 self.soma = soma.AstroIntergerSoma(step_mode='m')
             elif integer == False:
-                self.soma = soma.LIFSoma(step_mode='m',detach_reset=True,v_reset=None)
+                self.soma = soma.LIFSoma(step_mode='m',detach_reset=True)
             else:
                 self.soma = soma.IntergerSoma(step_mode='m')
 
@@ -545,7 +545,7 @@ def QKFormer_dend_mlp_only_dvs(pretrained=False, **kwargs):
     model = vit_snn(
         #patch_size=16, embed_dims=256, num_heads=16, mlp_ratios=1,
         #in_channels=2, num_classes=10, qkv_bias=False,
-        #norm_layer=partial(nn.LayerNorm, eps=1e-6), depths=4, sr_ratios=1,dend=True,multi=True,soma_astro=True,concat=True,
+        #norm_layer=partial(nn.LayerNorm, eps=1e-6), depths=4, sr_ratios=1,dend=True,multi=True,num_compartment=2,
         **kwargs #
     )
     model.default_cfg = _cfg()

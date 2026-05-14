@@ -719,10 +719,10 @@ class AdvancedNGCUDendCompartment(BaseDendCompartment):
         self,
         num_branches,
         c_sub=1,
-        init_tau=[1.5, 6.0],
-        #init_tau=[1.2, 8.0],
+        #init_tau=[1.2, 1.5, 4.0, 6.0],
+        init_tau=[1.2, 6.0],
         soma_dim=3,
-        decay_input: bool = False,
+        decay_input: bool = True,
         bn=True,
         bn_old=False,
         res=False,
@@ -730,14 +730,14 @@ class AdvancedNGCUDendCompartment(BaseDendCompartment):
         step_mode: str = "m",
         store_v_seq: bool = False,
         no_filter=False,
-        use_astro = True,
+        use_astro = False,
         last_sigmoid = True,
         last_tanh = False,
-        use_event_write = True,
+        use_event_write = False,
         event_threshold: float = 0.3,
         event_slope: float = 8.0,
         event_delta_weight: float = 0.5,
-        spatial_astro: bool = True,
+        spatial_astro: bool = False,
         astro_pool_kernel: int = 3,
         astro_active_eps: float = 1e-6,
     ):
@@ -794,23 +794,22 @@ class AdvancedNGCUDendCompartment(BaseDendCompartment):
         # 1. 极性写入通道 (Upward Writing)
         self.theta_exc = nn.Parameter(torch.tensor(0.0),requires_grad=False) ##
         self.theta_inh = nn.Parameter(torch.tensor(0.0),requires_grad=False) ##
-        self.theta = nn.Parameter(torch.full((num_branches,), 0.15)) ##
+        self.theta = nn.Parameter(torch.full((num_branches,), 1.0),requires_grad=True) ##
         #self.theta = nn.Parameter(torch.tensor((0.7, 0.3)))
         self.w_exc = nn.Parameter(torch.tensor(1.0))
         self.w_inh = nn.Parameter(torch.tensor(1.0))
         
-        self.lambda_local = nn.Parameter(torch.tensor(0.4)) ## 适当调大
+        self.lambda_local = nn.Parameter(torch.tensor(-1.0)) ## 适当调大
         self.event_threshold = nn.Parameter(torch.tensor(event_threshold, dtype=torch.float32))
         self.event_delta_weight = nn.Parameter(torch.tensor(event_delta_weight, dtype=torch.float32))
         self.event_slope = float(event_slope)
 
         # 4. 下行调制生成 (Downward Modulation)
-        self.alpha = nn.Parameter(torch.tensor(0.5))
+        self.alpha = nn.Parameter(torch.tensor(0.0))
         self.beta = nn.Parameter(torch.tensor(1.0))
         self.w_b = nn.Parameter(torch.tensor(0.1))
 
     def _build_tau_terms(self, T: int, device, dtype):
-        # ... (与你原本的矩阵构建代码完全一致，略去以节省空间，直接复用你原有代码) ...
         tau = torch.clamp(self.tau_branches, min=1.0 + 1e-5)
         a = 1.0 - 1.0 / tau
         t = torch.arange(T, device=device, dtype=dtype)
@@ -901,32 +900,36 @@ class AdvancedNGCUDendCompartment(BaseDendCompartment):
         event_gate_seq = []
 
         # 预计算 Sigmoid 约束的衰减率，确保其物理意义 (介于0到1之间)
-        lam_l = self.lambda_local
+        lam_l = torch.sigmoid(self.lambda_local)
 
         for t in range(T):
-            # 1. 特征降维聚合 (注意这里去掉了 abs()，保留正负极性！)
-            E_raw = F.relu(y_seq[t] - self.theta_exc)  ##
-            I_raw = F.relu(-y_seq[t] - self.theta_inh) ##
+            #energy_seq = y_seq[t].abs().mean(dim=(1, 2, 3)) if self.soma_dim == 3 else y_seq[t].abs().mean(dim=(1, 2))
+            #E_raw = F.relu(y_seq[t] - self.theta_exc)  ##
+            #I_raw = F.relu(-y_seq[t] - self.theta_inh) ##
 
             # 2. 然后再进行降维聚合
             if self.spatial_astro:
-                E_t = self._local_active_mean(E_raw)
-                I_t = self._local_active_mean(I_raw)
+                #E_t = self._local_active_mean(E_raw)
+                #I_t = self._local_active_mean(I_raw)
+                energy = self._local_active_mean(energy_seq)  #  这里要完全重写或者放弃!!!
                 theta = self.theta.view(1, 1, 1, 1, N) if self.soma_dim == 3 else self.theta.view(1, 1, 1, N)
             else:
                 if self.soma_dim == 3:
-                    E_t = E_raw.mean(dim=(1, 2, 3)) # (B, N)
-                    I_t = I_raw.mean(dim=(1, 2, 3)) # (B, N)
+                    #E_t = E_raw.mean(dim=(1, 2, 3)) # (B, N)
+                    #I_t = I_raw.mean(dim=(1, 2, 3)) # (B, N)
+                    energy_seq = y_seq[t].abs().mean(dim=(1, 2, 3))
                 else:
-                    E_t = E_raw.mean(dim=(1, 2))
-                    I_t = I_raw.mean(dim=(1, 2))
+                    #E_t = E_raw.mean(dim=(1, 2))
+                    #I_t = I_raw.mean(dim=(1, 2))
+                    energy_seq = y_seq[t].abs().mean(dim=(1, 2))
                 theta = self.theta
 
             # 3. 计算有饱和约束的写入量
             #Psi_t = torch.tanh(self.w_exc * E_t - self.w_inh * I_t)
-            Psi_t = self.w_exc * E_t + self.w_inh * I_t  
+            #Psi_t = self.w_exc * E_t + self.w_inh * I_t
+            Psi_t = energy_seq  
             # 局部状态演化
-            write_t = torch.tanh(F.relu(Psi_t - theta.abs()))
+            write_t = torch.tanh(F.relu(Psi_t - theta))
             if self.use_event_write:
                 branch_activity = Psi_t
                 delta_drive = (write_t - C_local).abs()
@@ -1041,9 +1044,12 @@ class AdvancedNGCUDendCompartment(BaseDendCompartment):
                 
                 y_normed = self.branch_bn(y.view(-1,N))                
                 y_normed = y_normed.reshape(y.shape)
-                # 应用三方突触调制: y_out = G * y_bn + B
+                # 应用三方突触调制: y_out = G * y_bn + B 
+            
             y_out = y_normed
-            y_out = G_mod * y_out + B_mod
+            if self.use_astro:
+               
+                y_out = G_mod * y_out + B_mod
                 #y_out = y_normed
             if self.last_sigmoid == True:
                 gate = torch.sigmoid(self.gate_alpha * y_out + self.gate_beta)
