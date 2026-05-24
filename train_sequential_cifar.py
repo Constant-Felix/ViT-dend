@@ -9,7 +9,8 @@ import numpy as np
 import torchvision
 from torchvision import transforms
 from spikingjelly.clock_driven.neuron import MultiStepParametricLIFNode, MultiStepLIFNode
-from spikingjelly.activation_based import neuron, functional, surrogate, layer
+from spikingjelly.activation_based import functional, surrogate, layer
+from spikingjelly.activation_based import neuron as ner
 from torch.utils.tensorboard import SummaryWriter
 import os
 import time
@@ -300,58 +301,197 @@ class MaskedSlidingPSN(nn.Module):
         else:
             raise NotImplementedError(self.backend)
 
-class dendneuron(nn.Module):
-    def __init__(self, channels, soma_shape, dend_model=True,multi=True,integer=False,num_compartment=2,concat=False,soma_astro=False):
+
+class DecayPorderMaskedLinear(nn.Linear):
+    def __init__(self, P: int, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.P = P
+        mask1 = torch.ones_like(self.weight.data)
+        mask0 = torch.tril(mask1) * torch.triu(mask1, -(P - 1))
+        self.register_buffer('mask0', mask0)
+        self.register_buffer('mask1', mask1)
+        self.k = 0.
+        # k should be set as epoch / (epochs - 1)
+
+    @staticmethod
+    @torch.jit.script
+    def gen_mask(k: float, mask0: torch.Tensor, mask1: torch.Tensor):
+        return k * mask0 + (1. - k) * mask1
+
+    @staticmethod
+    @torch.jit.script
+    def gen_masked_weight(weight: torch.Tensor, k: float, mask0: torch.Tensor, mask1: torch.Tensor):
+        return weight * (k * mask0 + (1. - k) * mask1)
+
+    def masked_weight(self):
+        return self.gen_masked_weight(self.weight, self.k, self.mask0, self.mask1)
+
+    def forward(self, x: torch.Tensor):
+        return F.linear(x, self.weight * self.gen_mask(self.k, self.mask0, self.mask1), self.bias)
+
+class IFNode5PorderMaskD(nn.Module):
+    def __init__(self, T: int, surrogate_function: surrogate.SurrogateFunctionBase, P: int):
         super().__init__()
-        self.soma_shape = soma_shape
-        if dend_model==False:
-            self.neuron = MultiStepLIFNode(tau=2.0, detach_reset=True)
-        else:
-            if soma_astro:
-                self.dc = dend_compartment.PureMultiScaleDendCompartment(num_compartment,step_mode='m',c_sub=channels,soma_dim=2)
-            elif multi==False:
-                self.dc = dend_compartment.PassiveDendCompartment(step_mode="m",c_sub=channels)
+        self.surrogate_function = surrogate_function
+        self.fc = DecayPorderMaskedLinear(P, T, T)
+        nn.init.constant_(self.fc.bias, -1)
+
+    def forward(self, x_seq: torch.Tensor):
+        # x_seq.shape = [T, N, *]
+        h_seq = torch.addmm(self.fc.bias.unsqueeze(1), self.fc.masked_weight(), x_seq.flatten(1))
+        spike = self.surrogate_function(h_seq)
+        return spike.view(x_seq.shape)
+
+
+
+def _dend_total_compartment(dend, num_branches, compartments_per_branch, multi=True):
+    if not dend:
+        return 1
+    return num_branches * compartments_per_branch if multi else num_branches
+
+
+def _make_dend_compartment(c_sub, num_branches, compartments_per_branch=2, multi=False, soma_astro=False):
+    if multi:
+        return dend_compartment.HierarchicalTrunkDistalDendCompartment(
+            num_branches=num_branches,
+            compartments_per_branch=compartments_per_branch,
+            step_mode='m',
+            c_sub=c_sub,
+            soma_dim=2
+        )
+    if soma_astro:
+        return dend_compartment.PureMultiScaleDendCompartment(
+            num_branches, step_mode='m', c_sub=c_sub, soma_dim=2
+        )
+    return dend_compartment.PureMultiScaleDendCompartment(
+            num_branches, step_mode='m', c_sub=c_sub, soma_dim=2)   #dend_compartment.AdvancedNGCUDendCompartment(num_branches ,step_mode="m", c_sub=c_sub,soma_dim=2)
+
+
+def _make_dend_wiring(num_branches, compartments_per_branch=2, multi=False):
+    if multi:
+        return wiring.BranchGroupedDendWiring(
+            num_branches=num_branches,
+            compartments_per_branch=compartments_per_branch,
+        )
+    return wiring.SegregatedDendWiring(num_branches)
+
+
+def _set_dend_soma_shape(dend_lif, x, total_compartment):
+    if x.shape[2] % total_compartment != 0:
+        raise ValueError(
+            f"Dend input channels ({x.shape[2]}) must be divisible by "
+            f"total_compartment ({total_compartment})."
+        )
+    dend_lif.soma_shape[0] = int(x.shape[2] // total_compartment)
+    dend_lif.soma_shape[1] = x.shape[3]
+
+
+def _set_forward_strength(lif, num_branches):
+    lif.forward_strength.data = torch.full((num_branches,), 1.0)
+    return lif
+
+
+def _make_soma(integer=False, soma_astro=False):
+    if soma_astro:
+        return soma.AstroPSNIntergerSoma_ssf(psn_order=32) if integer else soma.AstroLIFSoma(step_mode='m')
+    return soma.IntergerSoma_ssf(step_mode='m',detach_reset=True) if integer else MultiStepLIFNode(decay_input=True, detach_reset=True)      #soma.LIFSoma(decay_input=True, detach_reset=True, surrogate_function=surrogate.ATan())
+
+
+class dendneuron(nn.Module):
+    def __init__(
+        self,
+        channels,
+        dend_model=True,
+        multi=False,
+        integer=True,
+        num_branches=2,
+        compartments_per_branch=2,
+        soma_astro=True,
+        plain_lif="lif",
+        psn=False
+    ):
+        super().__init__()
+        self.dend_model = dend_model
+        self.num_branches = num_branches
+        self.compartments_per_branch = compartments_per_branch
+        self.total_compartment = _dend_total_compartment(
+            dend_model, num_branches, compartments_per_branch, multi=multi
+        )
+
+        if not dend_model:
+            if plain_lif == "integer":
+                self.neuron = soma.IntergerSoma(step_mode='m')
+            elif plain_lif == "lif":
+                self.neuron = MultiStepLIFNode(tau=2.0, detach_reset=True, surrogate_function=surrogate.ATan())
             else:
-                self.dc = dend_compartment.AdvancedNGCUDendCompartment(num_compartment,step_mode='m',c_sub=channels, soma_dim=2)   ###
-            self.wr = wiring.SegregatedDendWiring(num_compartment)
-            self.dend = dendrite.SegregatedDend(step_mode='m',compartment=self.dc,wiring=self.wr)
+                self.neuron = MultiStepParametricLIFNode(
+                    decay_input=True, detach_reset=True, surrogate_function=surrogate.ATan()
+                )
+            return
 
-            if soma_astro and integer == False:
-                self.soma = soma.AstroLIFSoma(step_mode='m',detach_reset=True,v_reset=None)
-            elif soma_astro:
-                self.soma = soma.AstroIntergerSoma(step_mode='m')
-            elif integer == False:
-                self.soma = soma.LIFSoma(decay_input=True, detach_reset=True,step_mode='m')
-            else:
-                self.soma = soma.IntergerSoma(step_mode='m')
+        self.dc = _make_dend_compartment(
+            channels,
+            num_branches,
+            compartments_per_branch=compartments_per_branch,
+            multi=multi,
+            soma_astro=soma_astro,
+        )
+        self.wr = _make_dend_wiring(
+            num_branches,
+            compartments_per_branch=compartments_per_branch,
+            multi=multi,
+        )
+        self.dend = dendrite.SegregatedDend(step_mode='m', compartment=self.dc, wiring=self.wr)
+        self.soma = _make_soma(integer=integer, soma_astro=soma_astro)
+        self.neuron = _set_forward_strength(
+            neuron.VActivationForwardDendNeuron(
+                dend=self.dend,
+                soma=self.soma,
+                f_da=lambda x: x,
+                soma_shape=np.zeros((2,), int),
+                forward_strength_learnable=True,
+                psn=psn
+            ),
+            num_branches,
+        )
 
-            if concat == False:
-                self.neuron = neuron.VActivationForwardDendNeuron(dend=self.dend,soma=self.soma,soma_shape=self.soma_shape,psn=True,forward_strength_learnable=True)
-            else:
-                self.neuron = neuron.VConcatForwardDendNeuron(dend=self.dend,soma=self.soma,soma_shape=self.soma_shape,forward_strength_learnable=True)
-            self.neuron.forward_strength.data = torch.full((num_compartment,),1.0)
-
-    def multi_step_forward(self, x_seq: Tensor, hook=None) -> Tensor:
-        return self.neuron.multi_step_forward(x_seq, hook)
-
-    def forward(self, x: Tensor, hook=None) -> Tensor:
-        return self.neuron.forward(x, hook)
+    def forward(self, x, hook=None):
+        if not self.dend_model:
+            return self.neuron(x)
+        _set_dend_soma_shape(self.neuron, x, self.total_compartment)
+        x = self.neuron(x, hook)
+        return x
     
 class CIFAR10Net(nn.Module):
-    def __init__(self, channels, length: int, class_num: int,num_compartment=2,spsn=False,concat=False):
+    def __init__(self, channels, length: int, class_num: int,num_branches=2,compartments_per_branch=4,spsn=False,concat=False, branch=False,psn=False): #num_branches and branch
         super().__init__()
         conv = []
+        total_comp = num_branches * compartments_per_branch if branch == True else num_branches
         length = length
         if concat == False:
             for i in range(2):
                 for j in range(3):
                     if conv.__len__() == 0:
                         in_channels = 3
+                        out_channels = channels*total_comp
                     else:
-                        in_channels = channels   
-                    conv.append(layer.Conv1d(in_channels, channels*num_compartment, kernel_size=3, padding=1, bias=False)) #
-                    conv.append(layer.BatchNorm1d(channels*num_compartment))
-                    conv.append(dendneuron(channels=channels*num_compartment,num_compartment=num_compartment,soma_shape=np.array((channels,length),dtype=int)))
+                        if i==0:
+                            if j!=1:
+                                in_channels = channels//total_comp
+                                out_channels = channels*total_comp
+                            else:
+                                in_channels = channels
+                                out_channels = channels
+                        if i==1:
+                            if j!=1:
+                                in_channels = channels
+                                out_channels = channels
+                            else:
+                                in_channels = channels//total_comp
+                                out_channels = channels*total_comp         
+                    conv.append(layer.Conv1d(in_channels, out_channels, kernel_size=3, padding=1, bias=False)) #
+                    conv.append(layer.BatchNorm1d(out_channels))
+                    conv.append(dendneuron(channels=out_channels,num_branches=num_branches,compartments_per_branch=compartments_per_branch,psn=psn))
                 conv.append(layer.AvgPool1d(2))
                 length = length/2    
         else:
@@ -374,12 +514,15 @@ class CIFAR10Net(nn.Module):
 
         self.fc = nn.Sequential(
             layer.Flatten(),
-            layer.Linear(channels * 8, channels*2),
+            layer.Linear(channels * 8 // total_comp, channels*2*total_comp),
             #IFNode5(32,surrogate.ATan()),
             #dendneuron(channels*num_compartment,num_compartment=num_compartment,soma_shape=np.array((channels,))),
             #soma.IntergerSoma_ssf(step_mode='m') if self.spsn==False else MaskedSlidingPSN(order=32,surrogate_function=surrogate.ATan(),exp_init=False),
-            MultiStepParametricLIFNode(decay_input=True, detach_reset=True),
-            layer.Linear(channels*2, class_num),
+            #MultiStepLIFNode(decay_input=True, detach_reset=True),
+            #MultiStepParametricLIFNode(decay_input=True, detach_reset=True),
+            #ner.ParametricLIFNode(init_tau=2., detach_reset=True, step_mode='m', backend='torch'),
+            soma.IntergerSoma_ssf(step_mode='m',detach_reset=True),
+            layer.Linear(channels*2*total_comp, class_num),
         )
 
         functional.set_step_mode(self, 'm')
@@ -390,13 +533,13 @@ class CIFAR10Net(nn.Module):
         x_seq = self.fc(self.conv(x_seq))  # [W, N, C]
         return x_seq.mean(0)
 
-# python train_sequential_cifar.py -data-dir /data/hyx/ViT-dend/data/cifar10 -amp -opt sgd -channels 128 -epochs 256 
+# python train_sequential_cifar.py -data-dir /data/hyx/ViT-dend/data/cifar10 -amp -channels 128  -warmup-epochs 0  -epochs 400 -opt adamw -lr 0.001  #-opt sgd
 
 from datetime import datetime
 def main():
 
     parser = argparse.ArgumentParser(description='Classify Sequential CIFAR10/100')
-    parser.add_argument('-device', default='cuda:5', help='device')
+    parser.add_argument('-device', default='cuda:0', help='device')
     parser.add_argument('-b', default=128, type=int, help='batch size')
     parser.add_argument('-epochs', default=256, type=int, metavar='N',
                         help='number of total epochs to run')
@@ -409,11 +552,17 @@ def main():
     parser.add_argument('-opt', type=str, help='use which optimizer. SDG or Adam')
     parser.add_argument('-momentum', default=0.9, type=float, help='momentum for SGD')
     parser.add_argument('-lr', default=0.1, type=float, help='learning rate')
+    parser.add_argument('-min-lr', '--min-lr', default=0, type=float,
+                        help='minimum learning rate for cosine scheduler')
+    parser.add_argument('-warmup-epochs', '--warmup-epochs', default=20, type=int,
+                        help='number of warmup epochs before cosine decay')
+    parser.add_argument('-warmup-lr', '--warmup-lr', default=1e-4, type=float,
+                        help='initial learning rate used at the start of warmup')
     parser.add_argument('-channels', default=128, type=int, help='channels of CSNN')
     parser.add_argument('-neu', type=str, help='use which neuron')
     parser.add_argument('-class-num', type=int, default=10)
 
-    parser.add_argument('-P', type=int, default=None, help='the order of the masked/sliding PSN')
+    parser.add_argument('-P', default=32, type=int, help='the order of the masked/sliding PSN')
     parser.add_argument('-exp-init', action='store_true', help='use the exp init method to initialize the weight of SPSN')
 
 
@@ -515,7 +664,7 @@ def main():
         os.makedirs(pt_dir)
 
     #net = CIFAR10Net(channels=args.channels, neu=args.neu, T=32, class_num=args.class_num, P=args.P, exp_init=args.exp_init)
-    net = CIFAR10Net(channels=args.channels, length=32, class_num=args.class_num,num_compartment=2)  ##
+    net = CIFAR10Net(channels=args.channels, length=32, class_num=args.class_num)  ##
     net.to(args.device)
     n_parameters = sum(p.numel() for p in net.parameters() if p.requires_grad)
     print(f"number of params: {n_parameters}")
@@ -534,8 +683,35 @@ def main():
         optimizer = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=0.)
     else:
         raise NotImplementedError(args.opt)
+    
+    warmup_epochs = max(0, min(args.warmup_epochs, args.epochs - 1))
+    if warmup_epochs > 0:
+        warmup_start_factor = max(args.warmup_lr / args.lr, 1e-8)
+        warmup_start_factor = min(warmup_start_factor, 1.0)
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=warmup_start_factor,
+            end_factor=1.0,
+            total_iters=warmup_epochs,
+        )
+        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=args.epochs - warmup_epochs,
+            eta_min=args.min_lr,
+        )
+        lr_scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[warmup_epochs],
+        )
+    else:
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=args.epochs,
+            eta_min=args.min_lr,
+        )
 
-    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs)
+    #lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs)
 
     if args.resume:
         checkpoint = torch.load(args.resume, map_location='cpu')

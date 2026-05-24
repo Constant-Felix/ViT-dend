@@ -193,6 +193,42 @@ class SegregatedDendWiring(BaseWiring):
     def build(self):
         pass
 
+class BranchGroupedDendWiring(SegregatedDendWiring):
+    """Segregated inputs with branch-grouped outputs.
+
+    This wiring declares ``B * K`` input compartments but only ``B`` branch
+    outputs.  It is intended for dendritic compartment modules that perform the
+    branch-local reduction themselves, such as
+    ``HierarchicalTrunkDistalDendCompartment``.
+    """
+
+    def __init__(self, num_branches: int, compartments_per_branch: int):
+        if num_branches <= 0:
+            raise ValueError("num_branches must be positive")
+        if compartments_per_branch < 2:
+            raise ValueError("compartments_per_branch must be at least 2")
+        self._num_branches = int(num_branches)
+        self._compartments_per_branch = int(compartments_per_branch)
+        n_compartment = self._num_branches * self._compartments_per_branch
+        BaseWiring.__init__(
+            self,
+            n_compartment=n_compartment,
+            n_input=n_compartment,
+            output_index=list(range(self._num_branches)),
+            bidirection=False,
+        )
+
+    @property
+    def num_branches(self) -> int:
+        return self._num_branches
+
+    @property
+    def compartments_per_branch(self) -> int:
+        return self._compartments_per_branch
+
+    def build(self):
+        pass
+
 
 class Kto1DendWirng(BaseWiring):
     """The wiring diagram of a k-to-1 dendritic tree.

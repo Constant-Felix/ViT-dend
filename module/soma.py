@@ -2,6 +2,7 @@ from typing import Callable
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from spikingjelly.activation_based import neuron as ner
 from spikingjelly.activation_based import neuron
 from spikingjelly.activation_based import surrogate
 from spikingjelly.activation_based.base import MemoryModule
@@ -89,14 +90,15 @@ class AstroSomaMixin(MemoryModule):
 
     def _init_astro_state(
         self,
-        astro_lambda: float = 0.1,
+        astro_lambda: float = 0.2,
         astro_trace_decay: float = 0.9,
         astro_gain: float = 0.4,
         astro_bias_gain: float = 0.0,
+        astro_thre: float = 1.0,
         astro_spike_scale: float = 1.0,
         astro_pool_kernel: int = 3,
         astro_pool_mode: str = "avg",
-        astro_event_write: bool = True,
+        astro_event_write: bool = False,
         astro_event_threshold: float = 0.4,
         astro_event_slope: float = 8.0,
         astro_delta_weight: float = 0.5,
@@ -110,6 +112,7 @@ class AstroSomaMixin(MemoryModule):
         self.astro_trace_decay_logit = nn.Parameter(torch.logit(astro_trace_decay))
         self.astro_gain = nn.Parameter(torch.tensor(astro_gain, dtype=torch.float32))
         self.astro_bias_gain = nn.Parameter(torch.tensor(astro_bias_gain, dtype=torch.float32))
+        self.astro_thre = nn.Parameter(torch.tensor(astro_thre, dtype=torch.float32))
         self.astro_spike_scale = float(astro_spike_scale)
         self.astro_pool_kernel = int(astro_pool_kernel)
         self.astro_pool_mode = astro_pool_mode
@@ -181,7 +184,7 @@ class AstroSomaMixin(MemoryModule):
             self.astro_trace = torch.zeros_like(pooled_spike)
         trace_decay = torch.sigmoid(self.astro_trace_decay_logit)
         next_trace = trace_decay * self.astro_trace + pooled_spike
-        write = torch.tanh(next_trace)
+        write = torch.tanh(torch.relu(next_trace - self.astro_thre.abs()))
         lam = torch.sigmoid(self.astro_lambda_logit)
         if self.astro_event_write:
             delta_drive = (write - self.c).abs()
@@ -260,7 +263,7 @@ class MultiSpike4(nn.Module):
 class IntergerSoma(neuron.BaseNode):
     def __init__(
         self, tau: float = 2.,
-        v_threshold: float = 1., v_reset: float = 0.,detach_reset: bool = False,decay_input: bool = True, ##
+        v_threshold: float = 1., v_reset: float = 0.,detach_reset: bool = True,decay_input: bool = True, ##
         step_mode='m', backend='torch', thre = 4,
         surrogate_function: Callable = surrogate.Sigmoid()
     ):
@@ -390,29 +393,40 @@ class IntergerSoma_ssf(neuron.BaseNode): # 假设基于 SpikingJelly 或类似�
         
         # 替换原有的 MultiSpike 为 SSF 机制
         self.qtrick = SSF(U=thre, v_th=v_threshold)
+
+    def parallel_membrane_forward(self, x: torch.Tensor, tau: torch.Tensor):
+        """Compute the no-reset membrane recurrence for all timesteps at once.
+
+        This is equivalent to the previous serial recurrence in this class:
+        mem[0] = x[0]
+        mem[t] = beta * mem[t - 1] + drive[t], beta = 1 / tau.
+        Because SSF does not feed the spike/reset result back into mem[t + 1],
+        the recurrence is linear and can be written as a causal matrix product.
+        """
+        T = x.shape[0]
+        beta = (1.0 / tau).to(device=x.device, dtype=x.dtype)
+        if self.decay_input:
+            drive = x * (1.0 - beta)
+            drive = drive.clone()
+            drive[0] = x[0]
+        else:
+            drive = x
+
+        t = torch.arange(T, device=x.device, dtype=x.dtype)
+        diff = t[:, None] - t[None, :]
+        mask = diff >= 0
+        weights = torch.zeros((T, T), device=x.device, dtype=x.dtype)
+        weights = weights.masked_scatter(mask, beta.pow(diff[mask]).to(x.dtype))
+        mem = torch.matmul(weights, drive.flatten(1)).view_as(x)
+        return mem
     
     def multi_step_forward(self, x: torch.Tensor):
-        spike = torch.zeros_like(x[0]).to(x.device)
-        output = torch.zeros_like(x)
-        mem_old = 0
-        time_window = x.shape[0]
         tau = torch.clamp(self.tau, min=1+1e-3)
-        
-        for i in range(time_window):
-            if i >= 1:
-                if self.decay_input == False:
-                    mem = (mem_old)/tau + x[i]
-                else:
-                    mem = (mem_old)/tau + x[i]*(1-1/tau)
-            else:
-                mem = x[i]
-                
-            # 这里输入给 SSF 的是原始膜电位，SSF 内部会自动进行平移和缩放
-            spike = self.qtrick(mem)
-
-            mem_old = mem.clone()
-            output[i] = spike
-            
+        mem_seq = self.parallel_membrane_forward(x, tau)
+        # 这里输入给 SSF 的是原始膜电位，SSF 内部会自动进行平移和缩放
+        output = self.qtrick(mem_seq)
+        self.v = mem_seq[-1].detach()
+        self.firing_rate = output.float().mean()
         return output
 
 
@@ -427,7 +441,7 @@ class AstroIntergerSoma(IntergerSoma, AstroSomaMixin):
         astro_lambda: float = 0.1, astro_trace_decay: float = 0.9,
         astro_gain: float = 1.0, astro_bias_gain: float = 0.0,
         astro_pool_kernel: int = 3, astro_pool_mode: str = "avg",
-        astro_event_write: bool = True, astro_event_threshold: float = 0.05,
+        astro_event_write: bool = False, astro_event_threshold: float = 0.05,
         astro_event_slope: float = 10.0, astro_delta_weight: float = 0.5,
         store_c_seq: bool = False,
     ):
@@ -489,14 +503,14 @@ class AstroIntergerSoma_ssf(IntergerSoma_ssf, AstroSomaMixin):
 
     def __init__(
         self, tau: float = 2.,
-        v_threshold: float = 1., v_reset: float = 0., detach_reset: bool = False,
+        v_threshold: float = 1., v_reset: float = 0., detach_reset: bool = True,
         decay_input: bool = True, step_mode='m', backend='torch', thre=4,
         surrogate_function: Callable = surrogate.Sigmoid(),
-        astro_lambda: float = 0.1, astro_trace_decay: float = 0.9,
-        astro_gain: float = 1.0, astro_bias_gain: float = 0.0,
+        astro_lambda: float = 0.2, astro_trace_decay: float = 0.9,
+        astro_gain: float = 0.5, astro_bias_gain: float = 0.0, astro_thre: float = 0.4,
         astro_pool_kernel: int = 3, astro_pool_mode: str = "avg",
-        astro_event_write: bool = True, astro_event_threshold: float = 0.05,
-        astro_event_slope: float = 10.0, astro_delta_weight: float = 0.5,
+        astro_event_write: bool = False, astro_event_threshold: float = 0.5,
+        astro_event_slope: float = 8.0, astro_delta_weight: float = 0.5,
         store_c_seq: bool = False,
     ):
         super().__init__(
@@ -510,6 +524,7 @@ class AstroIntergerSoma_ssf(IntergerSoma_ssf, AstroSomaMixin):
             astro_trace_decay=astro_trace_decay,
             astro_gain=astro_gain,
             astro_bias_gain=astro_bias_gain,
+            astro_thre=astro_thre,
             astro_spike_scale=float(thre),
             astro_pool_kernel=astro_pool_kernel,
             astro_pool_mode=astro_pool_mode,
@@ -522,34 +537,149 @@ class AstroIntergerSoma_ssf(IntergerSoma_ssf, AstroSomaMixin):
 
     def multi_step_forward(self, x: torch.Tensor):
         self.c_float_to_tensor(x[0])
-        spike = torch.zeros_like(x[0]).to(x.device)
-        output = torch.zeros_like(x)
-        mem_old = 0
-        c_seq = [] if self.store_c_seq else None
         tau = torch.clamp(self.tau, min=1 + 1e-3)
+        mem_seq = self.parallel_membrane_forward(x, tau)
+        output = torch.zeros_like(x)
+        modulated_mem = []
+        c_seq = [] if self.store_c_seq else None
 
         for i in range(x.shape[0]):
-            if i >= 1:
-                if self.decay_input == False:
-                    mem = mem_old / tau + x[i]
-                else:
-                    mem = mem_old / tau + x[i] * (1 - 1 / tau)
-            else:
-                mem = x[i]
-            mem = self.astro_modulate_membrane(mem)
+            mem = self.astro_modulate_membrane(mem_seq[i])
             spike = self.qtrick(mem)
             self.astro_update(spike)
             if self.store_c_seq:
                 c_seq.append(self.c)
 
-            mem_old = mem.clone()
+            modulated_mem.append(mem)
             output[i] = spike
 
-        self.v = mem_old.detach()
+        self.v = modulated_mem[-1].detach()
         self.firing_rate = output.float().mean()
         if self.store_c_seq:
             self.c_seq = torch.stack(c_seq)
         return output
+    
+import math
+class AstroPSNIntergerSoma_ssf(neuron.BaseNode, AstroSomaMixin):
+    """Astro-SSF soma whose pre-SSF membrane is generated by a PSN time kernel.
+
+    This class keeps the soma-side astrocyte loop from ``AstroIntergerSoma_ssf``
+    but replaces the fixed exponential no-reset recurrence with the causal
+    sliding temporal matrix used by ``MaskedSlidingPSN``.
+    """
+
+    def __init__(
+        self,
+        psn_order: int = 32,
+        psn_exp_init: bool = False,
+        psn_backend: str = "gemm",
+        psn_threshold_init: float = 0.0,
+        tau: float = 2.,
+        v_threshold: float = 1., v_reset: float = 0., detach_reset: bool = True,
+        decay_input: bool = True, step_mode='m', backend='torch', thre=4,
+        surrogate_function: Callable = surrogate.Sigmoid(),
+        astro_lambda: float = 0.2, astro_trace_decay: float = 0.9,
+        astro_gain: float = 0.5, astro_bias_gain: float = 0.0, astro_thre: float = 0.4,
+        astro_pool_kernel: int = 3, astro_pool_mode: str = "avg",
+        astro_event_write: bool = False, astro_event_threshold: float = 0.05,
+        astro_event_slope: float = 10.0, astro_delta_weight: float = 0.5,
+        store_c_seq: bool = False,
+    ):
+        super().__init__(
+            v_threshold, v_reset, surrogate_function, detach_reset, step_mode, backend
+        )
+        if psn_order <= 0:
+            raise ValueError("psn_order must be positive")
+        if psn_backend not in ("gemm", "conv"):
+            raise ValueError("psn_backend must be 'gemm' or 'conv'")
+
+        self.psn_order = int(psn_order)
+        self.psn_backend = psn_backend
+        self.decay_input = decay_input
+        self.tau = float(tau)
+
+        if psn_exp_init:
+            weight = torch.ones(self.psn_order, dtype=torch.float32)
+            for i in range(self.psn_order - 2, -1, -1):
+                weight[i] = weight[i + 1] / 2.
+        else:
+            weight = torch.empty(1, self.psn_order, dtype=torch.float32)
+            nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
+            weight = weight[0]
+        self.psn_weight = nn.Parameter(weight)
+        self.psn_threshold = nn.Parameter(torch.as_tensor(psn_threshold_init, dtype=torch.float32))
+        self.qtrick = SSF(U=thre, v_th=v_threshold)
+
+        self._init_astro_state(
+            astro_lambda=astro_lambda,
+            astro_trace_decay=astro_trace_decay,
+            astro_gain=astro_gain,
+            astro_bias_gain=astro_bias_gain,
+            astro_thre=astro_thre,
+            astro_spike_scale=float(thre),
+            astro_pool_kernel=astro_pool_kernel,
+            astro_pool_mode=astro_pool_mode,
+            astro_event_write=astro_event_write,
+            astro_event_threshold=astro_event_threshold,
+            astro_event_slope=astro_event_slope,
+            astro_delta_weight=astro_delta_weight,
+            store_c_seq=store_c_seq,
+        )
+
+    def gen_gemm_weight(self, T: int, device=None, dtype=None):
+        if device is None:
+            device = self.psn_weight.device
+        if dtype is None:
+            dtype = self.psn_weight.dtype
+        weight = torch.zeros((T, T), device=device, dtype=dtype)
+        psn_weight = self.psn_weight.to(device=device, dtype=dtype)
+        for i in range(T):
+            end = i + 1
+            start = max(0, i + 1 - self.psn_order)
+            length = min(end - start, self.psn_order)
+            weight[i, start:end] = psn_weight[self.psn_order - length:self.psn_order]
+        return weight
+
+    def psn_membrane_forward(self, x: torch.Tensor):
+        if self.psn_backend == "gemm":
+            weight = self.gen_gemm_weight(x.shape[0], device=x.device, dtype=x.dtype)
+            mem = torch.matmul(weight, x.flatten(1)).view_as(x)
+            return mem + self.psn_threshold.to(device=x.device, dtype=x.dtype)
+
+        x_shape = x.shape
+        x_flat = x.flatten(1).t().unsqueeze(1)
+        x_flat = F.pad(x_flat, pad=(self.psn_order - 1, 0))
+        kernel = self.psn_weight.to(device=x.device, dtype=x.dtype).view(1, 1, self.psn_order)
+        mem = F.conv1d(x_flat, kernel, stride=1)
+        mem = mem.squeeze(1).t().view(x_shape)
+        return mem + self.psn_threshold.to(device=x.device, dtype=x.dtype)
+
+    def single_step_forward(self, x: torch.Tensor):
+        return self.multi_step_forward(x.unsqueeze(0))[0]
+
+    def multi_step_forward(self, x: torch.Tensor):
+        self.c_float_to_tensor(x[0])
+        mem_seq = self.psn_membrane_forward(x)
+        output = torch.zeros_like(x)
+        c_seq = [] if self.store_c_seq else None
+        last_mem = None
+
+        for i in range(x.shape[0]):
+            mem = self.astro_modulate_membrane(mem_seq[i])
+            spike = self.qtrick(mem)
+            self.astro_update(spike)
+            if self.store_c_seq:
+                c_seq.append(self.c)
+
+            last_mem = mem
+            output[i] = spike
+
+        self.v = last_mem.detach()
+        self.firing_rate = output.float().mean()
+        if self.store_c_seq:
+            self.c_seq = torch.stack(c_seq)
+        return output
+
 
 class LIFSoma(BaseSoma):
 
@@ -912,7 +1042,7 @@ class LIFSoma(BaseSoma):
             return spike_seq
 
 
-class AstroLIFSoma(LIFSoma, AstroSomaMixin):
+class AstroLIFSoma(LIFSoma , AstroSomaMixin):  ##
     """LIF soma with spike-driven astrocyte state.
 
     The previous astro state modulates the current membrane, while the
@@ -923,21 +1053,21 @@ class AstroLIFSoma(LIFSoma, AstroSomaMixin):
         self, tau: float = 2., decay_input: bool = True,
         v_threshold: float = 1., v_reset: float = 0.,
         surrogate_function: Callable = surrogate.Sigmoid(),
-        detach_reset: bool = False, step_mode: str = "s",
+        detach_reset: bool = True, step_mode: str = "m",
         backend: str = "torch",
         store_v_seq: bool = False, store_v_pre_spike: bool = False,
         astro_lambda: float = 0.1, astro_trace_decay: float = 0.9,
         astro_gain: float = 0.5, astro_bias_gain: float = 0.0,
-        astro_pool_kernel: int = 3, astro_pool_mode: str = "avg",
-        astro_event_write: bool = True, astro_event_threshold: float = 0.4,
+        astro_pool_kernel: int = 5, astro_pool_mode: str = "avg",  # pool_kernel
+        astro_event_write: bool = True, astro_event_threshold: float = 0.5,
         astro_event_slope: float = 8.0, astro_delta_weight: float = 0.5,
         store_c_seq: bool = False,
     ):
         super().__init__(
             tau=tau, decay_input=decay_input, v_threshold=v_threshold,
             v_reset=v_reset, surrogate_function=surrogate_function,
-            detach_reset=detach_reset, step_mode=step_mode, backend=backend,
-            store_v_seq=store_v_seq, store_v_pre_spike=store_v_pre_spike,
+            detach_reset=detach_reset, step_mode=step_mode, 
+            backend=backend, store_v_seq=store_v_seq, store_v_pre_spike=store_v_pre_spike,
         )
         self._init_astro_state(
             astro_lambda=astro_lambda,

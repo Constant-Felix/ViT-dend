@@ -720,17 +720,17 @@ class AdvancedNGCUDendCompartment(BaseDendCompartment):
         num_branches,
         c_sub=1,
         #init_tau=[1.2, 1.5, 4.0, 6.0],
-        init_tau=[1.2, 6.0],
+        init_tau=[1.5, 5.0],
         soma_dim=3,
         decay_input: bool = True,
-        bn=True,
+        bn=True,  ##
         bn_old=False,
         res=False,
         v_rest: float = 0.0,
         step_mode: str = "m",
         store_v_seq: bool = False,
         no_filter=False,
-        use_astro = False,
+        use_astro = True,
         last_sigmoid = True,
         last_tanh = False,
         use_event_write = False,
@@ -794,7 +794,7 @@ class AdvancedNGCUDendCompartment(BaseDendCompartment):
         # 1. 极性写入通道 (Upward Writing)
         self.theta_exc = nn.Parameter(torch.tensor(0.0),requires_grad=False) ##
         self.theta_inh = nn.Parameter(torch.tensor(0.0),requires_grad=False) ##
-        self.theta = nn.Parameter(torch.full((num_branches,), 1.0),requires_grad=True) ##
+        self.theta = nn.Parameter(torch.full((num_branches,), 0.2),requires_grad=True) ##
         #self.theta = nn.Parameter(torch.tensor((0.7, 0.3)))
         self.w_exc = nn.Parameter(torch.tensor(1.0))
         self.w_inh = nn.Parameter(torch.tensor(1.0))
@@ -1058,8 +1058,11 @@ class AdvancedNGCUDendCompartment(BaseDendCompartment):
                 gate = torch.tanh(self.gate_alpha * y_out + self.gate_beta)
                 y_out = y_out * gate    
         else:
-            y_out = G_mod * y + B_mod
-            #y_out = y
+            if self.use_astro:
+                y_out = G_mod * y + B_mod
+            else:    
+                y_out = y
+
             if self.last_sigmoid == True:
                 gate_factor = torch.sigmoid(self.gate_scale * y_out + self.gate_beta2)
                 y_out = y_out * gate_factor
@@ -1073,7 +1076,315 @@ class AdvancedNGCUDendCompartment(BaseDendCompartment):
         return y_out
 
 
+class HierarchicalTrunkDistalDendCompartment(BaseDendCompartment):
+    """Pure dendritic hierarchy with B branches and K compartments per branch.
 
+    The input compartment dimension is interpreted as branch-major groups:
+    ``[b0_k0, b0_k1, ..., b1_k0, b1_k1, ...]``.  In every branch, ``k0`` is the
+    proximal trunk that carries the main signal, while the remaining distal
+    compartments modulate that trunk through a gated nonlinear interaction.
+
+    This module deliberately contains no astrocyte state.  It is meant to
+    replace the old "N parallel integrators" dendrite with a local dendritic
+    computation before the soma/astro loop is applied elsewhere.
+    """
+
+    def __init__(
+        self,
+        num_branches,
+        compartments_per_branch=2,
+        c_sub=1,
+        init_tau=[1.5, 2.0, 5.0, 6.0], #
+        soma_dim=3,
+        decay_input: bool = True,
+        bn=True, #
+        res=False,
+        v_rest: float = 0.0,
+        step_mode: str = "m",
+        store_v_seq: bool = False,
+        no_filter=False,
+        last_sigmoid=True, #
+        last_tanh=False,
+    ):
+        super().__init__(v_rest, step_mode, store_v_seq)
+        if num_branches <= 0:
+            raise ValueError("num_branches must be positive")
+        if compartments_per_branch < 2:
+            raise ValueError("compartments_per_branch must be at least 2")  ##不一定要有2个以上compartment，至少要有一个trunk和一个distal，但也可以只有trunk没有distal，此时就退化成纯积分器了
+
+        self.soma_dim = soma_dim
+        self.bn = bn
+        self.res = res
+        self.no_filter = no_filter
+        self.last_sigmoid = last_sigmoid
+        self.last_tanh = last_tanh
+        self.c_sub = c_sub
+        self.num_branches = int(num_branches)
+        self.compartments_per_branch = int(compartments_per_branch)
+        self.distal_count = self.compartments_per_branch - 1
+        self.num_compartments = self.num_branches * self.compartments_per_branch
+        self.decay_input = decay_input
+        self.v_rest = v_rest
+        self.skip_weight = nn.Parameter(torch.tensor(0.01), requires_grad=False)
+
+        tau_data = self._make_tau_data(init_tau)
+        self.tau_compartments = nn.Parameter(tau_data.clone().detach().float())
+
+        self.distal_gate_weight = nn.Parameter(torch.ones(self.num_branches, self.distal_count))
+        self.trunk_gate_weight = nn.Parameter(torch.zeros(self.num_branches, self.distal_count))
+        self.distal_gate_threshold = nn.Parameter(torch.full((self.num_branches, self.distal_count), 0.5))
+        self.distal_response_weight = nn.Parameter(torch.ones(self.num_branches, self.distal_count))
+        self.distal_mix_logits = nn.Parameter(torch.zeros(self.num_branches, self.distal_count))
+        self.branch_gain = nn.Parameter(torch.full((self.num_branches,), 0.1))
+        self.branch_bias = nn.Parameter(torch.zeros(self.num_branches))
+        self.branch_strength = nn.Parameter(torch.ones(self.num_branches))
+
+        if self.bn:
+            if self.c_sub % self.compartments_per_branch != 0:
+                raise ValueError(
+                    "c_sub should be the channel count before dendritic reshape "
+                    "and must be divisible by compartments_per_branch when bn=True"
+                )
+            bn_channels = self.c_sub // self.compartments_per_branch
+            self.branch_bn = (
+                nn.BatchNorm2d(bn_channels, affine=True, momentum=0.1)
+                if self.soma_dim == 3
+                else nn.BatchNorm1d(bn_channels, affine=True, momentum=0.1)
+            )
+            nn.init.constant_(self.branch_bn.weight, 1.0)
+            nn.init.constant_(self.branch_bn.bias, 0.0)
+
+        if self.last_sigmoid or self.last_tanh:
+            self.gate_alpha = nn.Parameter(torch.ones(self.num_branches))
+            self.gate_beta = nn.Parameter(torch.zeros(self.num_branches))
+
+        self.branch_mod_seq = None
+        self.distal_gate_seq = None
+        self.distal_response_seq = None
+
+    def _make_tau_data(self, init_tau):
+        if init_tau is None:
+            per_branch_tau = torch.linspace(1.2, 6.0, steps=self.compartments_per_branch)
+            return per_branch_tau.repeat(self.num_branches)
+        if isinstance(init_tau, (float, int)):
+            return torch.full((self.num_compartments,), float(init_tau))
+
+        tau_data = torch.as_tensor(init_tau, dtype=torch.float32)
+        if tau_data.numel() == 2:
+            per_branch_tau = torch.linspace(
+                float(tau_data.flatten()[0]),
+                float(tau_data.flatten()[-1]),
+                steps=self.compartments_per_branch,
+            )
+            return per_branch_tau.repeat(self.num_branches)
+        if tau_data.numel() == self.compartments_per_branch:
+            return tau_data.flatten().repeat(self.num_branches)
+        if tau_data.numel() == self.num_compartments:
+            return tau_data.reshape(-1)
+        raise ValueError(
+            "init_tau must be scalar, length 2, length compartments_per_branch, "
+            "or match num_branches * compartments_per_branch"
+        )
+
+    def _build_tau_terms(self, T: int, device, dtype):
+        tau = torch.clamp(self.tau_compartments, min=1.0 + 1e-5)
+        a = 1.0 - 1.0 / tau
+        t = torch.arange(T, device=device, dtype=dtype)
+        i = t[:, None]
+        j = t[None, :]
+        diff = i - j
+        mask = diff >= 0
+        tau_matrix = torch.zeros((len(tau), T, T), device=device, dtype=dtype)
+        for n in range(len(tau)):
+            tau_matrix[n] = tau_matrix[n].masked_scatter(mask, (a[n] ** diff[mask]).to(dtype))
+        tau_vec_init = a.unsqueeze(1) ** (t + 1.0)
+        tau_vec_rest = 1.0 - tau_vec_init
+        return tau_matrix, tau_vec_init, tau_vec_rest, tau
+
+    def _assert_input_shape(self, x: torch.Tensor):
+        if x.shape[-1] != self.num_compartments:
+            raise ValueError(
+                f"Expected last input dimension to be num_branches * "
+                f"compartments_per_branch = {self.num_compartments}, "
+                f"but got {x.shape[-1]}"
+            )
+
+    def _view_distal_param(self, value: torch.Tensor, ref: torch.Tensor):
+        return value.view(*([1] * (ref.dim() - 2)), self.num_branches, self.distal_count)
+
+    def _view_branch_param(self, value: torch.Tensor, ref: torch.Tensor):
+        return value.view(*([1] * (ref.dim() - 1)), self.num_branches)
+
+    def _reshape_to_branches(self, x: torch.Tensor):
+        self._assert_input_shape(x)
+        return x.reshape(*x.shape[:-1], self.num_branches, self.compartments_per_branch)
+
+    def _compute_branch_output(self, compartment_state: torch.Tensor, raw_input: torch.Tensor = None):
+        branch_state = self._reshape_to_branches(compartment_state)
+        trunk = branch_state[..., 0]
+        distal = branch_state[..., 1:]
+
+        gate = torch.sigmoid(
+            self._view_distal_param(self.distal_gate_weight, distal) * distal
+            + self._view_distal_param(self.trunk_gate_weight, distal) * trunk.unsqueeze(-1)
+            - self._view_distal_param(self.distal_gate_threshold, distal)
+        )
+        response = torch.tanh(self._view_distal_param(self.distal_response_weight, distal) * distal)
+        mix = torch.softmax(self.distal_mix_logits, dim=-1)
+        branch_mod = (self._view_distal_param(mix, distal) * gate * response).sum(dim=-1)
+
+        self.branch_mod_seq = branch_mod
+        self.distal_gate_seq = gate
+        self.distal_response_seq = response
+
+        branch_mod = torch.tanh(branch_mod)
+        gain = 1.0 + self._view_branch_param(self.branch_gain, trunk) * branch_mod
+        bias = self._view_branch_param(self.branch_bias, trunk) * branch_mod
+        y = self._view_branch_param(self.branch_strength, trunk) * (trunk * gain + bias)
+
+        if self.res:
+            if raw_input is None:
+                trunk_input = trunk
+            else:
+                trunk_input = self._reshape_to_branches(raw_input)[..., 0]
+            y = y + self.skip_weight * trunk_input
+        return y
+
+    def _apply_branch_bn(self, y: torch.Tensor):
+        if not self.bn:
+            return y
+
+        if self.soma_dim == 3:
+            if y.dim() == 6:
+                T, batch_size, C_sub, H, W, N = y.shape
+                flat_channels = N * C_sub
+                self._check_bn_channels(flat_channels)
+                y_permuted = y.permute(0, 1, 5, 2, 3, 4).contiguous()
+                y_reshaped = y_permuted.view(T * batch_size, flat_channels, H, W)
+                y_normed = self.branch_bn(y_reshaped).view(T, batch_size, N, C_sub, H, W)
+                return y_normed.permute(0, 1, 3, 4, 5, 2).contiguous()
+            if y.dim() == 5:
+                batch_size, C_sub, H, W, N = y.shape
+                flat_channels = N * C_sub
+                self._check_bn_channels(flat_channels)
+                y_permuted = y.permute(0, 4, 1, 2, 3).contiguous()
+                y_reshaped = y_permuted.view(batch_size, flat_channels, H, W)
+                y_normed = self.branch_bn(y_reshaped).view(batch_size, N, C_sub, H, W)
+                return y_normed.permute(0, 2, 3, 4, 1).contiguous()
+        else:
+            if y.dim() == 5:
+                T, batch_size, C_sub, H, N = y.shape
+                flat_channels = N * C_sub
+                self._check_bn_channels(flat_channels)
+                y_permuted = y.permute(0, 1, 4, 2, 3).contiguous()
+                y_reshaped = y_permuted.view(T * batch_size, flat_channels, H)
+                y_normed = self.branch_bn(y_reshaped).view(T, batch_size, N, C_sub, H)
+                return y_normed.permute(0, 1, 3, 4, 2).contiguous()
+            if y.dim() == 4:
+                batch_size, C_sub, H, N = y.shape
+                flat_channels = N * C_sub
+                self._check_bn_channels(flat_channels)
+                y_permuted = y.permute(0, 3, 1, 2).contiguous()
+                y_reshaped = y_permuted.view(batch_size, flat_channels, H)
+                y_normed = self.branch_bn(y_reshaped).view(batch_size, N, C_sub, H)
+                return y_normed.permute(0, 2, 3, 1).contiguous()
+
+        raise ValueError(f"Unexpected branch output shape for soma_dim={self.soma_dim}: {tuple(y.shape)}")
+
+    def _check_bn_channels(self, flat_channels: int):
+        if self.branch_bn.num_features != flat_channels:
+            raise RuntimeError(
+                f"branch_bn was initialized with {self.branch_bn.num_features} channels, "
+                f"but branch output has {flat_channels}. When using this compartment, "
+                f"pass c_sub as the pre-reshape channel count: C_out * "
+                f"(num_branches * compartments_per_branch)."
+            )
+
+    def _view_gate_param(self, value: torch.Tensor, ref: torch.Tensor):
+        return value.view(*([1] * (ref.dim() - 1)), self.num_branches)
+
+    def _apply_output_gate(self, y: torch.Tensor):
+        if self.last_sigmoid:
+            gate = torch.sigmoid(self._view_gate_param(self.gate_alpha, y) * y + self._view_gate_param(self.gate_beta, y))
+            y = y * gate
+        if self.last_tanh:
+            gate = torch.tanh(self._view_gate_param(self.gate_alpha, y) * y + self._view_gate_param(self.gate_beta, y))
+            y = y * gate
+        return y
+
+    def single_step_forward(self, x: torch.Tensor):
+        self._assert_input_shape(x)
+        tau = torch.clamp(self.tau_compartments, min=1.0 + 1e-3)
+        if isinstance(self.v, float):
+            self.v = torch.full_like(x, self.v)
+
+        tau = tau.view(*([1] * (x.dim() - 1)), self.num_compartments)
+        if self.no_filter:
+            v = x
+        elif self.decay_input:
+            v = self.v + (x - (self.v - self.v_rest)) / tau
+        else:
+            v = self.v - (self.v - self.v_rest) / tau + x
+
+        self.v = v.detach()
+        y = self._compute_branch_output(v, x)
+        y = self._apply_branch_bn(y)
+        y = self._apply_output_gate(y)
+        return y
+
+    def multi_step_forward(self, x_seq: torch.Tensor):
+        self._assert_input_shape(x_seq)
+        if self.soma_dim == 3:
+            T, batch_size, C_sub, H, W, N = x_seq.shape
+        else:
+            T, batch_size, C_sub, H, N = x_seq.shape
+
+        device, dtype = x_seq.device, x_seq.dtype
+        dend_input = x_seq
+
+        if not self.no_filter:
+            tau_matrix, tau_vec_init, tau_vec_rest, tau = self._build_tau_terms(T, device, dtype)
+            tau_shape = [1] * x_seq.dim()
+            tau_shape[-1] = N
+            if self.decay_input:
+                dend_input = dend_input / tau.view(*tau_shape)
+
+            y_compartments = []
+            for n in range(self.num_compartments):
+                x_n = dend_input[..., n].reshape(T, -1)
+                y_n_flat = torch.matmul(tau_matrix[n], x_n)
+                y_n = (
+                    y_n_flat.view(T, batch_size, C_sub, H, W)
+                    if self.soma_dim == 3
+                    else y_n_flat.view(T, batch_size, C_sub, H)
+                )
+
+                t_init = (
+                    tau_vec_init[n].view(T, 1, 1, 1, 1)
+                    if self.soma_dim == 3
+                    else tau_vec_init[n].view(T, 1, 1, 1)
+                )
+                t_rest = (
+                    tau_vec_rest[n].view(T, 1, 1, 1, 1)
+                    if self.soma_dim == 3
+                    else tau_vec_rest[n].view(T, 1, 1, 1)
+                )
+                v_in = self.v[..., n].detach().unsqueeze(0) if isinstance(self.v, torch.Tensor) else self.v
+                y_n = y_n + (t_init * v_in) + (t_rest * self.v_rest)
+                y_compartments.append(y_n)
+
+            y_compartment = torch.stack(y_compartments, dim=-1)
+        else:
+            y_compartment = dend_input
+
+        if self.store_v_seq:
+            self.v_seq = y_compartment
+        self.v = y_compartment[-1].detach()
+
+        y = self._compute_branch_output(y_compartment, x_seq)
+        y = self._apply_branch_bn(y)
+        y = self._apply_output_gate(y)
+        return y
 
 
 
@@ -1090,9 +1401,9 @@ class PureMultiScaleDendCompartment(BaseDendCompartment):
         self,
         num_branches,
         c_sub=1,
-        init_tau=[1.1, 1.2],
+        init_tau=[1.5, 5.0],
         soma_dim=3,
-        decay_input: bool = False, 
+        decay_input: bool = True, 
         bn=True,  ##
         res=False,
         v_rest: float = 0.0,
@@ -1113,7 +1424,7 @@ class PureMultiScaleDendCompartment(BaseDendCompartment):
         self.num_branches = num_branches
         self.decay_input = decay_input
         self.v_rest = v_rest
-        self.skip_weight = nn.Parameter(torch.tensor(0.01),requires_grad=False)
+        self.skip_weight = nn.Parameter(torch.tensor(0.05),requires_grad=True)
 
         if init_tau is None:
             tau_data = torch.linspace(2.0, 10.0, steps=num_branches)
@@ -1209,6 +1520,9 @@ class PureMultiScaleDendCompartment(BaseDendCompartment):
             self.v_seq = y
         self.v = y[-1].detach()
 
+        if self.res:
+            y = y + self.skip_weight * x_seq
+
         if self.bn:
             if self.soma_dim == 3:
                 y_permuted = y.permute(0, 1, 5, 2, 3, 4).contiguous()
@@ -1236,8 +1550,8 @@ class PureMultiScaleDendCompartment(BaseDendCompartment):
                 gate = torch.tanh(self.gate_scale * y_out + self.gate_beta2)
                 y_out = y_out * gate
 
-        if self.res:
-            y_out = y_out + self.skip_weight * x_seq
+        #if self.res:
+        #    y_out = y_out + self.skip_weight * x_seq
 
         return y_out
 
