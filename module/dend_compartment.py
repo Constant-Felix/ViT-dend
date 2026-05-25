@@ -1555,6 +1555,71 @@ class PureMultiScaleDendCompartment(BaseDendCompartment):
 
         return y_out
 
+class SoftmaxMixedPureMultiScaleDendCompartment(PureMultiScaleDendCompartment):
+    """Pure multi-scale dendrite with normalized learnable branch mixing.
+
+    This class keeps the same branch-wise output shape as
+    ``PureMultiScaleDendCompartment``.  It only scales every branch by
+    ``softmax(branch_mix_logits)`` before the dendrite-to-soma readout.  When it
+    is used with ``VActivationForwardDendNeuron``, the following ``sum(dim=-1)``
+    becomes a normalized branch mixture instead of an unnormalized branch sum.
+    """
+
+    def __init__(
+        self,
+        num_branches,
+        c_sub=1,
+        init_tau=[1.5, 5.0],
+        soma_dim=3,
+        decay_input: bool = True,
+        bn=True,
+        res=False,
+        v_rest: float = 0.0,
+        step_mode: str = "m",
+        store_v_seq: bool = False,
+        no_filter=False,
+        last_sigmoid=False,
+        last_tanh=False,
+        branch_mix_temperature: float = 1.0,
+    ):
+        super().__init__(
+            num_branches=num_branches,
+            c_sub=c_sub,
+            init_tau=init_tau,
+            soma_dim=soma_dim,
+            decay_input=decay_input,
+            bn=bn,
+            res=res,
+            v_rest=v_rest,
+            step_mode=step_mode,
+            store_v_seq=store_v_seq,
+            no_filter=no_filter,
+            last_sigmoid=last_sigmoid,
+            last_tanh=last_tanh,
+        )
+        if branch_mix_temperature <= 0:
+            raise ValueError("branch_mix_temperature must be positive")
+        self.branch_mix_logits = nn.Parameter(torch.zeros(num_branches))
+        self.branch_mix_temperature = float(branch_mix_temperature)
+
+    def branch_mix_weights(self, dtype=None, device=None):
+        logits = self.branch_mix_logits
+        if dtype is not None or device is not None:
+            logits = logits.to(dtype=dtype or logits.dtype, device=device or logits.device)
+        return torch.softmax(logits / self.branch_mix_temperature, dim=0)
+
+    def _apply_branch_mix(self, y: torch.Tensor):
+        weights = self.branch_mix_weights(dtype=y.dtype, device=y.device)
+        weights = weights.view(*([1] * (y.dim() - 1)), self.num_branches)
+        return y * weights
+
+    def single_step_forward(self, x: torch.Tensor):
+        y = super().single_step_forward(x)
+        return self._apply_branch_mix(y)
+
+    def multi_step_forward(self, x_seq: torch.Tensor):
+        y = super().multi_step_forward(x_seq)
+        return self._apply_branch_mix(y)
 
 class PAComponentDendCompartment(BaseDendCompartment):
     """Dendritic compartment with passive and active voltage components.

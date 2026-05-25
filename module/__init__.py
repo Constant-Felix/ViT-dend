@@ -5,10 +5,11 @@ from .sps import MS_SPS
 from .dend_compartment import (
     PassiveDendCompartment,
     PureMultiScaleDendCompartment,
+    SoftmaxMixedPureMultiScaleDendCompartment,
     HierarchicalTrunkDistalDendCompartment,
 )
 from .dendrite import SegregatedDend
-from .soma import LIFSoma, AstroLIFSoma, AstroIntergerSoma, AstroIntergerSoma_ssf, AstroPSNIntergerSoma_ssf ### 继续写这里
+from .soma import LIFSoma, AstroLIFSoma, AstroIntergerSoma, AstroIntergerSoma_ssf, PSNIntergerSoma_ssf, FullPSNIntergerSoma_ssf, AstroFullPSNIntergerSoma_ssf, AstroPSNIntergerSoma_ssf ### 继续写这里
 from .neuron import VActivationForwardDendNeuron
 from .wiring import SegregatedDendWiring, BranchGroupedDendWiring
 
@@ -21,10 +22,14 @@ __all__ = [
     "AstroLIFSoma",
     "AstroIntergerSoma",
     "AstroIntergerSoma_ssf",
+    "PSNIntergerSoma_ssf",
+    "FullPSNIntergerSoma_ssf",
+    "AstroFullPSNIntergerSoma_ssf",
     "AstroPSNIntergerSoma_ssf",
     "SegregatedDend",
     "PassiveDendCompartment",
     "PureMultiScaleDendCompartment",
+    "SoftmaxMixedPureMultiScaleDendCompartment",
     "HierarchicalTrunkDistalDendCompartment",
     "SegregatedDendWiring",
     "BranchGroupedDendWiring",

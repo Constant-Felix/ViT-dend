@@ -393,7 +393,7 @@ def _set_forward_strength(lif, num_branches):
 
 def _make_soma(integer=False, soma_astro=False):
     if soma_astro:
-        return soma.AstroPSNIntergerSoma_ssf(psn_order=32) if integer else soma.AstroLIFSoma(step_mode='m')
+        return soma.AstroFullPSNIntergerSoma_ssf(T=32) if integer else soma.AstroLIFSoma(step_mode='m')
     return soma.IntergerSoma_ssf(step_mode='m',detach_reset=True) if integer else MultiStepLIFNode(decay_input=True, detach_reset=True)      #soma.LIFSoma(decay_input=True, detach_reset=True, surrogate_function=surrogate.ATan())
 
 
@@ -521,7 +521,9 @@ class CIFAR10Net(nn.Module):
             #MultiStepLIFNode(decay_input=True, detach_reset=True),
             #MultiStepParametricLIFNode(decay_input=True, detach_reset=True),
             #ner.ParametricLIFNode(init_tau=2., detach_reset=True, step_mode='m', backend='torch'),
-            soma.IntergerSoma_ssf(step_mode='m',detach_reset=True),
+            #soma.IntergerSoma_ssf(step_mode='m',detach_reset=True),
+            #soma.PSNIntergerSoma_ssf(step_mode='m',detach_reset=True),
+            soma.FullPSNIntergerSoma_ssf(32),
             layer.Linear(channels*2*total_comp, class_num),
         )
 
@@ -533,7 +535,7 @@ class CIFAR10Net(nn.Module):
         x_seq = self.fc(self.conv(x_seq))  # [W, N, C]
         return x_seq.mean(0)
 
-# python train_sequential_cifar.py -data-dir /data/hyx/ViT-dend/data/cifar10 -amp -channels 128  -warmup-epochs 0  -epochs 400 -opt adamw -lr 0.001  #-opt sgd
+# python train_sequential_cifar.py -data-dir /data/hyx/ViT-dend/data/cifar10 -amp -channels 128  -warmup-epochs 0  -epochs 400   -opt adamw -lr 0.001  -opt sgd    #-resume logs/pt/None_e400_b128_adamw_lr0.001_c128_20260524-182050_amp_P32/checkpoint_latest.pth  #-opt sgd
 
 from datetime import datetime
 def main():
