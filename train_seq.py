@@ -22,6 +22,7 @@ from torch.utils.data.dataloader import default_collate
 from torchvision.transforms import autoaugment, transforms
 from torchvision.transforms.functional import InterpolationMode
 from module import dendrite,dend_compartment,soma,neuron,wiring
+from module.dend_compartment import ChannelPreservingTrunkDistalDendCompartment
 
 
 
@@ -341,201 +342,44 @@ class IFNode5PorderMaskD(nn.Module):
         h_seq = torch.addmm(self.fc.bias.unsqueeze(1), self.fc.masked_weight(), x_seq.flatten(1))
         spike = self.surrogate_function(h_seq)
         return spike.view(x_seq.shape)
-
-
-
-def _dend_total_compartment(dend, num_branches, compartments_per_branch, multi=True):
-    if not dend:
-        return 1
-    return num_branches * compartments_per_branch #if multi else num_branches  ###
-
-
-def _make_dend_compartment(c_sub, num_branches, compartments_per_branch=2, multi=False, soma_astro=False):
-    if multi:
-        return dend_compartment.HierarchicalTrunkDistalDendCompartment(
-            num_branches=num_branches,
-            compartments_per_branch=compartments_per_branch,
-            step_mode='m',
-            c_sub=c_sub,
-            soma_dim=2
-        )
-    if soma_astro:
-        return dend_compartment.SparseRoutedTrunkDistalDendCompartment(
-            num_branches=num_branches, compartments_per_branch=compartments_per_branch, step_mode='m', c_sub=c_sub, soma_dim=2
-        )
-    return dend_compartment.PureMultiScaleDendCompartment(
-            num_branches, step_mode='m', c_sub=c_sub, soma_dim=2)   #dend_compartment.AdvancedNGCUDendCompartment(num_branches ,step_mode="m", c_sub=c_sub,soma_dim=2)
-
-
-def _make_dend_wiring(num_branches, compartments_per_branch=2, multi=False):
-    if multi:
-        return wiring.BranchGroupedDendWiring(
-            num_branches=num_branches,
-            compartments_per_branch=compartments_per_branch,
-        )
-    return wiring.SegregatedDendWiring(num_branches)
-
-
-def _set_dend_soma_shape(dend_lif, x, total_compartment):
-    if x.shape[2] % total_compartment != 0:
-        raise ValueError(
-            f"Dend input channels ({x.shape[2]}) must be divisible by "
-            f"total_compartment ({total_compartment})."
-        )
-    dend_lif.soma_shape[0] = int(x.shape[2] // total_compartment)
-    dend_lif.soma_shape[1] = x.shape[3]
-
-
-def _set_forward_strength(lif, num_branches):
-    lif.forward_strength.data = torch.full((num_branches,), 1.0)
-    return lif
-
-
-def _make_soma(integer=False, soma_astro=False):
-    if soma_astro:
-        return soma.AstroPSNIntergerSoma_ssf(psn_order=32) if integer else soma.AstroLIFSoma(step_mode='m')
-    return soma.IntergerSoma_ssf(step_mode='m',detach_reset=True) if integer else MultiStepLIFNode(decay_input=True, detach_reset=True)      #soma.LIFSoma(decay_input=True, detach_reset=True, surrogate_function=surrogate.ATan())
-
-
-class dendneuron(nn.Module):
-    def __init__(
-        self,
-        channels,
-        dend_model=True,
-        multi=False,
-        integer=True,
-        num_branches=2,
-        compartments_per_branch=2,
-        soma_astro=True,
-        plain_lif="lif",
-        psn=False
-    ):
-        super().__init__()
-        self.dend_model = dend_model
-        self.num_branches = num_branches
-        self.compartments_per_branch = compartments_per_branch
-        self.total_compartment = _dend_total_compartment(
-            dend_model, num_branches, compartments_per_branch, multi=multi
-        )
-
-        if not dend_model:
-            if plain_lif == "integer":
-                self.neuron = soma.IntergerSoma(step_mode='m')
-            elif plain_lif == "lif":
-                self.neuron = MultiStepLIFNode(tau=2.0, detach_reset=True, surrogate_function=surrogate.ATan())
-            else:
-                self.neuron = MultiStepParametricLIFNode(
-                    decay_input=True, detach_reset=True, surrogate_function=surrogate.ATan()
-                )
-            return
-
-        self.dc = _make_dend_compartment(
-            channels,
-            num_branches,
-            compartments_per_branch=compartments_per_branch,
-            multi=multi,
-            soma_astro=soma_astro,
-        )
-        self.wr = _make_dend_wiring(
-            num_branches,
-            compartments_per_branch=compartments_per_branch,
-            multi=multi,
-        )
-        self.dend = dendrite.SegregatedDend(step_mode='m', compartment=self.dc, wiring=self.wr)
-        self.soma = _make_soma(integer=integer, soma_astro=soma_astro)
-        self.neuron = _set_forward_strength(
-            neuron.VActivationForwardDendNeuron(
-                dend=self.dend,
-                soma=self.soma,
-                f_da=lambda x: x,
-                soma_shape=np.zeros((2,), int),
-                forward_strength_learnable=True,  ###
-                psn=psn
-            ),
-            num_branches,
-        )
-
-    def forward(self, x, hook=None):
-        if not self.dend_model:
-            return self.neuron(x)
-        _set_dend_soma_shape(self.neuron, x, self.total_compartment)
-        x = self.neuron(x, hook)
-        return x
     
+
 class CIFAR10Net(nn.Module):
-    def __init__(self, channels, length: int, class_num: int,num_branches=2,compartments_per_branch=4,spsn=False,concat=False, branch=True,psn=False): #num_branches and branch
+    def __init__(self, channels, class_num: int, T: int=32, P:int=-1,num_branches=4,compartments_per_branch=2):
         super().__init__()
         conv = []
-        total_comp = num_branches * compartments_per_branch if branch == True else num_branches
-        length = length
-        if concat == False:
-            for i in range(2):
-                for j in range(3):
-                    if conv.__len__() == 0:
-                        in_channels = 3
-                        out_channels = channels*total_comp
-                    else:
-                        if i==0:
-                            if j!=1:
-                                in_channels = channels//total_comp
-                                out_channels = channels*total_comp
-                            else:
-                                in_channels = channels
-                                out_channels = channels
-                        if i==1:
-                            if j!=1:
-                                in_channels = channels
-                                out_channels = channels
-                            else:
-                                in_channels = channels//total_comp
-                                out_channels = channels*total_comp         
-                    conv.append(layer.Conv1d(in_channels, out_channels, kernel_size=3, padding=1, bias=False)) #
-                    conv.append(layer.BatchNorm1d(out_channels))
-                    conv.append(dendneuron(channels=out_channels,num_branches=num_branches,compartments_per_branch=compartments_per_branch,psn=psn))
-                conv.append(layer.AvgPool1d(2))
-                length = length/2    
-        else:
-            for i in range(2):
-                for j in range(3):
-                    if conv.__len__() == 0:
-                        in_channels = 3
-                    else:
-                        in_channels = channels   
-                    conv.append(layer.Conv1d(in_channels, channels, kernel_size=3, padding=1, bias=False)) #
-                    conv.append(layer.BatchNorm1d(channels))
-                    conv.append(dendneuron(channels=channels,num_compartment=num_compartment,soma_shape=np.array((channels/num_compartment,length),dtype=int),concat=True))            
+        for i in range(2):
+            for j in range(3):
+                if conv.__len__() == 0:
+                    in_channels = 3
+                else:
+                    in_channels = channels
+                conv.append(layer.Conv1d(in_channels, channels, kernel_size=3, padding=1, bias=False))
+                conv.append(layer.BatchNorm1d(channels))
+                conv.append(ChannelPreservingTrunkDistalDendCompartment(channels,num_branches=num_branches,compartment_tau_scale=compartments_per_branch,c_sub=channels))
+                conv.append(soma.AstroPSNIntergerSoma_ssf(psn_order=T))
 
-                conv.append(layer.AvgPool1d(2))
-                length = length/2
+            conv.append(layer.AvgPool1d(2))
 
         self.conv = nn.Sequential(*conv)
-        self.spsn = spsn
 
 
         self.fc = nn.Sequential(
             layer.Flatten(),
-            layer.Linear(channels * 8 // total_comp, channels*2*total_comp),
-            #IFNode5(32,surrogate.ATan()),
-            #dendneuron(channels*num_compartment,num_compartment=num_compartment,soma_shape=np.array((channels,))),
-            #soma.IntergerSoma_ssf(step_mode='m') if self.spsn==False else MaskedSlidingPSN(order=32,surrogate_function=surrogate.ATan(),exp_init=False),
-            #MultiStepLIFNode(decay_input=True, detach_reset=True),
-            #MultiStepParametricLIFNode(decay_input=True, detach_reset=True),
-            #ner.ParametricLIFNode(init_tau=2., detach_reset=True, step_mode='m', backend='torch'),
-            #soma.IntergerSoma_ssf(step_mode='m',detach_reset=True),
-            soma.PSNIntergerSoma_ssf(step_mode='m',detach_reset=True),
-            #soma.FullPSNIntergerSoma_ssf(32),
-            layer.Linear(channels*2*total_comp, class_num),
+            layer.Linear(channels * 8, channels * 8 // 4),
+            soma.AstroPSNIntergerSoma_ssf(psn_order=T),
+            layer.Linear(channels * 8 // 4, class_num),
         )
 
         functional.set_step_mode(self, 'm')
 
     def forward(self, x_seq: torch.Tensor):
-        # [N, C, H, W] -> [W, N, C, H] [32,64,3,32]
+        # [N, C, H, W] -> [W, N, C, H]
         x_seq = x_seq.permute(3, 0, 1, 2)
         x_seq = self.fc(self.conv(x_seq))  # [W, N, C]
         return x_seq.mean(0)
 
-# python train_sequential_cifar.py -data-dir /data/hyx/ViT-dend/data/cifar10 -amp -channels 128  -warmup-epochs 0  -epochs 400 -opt adamw -lr 0.001  -opt sgd    #-resume logs/pt/None_e400_b128_adamw_lr0.001_c128_20260524-182050_amp_P32/checkpoint_latest.pth  #-opt sgd
+# python train_seq.py -data-dir /data/hyx/ViT-dend/data/cifar100 -amp -class-num 100 -channels 128  -warmup-epochs 0  -epochs 400 -opt adamw -lr 0.001
 
 from datetime import datetime
 def main():
@@ -666,7 +510,7 @@ def main():
         os.makedirs(pt_dir)
 
     #net = CIFAR10Net(channels=args.channels, neu=args.neu, T=32, class_num=args.class_num, P=args.P, exp_init=args.exp_init)
-    net = CIFAR10Net(channels=args.channels, length=32, class_num=args.class_num)  ##
+    net = CIFAR10Net(channels=args.channels, class_num=args.class_num)  ##
     net.to(args.device)
     n_parameters = sum(p.numel() for p in net.parameters() if p.requires_grad)
     print(f"number of params: {n_parameters}")
@@ -835,4 +679,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    main()       
