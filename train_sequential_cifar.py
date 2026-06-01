@@ -463,7 +463,7 @@ class dendneuron(nn.Module):
         return x
     
 class CIFAR10Net(nn.Module):
-    def __init__(self, channels, length: int, class_num: int,num_branches=2,compartments_per_branch=4,spsn=False,concat=False, branch=True,psn=False): #num_branches and branch
+    def __init__(self, channels, length: int, class_num: int,num_branches=4,compartments_per_branch=4,spsn=False,concat=False, branch=True,psn=False): #num_branches and branch
         super().__init__()
         conv = []
         total_comp = num_branches * compartments_per_branch if branch == True else num_branches

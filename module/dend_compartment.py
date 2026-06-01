@@ -2215,6 +2215,388 @@ class ChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
         self.branch_output_seq = torch.stack(branch_output_seq)
         return torch.stack(y_seq)
 
+class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
+    """Active-edge channel-preserving trunk-distal dendrite.
+
+    This is the sparse version of ``ChannelPreservingTrunkDistalDendCompartment``.
+    The external mapping is still ``C -> C``, but the internal state is
+    ``[N, d, C, K, ...]`` instead of ``[N, B, C, K, ...]``.  Here ``B`` is the
+    size of the branch parameter library and ``d`` is ``branch_degree``.  Scaling
+    ``num_branches`` therefore adds candidate branch dynamics without forcing
+    every channel to materialize every branch.
+    """
+
+    def __init__(
+        self,
+        channels=None,
+        num_branches=4,
+        compartments_per_branch=2,
+        c_sub=None,
+        branch_degree=2,
+        branch_assignment: str = "cyclic",
+        init_tau=None,
+        tau_min: float = 1.25,
+        tau_max: float = 5.0,
+        compartment_tau_scale=(1.0, 1.5),
+        decay_input: bool = True,
+        v_rest: float = 0.0,
+        step_mode: str = "m",
+        store_v_seq: bool = False,
+        store_branch_monitor: bool = False,
+        no_filter: bool = False,
+        merge_norm: str = "sqrt",
+        learn_edge_gain: bool = True,
+        edge_gain_scale: float = 0.5,
+        distal_gain_init: float = 0.1,
+        distal_residual_init: float = 0.0,
+        distal_gate_alpha_init: float = 6.0,
+        distal_gate_threshold_init: float = 0.5,
+        input_residual_init: float = 0.0,
+        detach_state_during_forward: bool = False,
+    ):
+        super().__init__(v_rest, step_mode, store_v_seq)
+        if channels is None:
+            channels = c_sub
+        if channels is None:
+            raise ValueError("channels or c_sub must be provided")
+        if int(channels) <= 0:
+            raise ValueError("channels must be positive")
+        if num_branches <= 0:
+            raise ValueError("num_branches must be positive")
+        if compartments_per_branch < 2:
+            raise ValueError("compartments_per_branch must be at least 2")
+        if branch_degree <= 0:
+            raise ValueError("branch_degree must be positive")
+        if branch_assignment not in {"window", "cyclic"}:
+            raise ValueError("branch_assignment must be 'window' or 'cyclic'")
+        if merge_norm not in {"sqrt", "mean", "sum"}:
+            raise ValueError("merge_norm must be one of: 'sqrt', 'mean', 'sum'")
+        if tau_min <= 1.0 or tau_max <= 1.0:
+            raise ValueError("tau_min and tau_max should be larger than 1")
+
+        self.channels = int(channels)
+        self.c_sub = self.channels
+        self.num_branches = int(num_branches)
+        self.compartments_per_branch = int(compartments_per_branch)
+        self.distal_count = self.compartments_per_branch - 1
+        self.branch_degree = min(int(branch_degree), self.num_branches)
+        self.branch_assignment = branch_assignment
+        self.decay_input = decay_input
+        self.v_rest = v_rest
+        self.no_filter = no_filter
+        self.merge_norm = merge_norm
+        self.learn_edge_gain = bool(learn_edge_gain)
+        self.edge_gain_scale = float(edge_gain_scale)
+        self.detach_state_during_forward = bool(detach_state_during_forward)
+        self.store_branch_monitor = bool(store_branch_monitor)
+
+        active_branch_index = self._make_active_branch_index(
+            self.channels,
+            self.num_branches,
+            self.branch_degree,
+            self.branch_assignment,
+        )
+        channel_degree = torch.full((self.channels,), float(self.branch_degree))
+        branch_usage = torch.bincount(
+            active_branch_index.reshape(-1),
+            minlength=self.num_branches,
+        ).float()
+        self.register_buffer("active_branch_index", active_branch_index)
+        self.register_buffer("channel_degree", channel_degree)
+        self.register_buffer("branch_usage", branch_usage)
+
+        tau_data = self._make_tau_data(
+            init_tau=init_tau,
+            tau_min=tau_min,
+            tau_max=tau_max,
+            compartment_tau_scale=compartment_tau_scale,
+        )
+        self.tau_compartments = nn.Parameter(tau_data.clone().detach().float())
+
+        if self.learn_edge_gain:
+            self.edge_channel_gain = nn.Parameter(torch.zeros(self.branch_degree, self.channels))
+        else:
+            self.register_buffer("edge_channel_gain", torch.zeros(self.branch_degree, self.channels))
+
+        self.compartment_input_logits = nn.Parameter(torch.zeros(self.num_branches, self.compartments_per_branch))
+        self.distal_mix_logits = nn.Parameter(torch.zeros(self.num_branches, self.distal_count))
+        self.distal_gate_alpha = nn.Parameter(torch.full((self.num_branches, self.distal_count), float(distal_gate_alpha_init)))
+        self.distal_gate_threshold = nn.Parameter(torch.full((self.num_branches, self.distal_count), float(distal_gate_threshold_init)))
+        self.distal_gain = nn.Parameter(torch.full((self.num_branches,), float(distal_gain_init)))
+        self.distal_residual_gain = nn.Parameter(torch.full((self.num_branches,), float(distal_residual_init)))
+        self.branch_strength = nn.Parameter(torch.ones(self.num_branches))
+        self.input_residual_scale = nn.Parameter(torch.tensor(float(input_residual_init)))
+        self.output_scale = nn.Parameter(torch.tensor(1.0))
+
+        self.branch_input_seq = None
+        self.branch_mod_seq = None
+        self.distal_gate_seq = None
+        self.branch_output_seq = None
+
+    @staticmethod
+    def _make_active_branch_index(
+        channels: int,
+        num_branches: int,
+        branch_degree: int,
+        branch_assignment: str,
+    ):
+        channel_index = torch.arange(channels, dtype=torch.long)
+        if branch_assignment == "window":
+            base = torch.div(channel_index * num_branches, channels, rounding_mode="floor")
+        else:
+            base = channel_index % num_branches
+
+        edges = []
+        for offset in range(branch_degree):
+            edges.append((base + offset) % num_branches)
+        return torch.stack(edges, dim=0)
+
+    def _make_tau_data(self, init_tau, tau_min, tau_max, compartment_tau_scale):
+        if init_tau is not None:
+            tau_data = torch.as_tensor(init_tau, dtype=torch.float32)
+            if tau_data.numel() == 1:
+                return torch.full((self.num_branches, self.compartments_per_branch), float(tau_data.flatten()[0]))
+            if tau_data.numel() == 2:
+                tau_min_v = float(tau_data.flatten()[0])
+                tau_max_v = float(tau_data.flatten()[-1])
+                branch_tau = torch.exp(torch.linspace(
+                    torch.log(torch.tensor(tau_min_v)),
+                    torch.log(torch.tensor(tau_max_v)),
+                    steps=self.num_branches,
+                ))
+                comp_scale = torch.linspace(1.0, 1.5, steps=self.compartments_per_branch)
+                return branch_tau[:, None] * comp_scale[None, :]
+            if tau_data.numel() == self.num_branches:
+                return tau_data.flatten()[:, None].repeat(1, self.compartments_per_branch)
+            if tau_data.numel() == self.compartments_per_branch:
+                return tau_data.flatten()[None, :].repeat(self.num_branches, 1)
+            if tau_data.numel() == self.num_branches * self.compartments_per_branch:
+                return tau_data.reshape(self.num_branches, self.compartments_per_branch)
+            raise ValueError(
+                "init_tau must be scalar, length 2, length num_branches, "
+                "length compartments_per_branch, or length num_branches * compartments_per_branch"
+            )
+
+        branch_tau = torch.exp(torch.linspace(
+            torch.log(torch.tensor(float(tau_min))),
+            torch.log(torch.tensor(float(tau_max))),
+            steps=self.num_branches,
+        ))
+        if isinstance(compartment_tau_scale, (float, int)):
+            comp_scale = torch.full((self.compartments_per_branch,), float(compartment_tau_scale))
+        else:
+            comp_scale_data = torch.as_tensor(compartment_tau_scale, dtype=torch.float32)
+            if comp_scale_data.numel() == 2:
+                comp_scale = torch.linspace(
+                    float(comp_scale_data.flatten()[0]),
+                    float(comp_scale_data.flatten()[-1]),
+                    steps=self.compartments_per_branch,
+                )
+            elif comp_scale_data.numel() == self.compartments_per_branch:
+                comp_scale = comp_scale_data.flatten()
+            else:
+                raise ValueError(
+                    "compartment_tau_scale must be scalar, length 2, "
+                    "or length compartments_per_branch"
+                )
+        return branch_tau[:, None] * comp_scale[None, :]
+
+    def _assert_input_shape(self, x: torch.Tensor):
+        if x.dim() < 2:
+            raise ValueError("Expected input shape [N, C, ...]")
+        if x.shape[1] != self.channels:
+            raise ValueError(f"Expected {self.channels} input channels, but got {x.shape[1]}")
+
+    def _edge_index(self, device=None):
+        if device is None:
+            return self.active_branch_index
+        return self.active_branch_index.to(device=device)
+
+    def _edge_branch_value(self, value: torch.Tensor):
+        return value[self._edge_index(value.device)]
+
+    def _view_edge_channel(self, value: torch.Tensor, ref: torch.Tensor):
+        return value.view(1, self.branch_degree, self.channels, *([1] * (ref.dim() - 3)))
+
+    def _view_edge_compartment(self, value: torch.Tensor, ref: torch.Tensor):
+        return value.view(1, self.branch_degree, self.channels, self.compartments_per_branch, *([1] * (ref.dim() - 4)))
+
+    def _view_edge_distal(self, value: torch.Tensor, ref: torch.Tensor):
+        return value.view(1, self.branch_degree, self.channels, self.distal_count, *([1] * (ref.dim() - 4)))
+
+    def _view_channel_degree(self, ref: torch.Tensor):
+        return self.channel_degree.to(dtype=ref.dtype, device=ref.device).view(
+            1, self.channels, *([1] * (ref.dim() - 2))
+        )
+
+    def _edge_channel_weight(self, dtype, device):
+        gain = self.edge_channel_gain.to(dtype=dtype, device=device)
+        if self.learn_edge_gain:
+            return 1.0 + self.edge_gain_scale * torch.tanh(gain)
+        return torch.ones_like(gain)
+
+    def _edge_compartment_input_gain(self, dtype, device):
+        raw = F.softplus(self.compartment_input_logits.to(dtype=dtype, device=device)) + 1e-4
+        normalized = self.compartments_per_branch * raw / raw.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        return self._edge_branch_value(normalized)
+
+    def _build_branch_input(self, x: torch.Tensor):
+        self._assert_input_shape(x)
+        x_edge = x.unsqueeze(1).unsqueeze(3)
+        edge_gain = self._view_edge_channel(self._edge_channel_weight(x.dtype, x.device), x.unsqueeze(1))
+        comp_gain = self._view_edge_compartment(self._edge_compartment_input_gain(x.dtype, x.device), x_edge)
+        branch_input = x_edge * edge_gain.unsqueeze(3) * comp_gain
+        if self.store_branch_monitor:
+            self._branch_input_step = branch_input.detach()
+        else:
+            self._branch_input_step = None
+        return branch_input
+
+    def _init_state(self, branch_input: torch.Tensor):
+        if isinstance(self.v, float):
+            return torch.full_like(branch_input, self.v)
+        if self.v.shape != branch_input.shape:
+            return torch.full_like(branch_input, self.v_rest)
+        return self.v
+
+    def _integrate(self, branch_input: torch.Tensor, v_prev: torch.Tensor):
+        if self.no_filter:
+            return branch_input
+
+        tau = torch.clamp(self.tau_compartments, min=1.0 + 1e-3)
+        tau = self._edge_branch_value(tau.to(dtype=branch_input.dtype, device=branch_input.device))
+        tau = self._view_edge_compartment(tau, branch_input)
+        if self.decay_input:
+            return v_prev + (branch_input - (v_prev - self.v_rest)) / tau
+        return v_prev - (v_prev - self.v_rest) / tau + branch_input
+
+    def _normalize_distal_delta(self, delta: torch.Tensor):
+        reduce_dims = [2] + list(range(4, delta.dim()))
+        rms = torch.sqrt(delta.square().mean(dim=reduce_dims, keepdim=True) + 1e-6)
+        return delta / rms
+
+    def _compute_branch_output(self, state: torch.Tensor):
+        trunk = state[:, :, :, 0, ...]
+        distal = state[:, :, :, 1:, ...]
+        delta = distal - trunk.unsqueeze(3)
+        delta_norm = self._normalize_distal_delta(delta)
+
+        alpha = F.softplus(self._edge_branch_value(self.distal_gate_alpha).to(dtype=state.dtype, device=state.device))
+        threshold = self._edge_branch_value(self.distal_gate_threshold.abs()).to(dtype=state.dtype, device=state.device)
+        alpha = self._view_edge_distal(alpha, delta_norm)
+        threshold = self._view_edge_distal(threshold, delta_norm)
+        distal_gate = torch.sigmoid(alpha * delta_norm.abs() - threshold)
+
+        mix = torch.softmax(self.distal_mix_logits, dim=-1)
+        mix = self._edge_branch_value(mix.to(dtype=state.dtype, device=state.device))
+        mix = self._view_edge_distal(mix, delta_norm)
+        branch_mod = (mix * distal_gate * torch.tanh(delta_norm)).sum(dim=3)
+        branch_mod = torch.tanh(branch_mod)
+
+        distal_gain = self._edge_branch_value(self.distal_gain).to(dtype=state.dtype, device=state.device)
+        residual_gain = self._edge_branch_value(self.distal_residual_gain).to(dtype=state.dtype, device=state.device)
+        branch_strength = self._edge_branch_value(self.branch_strength).to(dtype=state.dtype, device=state.device)
+        distal_gain = self._view_edge_channel(distal_gain, trunk)
+        residual_gain = self._view_edge_channel(residual_gain, trunk)
+        branch_strength = self._view_edge_channel(branch_strength, trunk)
+
+        y = branch_strength * (trunk + distal_gain * trunk * branch_mod + residual_gain * branch_mod)
+
+        if self.store_branch_monitor:
+            self._branch_mod_step = branch_mod.detach()
+            self._distal_gate_step = distal_gate.detach()
+            self._branch_output_step = y.detach()
+        else:
+            self._branch_mod_step = None
+            self._distal_gate_step = None
+            self._branch_output_step = None
+        return y
+
+    def _merge_edges(self, edge_output: torch.Tensor, raw_input: torch.Tensor):
+        y = edge_output.sum(dim=1)
+        degree = self._view_channel_degree(y)
+        if self.merge_norm == "sqrt":
+            y = y / torch.sqrt(degree)
+        elif self.merge_norm == "mean":
+            y = y / degree
+        return self.output_scale * y + self.input_residual_scale * raw_input
+
+    def _step(self, x: torch.Tensor, v_prev: torch.Tensor):
+        branch_input = self._build_branch_input(x)
+        state = self._integrate(branch_input, v_prev)
+        edge_output = self._compute_branch_output(state)
+        y = self._merge_edges(edge_output, x)
+        return y, state
+
+    def single_step_forward(self, x: torch.Tensor):
+        branch_input = self._build_branch_input(x)
+        v_prev = self._init_state(branch_input)
+        state = self._integrate(branch_input, v_prev)
+        edge_output = self._compute_branch_output(state)
+        y = self._merge_edges(edge_output, x)
+        self.v = state.detach()
+        if self.store_v_seq:
+            self.v_seq = state.detach().unsqueeze(0)
+        if self.store_branch_monitor:
+            self.branch_input_seq = self._branch_input_step
+            self.branch_mod_seq = self._branch_mod_step
+            self.distal_gate_seq = self._distal_gate_step
+            self.branch_output_seq = self._branch_output_step
+        else:
+            self.branch_input_seq = None
+            self.branch_mod_seq = None
+            self.distal_gate_seq = None
+            self.branch_output_seq = None
+        return y
+
+    def multi_step_forward(self, x_seq: torch.Tensor):
+        if x_seq.dim() < 3:
+            raise ValueError("Expected multi-step input shape [T, N, C, ...]")
+        if x_seq.shape[2] != self.channels:
+            raise ValueError(f"Expected {self.channels} input channels, but got {x_seq.shape[2]}")
+
+        y_seq = []
+        v_seq = [] if self.store_v_seq else None
+        if self.store_branch_monitor:
+            branch_input_seq = []
+            branch_mod_seq = []
+            distal_gate_seq = []
+            branch_output_seq = []
+
+        first_branch_input = self._build_branch_input(x_seq[0])
+        v = self._init_state(first_branch_input)
+        for t in range(x_seq.shape[0]):
+            if t == 0:
+                state = self._integrate(first_branch_input, v)
+                edge_output = self._compute_branch_output(state)
+                y = self._merge_edges(edge_output, x_seq[t])
+            else:
+                y, state = self._step(x_seq[t], v)
+            y_seq.append(y)
+
+            if self.store_branch_monitor:
+                branch_input_seq.append(self._branch_input_step)
+                branch_mod_seq.append(self._branch_mod_step)
+                distal_gate_seq.append(self._distal_gate_step)
+                branch_output_seq.append(self._branch_output_step)
+            if self.store_v_seq:
+                v_seq.append(state.detach())
+            v = state.detach() if self.detach_state_during_forward else state
+
+        self.v = v.detach()
+        if self.store_v_seq:
+            self.v_seq = torch.stack(v_seq)
+        if self.store_branch_monitor:
+            self.branch_input_seq = torch.stack(branch_input_seq)
+            self.branch_mod_seq = torch.stack(branch_mod_seq)
+            self.distal_gate_seq = torch.stack(distal_gate_seq)
+            self.branch_output_seq = torch.stack(branch_output_seq)
+        else:
+            self.branch_input_seq = None
+            self.branch_mod_seq = None
+            self.distal_gate_seq = None
+            self.branch_output_seq = None
+        return torch.stack(y_seq)
 
 class PAComponentDendCompartment(BaseDendCompartment):
     """Dendritic compartment with passive and active voltage components.

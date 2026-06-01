@@ -22,7 +22,7 @@ from torch.utils.data.dataloader import default_collate
 from torchvision.transforms import autoaugment, transforms
 from torchvision.transforms.functional import InterpolationMode
 from module import dendrite,dend_compartment,soma,neuron,wiring
-from module.dend_compartment import ChannelPreservingTrunkDistalDendCompartment
+from module.dend_compartment import ChannelPreservingTrunkDistalDendCompartment,SparseChannelPreservingTrunkDistalDendCompartment
 
 
 
@@ -345,7 +345,7 @@ class IFNode5PorderMaskD(nn.Module):
     
 
 class CIFAR10Net(nn.Module):
-    def __init__(self, channels, class_num: int, T: int=32, P:int=-1,num_branches=4,compartments_per_branch=2):
+    def __init__(self, channels, class_num: int, T: int=32, P:int=-1,num_branches=8,compartments_per_branch=4,branch_degree=4):
         super().__init__()
         conv = []
         for i in range(2):
@@ -356,7 +356,7 @@ class CIFAR10Net(nn.Module):
                     in_channels = channels
                 conv.append(layer.Conv1d(in_channels, channels, kernel_size=3, padding=1, bias=False))
                 conv.append(layer.BatchNorm1d(channels))
-                conv.append(ChannelPreservingTrunkDistalDendCompartment(channels,num_branches=num_branches,compartment_tau_scale=compartments_per_branch,c_sub=channels))
+                conv.append(SparseChannelPreservingTrunkDistalDendCompartment(channels,num_branches=num_branches,compartment_tau_scale=compartments_per_branch,c_sub=channels,branch_degree=branch_degree))
                 conv.append(soma.AstroPSNIntergerSoma_ssf(psn_order=T))
 
             conv.append(layer.AvgPool1d(2))
@@ -367,6 +367,7 @@ class CIFAR10Net(nn.Module):
         self.fc = nn.Sequential(
             layer.Flatten(),
             layer.Linear(channels * 8, channels * 8 // 4),
+            SparseChannelPreservingTrunkDistalDendCompartment(channels * 2,num_branches=num_branches,compartment_tau_scale=compartments_per_branch,c_sub=channels,branch_degree=branch_degree),
             soma.AstroPSNIntergerSoma_ssf(psn_order=T),
             layer.Linear(channels * 8 // 4, class_num),
         )
@@ -385,7 +386,7 @@ from datetime import datetime
 def main():
 
     parser = argparse.ArgumentParser(description='Classify Sequential CIFAR10/100')
-    parser.add_argument('-device', default='cuda:0', help='device')
+    parser.add_argument('-device', default='cuda:7', help='device')
     parser.add_argument('-b', default=128, type=int, help='batch size')
     parser.add_argument('-epochs', default=256, type=int, metavar='N',
                         help='number of total epochs to run')
