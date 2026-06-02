@@ -1,4 +1,5 @@
 output/
+exp/
 all_spike/
 logs/
 events.*

@@ -2237,7 +2237,7 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
         init_tau=None,
         tau_min: float = 1.25,
         tau_max: float = 5.0,
-        compartment_tau_scale=(1.0, 1.5),
+        compartment_tau_scale=(1.0, 2.5),
         decay_input: bool = True,
         v_rest: float = 0.0,
         step_mode: str = "m",

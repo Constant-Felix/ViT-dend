@@ -34,19 +34,19 @@ from module import dendrite,dend_compartment,soma,neuron,wiring
 from spikingjelly.activation_based import functional, surrogate, layer
 from module.dend_compartment import ChannelPreservingTrunkDistalDendCompartment,SparseChannelPreservingTrunkDistalDendCompartment
 
-device = 'cuda'
+#device = 'cuda'
 class ff_SHD(nn.Module):
-    def __init__(self, in_dim=700, hidden=128, out_dim=20,drop=0.0,T=250):
+    def __init__(self, in_dim=700, hidden=128, out_dim=35,drop=0.0,T=250):
         super().__init__()
         layers = []
         layers += [layer.Conv1d(in_dim, hidden,kernel_size=1),
                    nn.Dropout(drop),
                    SparseChannelPreservingTrunkDistalDendCompartment(channels=hidden),
-                   soma.AstroPSNIntergerSoma_ssf(psn_order=T)]
+                   soma.PSNIntergerSoma_ssf(psn_order=T)]  #需要试astro_event_write=True
         layers += [layer.Conv1d(hidden, hidden,kernel_size=1),
                    nn.Dropout(drop),
                    SparseChannelPreservingTrunkDistalDendCompartment(channels=hidden),
-                   soma.AstroPSNIntergerSoma_ssf(psn_order=T)]
+                   soma.PSNIntergerSoma_ssf(psn_order=T)]
         layers += [layer.Conv1d(hidden, out_dim,kernel_size=1)]
         self.features = nn.Sequential(*layers)
 
@@ -57,10 +57,10 @@ class ff_SHD(nn.Module):
         x = x.unsqueeze(-1)
         assert x.dim() == 4, "dimension of x is not correct!"
 
-        x = self.features(x)
-        return x.sum(0)
+        x = self.features(x).squeeze(-1)
+        return x.mean(0)
 
-def train(train_loader, model, criterion, optimizer, epoch, args):
+def train(train_loader, model, criterion, optimizer, epoch, args, gpu):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -77,8 +77,8 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
     for i, (images, target) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
-        images = images.cuda(non_blocking=True)  # images:[bs, 1, 28, 28]
-        target = target.cuda(non_blocking=True)
+        images = images.to(gpu)  # images:[bs, 1, 28, 28]
+        target = target.to(gpu)
 
         functional.reset_net(model)
         output = model(images)
@@ -107,7 +107,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
     return top1.avg, losses.avg
 
 
-def validate(val_loader, model, criterion, args):
+def validate(val_loader, model, criterion, args, gpu):
     batch_time = AverageMeter('Time', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
@@ -123,8 +123,8 @@ def validate(val_loader, model, criterion, args):
     with torch.no_grad():
         end = time.time()
         for i, (images, target) in enumerate(val_loader):
-            images = images.cuda(non_blocking=True)
-            target = target.cuda(non_blocking=True)
+            images = images.to(gpu)
+            target = target.to(gpu)
 
             functional.reset_net(model)
             output = model(images)
@@ -174,22 +174,22 @@ parser = argparse.ArgumentParser(description='Sequential SHD/SSC')
 parser.add_argument('--task', default='SSC', type=str, help='SHD, SSC')
 parser.add_argument('--optim', default='adam', type=str, help='optimizer (default: adam)')
 parser.add_argument('--results-dir', default='', type=str, metavar='PATH', help='path to cache (default: none)')
-parser.add_argument('-p', '--print-freq', default=50, type=int,
+parser.add_argument('-p', '--print-freq', default=1, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('--seed', default=0, type=int, metavar='N', help='seed')
-parser.add_argument('--epochs', default=100, type=int, metavar='N', help='number of total epochs to run')
-parser.add_argument('--lr', '--learning-rate', default=0.0005, type=float, metavar='LR', help='initial learning rate',
+parser.add_argument('--epochs', default=200, type=int, metavar='N', help='number of total epochs to run')
+parser.add_argument('--lr', '--learning-rate', default=0.01, type=float, metavar='LR', help='initial learning rate',
                     dest='lr')
-parser.add_argument('--schedule', default=[40, 80], nargs='*', type=int,
+parser.add_argument('--schedule', default=[], nargs='*', type=int,
                     help='learning rate schedule (when to drop lr by 10x); does not take effect if --cos is on')
-parser.add_argument('--batch-size', default=64, type=int, metavar='N', help='mini-batch size')
-parser.add_argument('--wd', default=0, type=float, metavar='W', help='weight decay')
+parser.add_argument('--batch-size', default=32, type=int, metavar='N', help='mini-batch size')
+parser.add_argument('--wd', default=0.0, type=float, metavar='W', help='weight decay')
 parser.add_argument("--workers", type=int, default=8)
 parser.add_argument('--cos', action='store_true', default=False, help='use cosine lr schedule')
 
 args = parser.parse_args()
 if args.results_dir == '':
-    args.results_dir = './exp/'+args.task+args.network+'-' + datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+    args.results_dir = './exp/'+args.task+'ff'+'-' + datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
 
 Path(args.results_dir).mkdir(parents=True, exist_ok=True)
 logger = setup_logging(os.path.join(args.results_dir, "log-" + datetime.now().strftime("%Y-%m-%d-%H-%M-%S") + ".txt"))
@@ -200,7 +200,7 @@ if torch.cuda.is_available():
 else:
     device = 'cpu'
     print('GPU is not available')
-gpu = torch.device('cuda')
+gpu = torch.device('cuda:5')
 seed_everything(seed=args.seed, is_cuda=True)
 
 torch.backends.cudnn.benchmark = True
@@ -215,7 +215,9 @@ if args.task == 'SHD' or args.task == 'SSC':
 else:
     raise NotImplementedError
 
-model = ff_SHD(in_dim=in_dim, hidden=128, out_dim=20,T=T).to(gpu)
+model = ff_SHD(in_dim=in_dim, hidden=128, out_dim=35,T=T).to(gpu)
+n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"number of params: {n_parameters}")
 
 logging.info(str(model))
 
@@ -245,12 +247,13 @@ test_res = pd.DataFrame()
 for epoch in range(start_epoch, args.epochs):
     adjust_learning_rate(optimizer, epoch, args)
 
-    train_acc, train_loss = train(train_loader, model, criterion, optimizer, epoch, args)
+    train_acc, train_loss = train(train_loader, model, criterion, optimizer, epoch, args,gpu=gpu)
     train_loader.reset()
-    acc1, acc5 = validate(test_loader, model, criterion, args)
+    acc1, acc5 = validate(test_loader, model, criterion, args,gpu=gpu)
     test_loader.reset()
     #scheduler.step()
 
+    is_best = acc1 > best_acc.top1
     best_acc.top1 = max(best_acc.top1, acc1)
     best_acc.top5 = max(best_acc.top5, acc5)
     train_res[str(epoch)] = [train_acc.cpu().item(), train_loss]
@@ -269,4 +272,4 @@ for epoch in range(start_epoch, args.epochs):
         'best_acc': best_acc,
         'state_dict': model.state_dict(),
         'optimizer': optimizer.state_dict(),
-    }, is_best=False, dirname=args.results_dir, filename='checkpoint.pth.tar')
+    }, is_best=is_best, dirname=args.results_dir, filename='checkpoint.pth.tar')
