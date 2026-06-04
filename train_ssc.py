@@ -19,20 +19,47 @@ import os
 import time
 import json
 import argparse
+import logging
 from datetime import datetime
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
 from pathlib import Path
 from functools import partial
-import pandas as pd
 import sys
-from ssc_dataset import getData,SpikeIterator
+from ssc_dataset import create_spikingjelly_frame_dataloader,create_fixed_time_h5_dataloader
 from torch.utils.data.dataloader import default_collate
 from torchvision.transforms import autoaugment, transforms
 from torchvision.transforms.functional import InterpolationMode
 from module import dendrite,dend_compartment,soma,neuron,wiring
 from spikingjelly.activation_based import functional, surrogate, layer
+from spikingjelly.clock_driven.neuron import MultiStepParametricLIFNode, MultiStepLIFNode
 from module.dend_compartment import ChannelPreservingTrunkDistalDendCompartment,SparseChannelPreservingTrunkDistalDendCompartment
+
+def setup_train_logging(log_file):
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
+
+    file_handler = logging.FileHandler(log_file, mode='w')
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(logging.Formatter('%(message)s'))
+
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    return logger
+
+
+def scalar_value(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().item()
+    return float(value)
+
 
 #device = 'cuda'
 class ff_SHD(nn.Module):
@@ -41,11 +68,15 @@ class ff_SHD(nn.Module):
         layers = []
         layers += [layer.Conv1d(in_dim, hidden,kernel_size=1),
                    nn.Dropout(drop),
-                   SparseChannelPreservingTrunkDistalDendCompartment(channels=hidden),
+                   #layer.BatchNorm1d(hidden),
+                   SparseChannelPreservingTrunkDistalDendCompartment(channels=hidden,num_branches=4,branch_degree=2),
+                   #nn.Identity(),
                    soma.PSNIntergerSoma_ssf(psn_order=T)]  #需要试astro_event_write=True
         layers += [layer.Conv1d(hidden, hidden,kernel_size=1),
                    nn.Dropout(drop),
-                   SparseChannelPreservingTrunkDistalDendCompartment(channels=hidden),
+                   #layer.BatchNorm1d(hidden),
+                   SparseChannelPreservingTrunkDistalDendCompartment(channels=hidden,num_branches=4,branch_degree=2),
+                   #nn.Identity(),
                    soma.PSNIntergerSoma_ssf(psn_order=T)]
         layers += [layer.Conv1d(hidden, out_dim,kernel_size=1)]
         self.features = nn.Sequential(*layers)
@@ -77,8 +108,8 @@ def train(train_loader, model, criterion, optimizer, epoch, args, gpu):
     for i, (images, target) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
-        images = images.to(gpu)  # images:[bs, 1, 28, 28]
-        target = target.to(gpu)
+        images = images.to(gpu, dtype=torch.float32, non_blocking=True)
+        target = target.to(gpu, non_blocking=True)
 
         functional.reset_net(model)
         output = model(images)
@@ -99,11 +130,11 @@ def train(train_loader, model, criterion, optimizer, epoch, args, gpu):
         batch_time.update(time.time() - end)
         end = time.time()
 
-        #if i % args.print_freq == 0:
-        #    progress.display(i)
+        if args.print_freq > 0 and i % args.print_freq == 0:
+            progress.display(i)
     logging.info(
         'Train Epoch: [{}/{}], lr: {:.6f}, top1: {:.4f}'.format(epoch, args.epochs, optimizer.param_groups[0]['lr'],
-                                                                top1.avg))
+                                                                scalar_value(top1.avg)))
     return top1.avg, losses.avg
 
 
@@ -123,8 +154,8 @@ def validate(val_loader, model, criterion, args, gpu):
     with torch.no_grad():
         end = time.time()
         for i, (images, target) in enumerate(val_loader):
-            images = images.to(gpu)
-            target = target.to(gpu)
+            images = images.to(gpu, dtype=torch.float32, non_blocking=True)
+            target = target.to(gpu, non_blocking=True)
 
             functional.reset_net(model)
             output = model(images)
@@ -142,15 +173,18 @@ def validate(val_loader, model, criterion, args, gpu):
 
             # torch.cuda.synchronize()
 
-            # if i % 10 == 0:
-            #     progress.display(i)
+            if args.print_freq > 0 and i % args.print_freq == 0:
+                progress.display(i)
 
-        # print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
-        #       .format(top1=top1, top5=top5))
+        logging.info(
+            ' * Loss {:.4e} Acc@1 {:.3f} Acc@5 {:.3f}'.format(
+                losses.avg,
+                scalar_value(top1.avg),
+                scalar_value(top5.avg),
+            )
+        )
 
-        logging.info(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'.format(top1=top1, top5=top5))
-
-    return top1.avg, top5.avg
+    return top1.avg, top5.avg, losses.avg
 
 
 def accuracy(output, target, topk=(1,)):
@@ -169,13 +203,14 @@ def accuracy(output, target, topk=(1,)):
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 
+# python train_ssc.py --task SSC --device cuda:2 --workers 8 --epoch 200 --optim sgd --lr 0.1
 
 parser = argparse.ArgumentParser(description='Sequential SHD/SSC')
 parser.add_argument('--task', default='SSC', type=str, help='SHD, SSC')
 parser.add_argument('--optim', default='adam', type=str, help='optimizer (default: adam)')
 parser.add_argument('--results-dir', default='', type=str, metavar='PATH', help='path to cache (default: none)')
-parser.add_argument('-p', '--print-freq', default=1, type=int,
-                    metavar='N', help='print frequency (default: 10)')
+parser.add_argument('-p', '--print-freq', default=512, type=int,
+                    metavar='N', help='print frequency (default: 50)')
 parser.add_argument('--seed', default=0, type=int, metavar='N', help='seed')
 parser.add_argument('--epochs', default=200, type=int, metavar='N', help='number of total epochs to run')
 parser.add_argument('--lr', '--learning-rate', default=0.01, type=float, metavar='LR', help='initial learning rate',
@@ -186,32 +221,59 @@ parser.add_argument('--batch-size', default=32, type=int, metavar='N', help='min
 parser.add_argument('--wd', default=0.0, type=float, metavar='W', help='weight decay')
 parser.add_argument("--workers", type=int, default=8)
 parser.add_argument('--cos', action='store_true', default=False, help='use cosine lr schedule')
+parser.add_argument('--data-root', default='/data/hyx/ViT-dend/data/ssc', type=str,
+                    help='path to extract/ or frames_number_250_split_by_number/')
+parser.add_argument('--device', default=None, type=str, help="device, e.g. 'cuda', 'cuda:5', or 'cpu'")
+parser.add_argument('--no-pin-memory', action='store_true', default=False, help='disable DataLoader pinned memory')
 
 args = parser.parse_args()
 if args.results_dir == '':
     args.results_dir = './exp/'+args.task+'ff'+'-' + datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
 
 Path(args.results_dir).mkdir(parents=True, exist_ok=True)
-logger = setup_logging(os.path.join(args.results_dir, "log-" + datetime.now().strftime("%Y-%m-%d-%H-%M-%S") + ".txt"))
+logger = setup_train_logging(os.path.join(args.results_dir, "log-" + datetime.now().strftime("%Y-%m-%d-%H-%M-%S") + ".txt"))
 
-if torch.cuda.is_available():
-    device = 'cuda'
+if args.device is not None:
+    gpu = torch.device(args.device)
+elif torch.cuda.is_available():
+    gpu = torch.device('cuda')
     print('GPU is available')
 else:
-    device = 'cpu'
+    gpu = torch.device('cpu')
     print('GPU is not available')
-gpu = torch.device('cuda:5')
 seed_everything(seed=args.seed, is_cuda=True)
 
 torch.backends.cudnn.benchmark = True
 
-if args.task == 'SHD' or args.task == 'SSC':
+if args.task.upper() == 'SSC':
     T = 250
-    max_time = 1.4
     in_dim = 700
-    (x_train, y_train), (x_test, y_test) = getData(args.task)
-    train_loader = SpikeIterator(x_train, y_train, args.batch_size, T, in_dim, max_time, shuffle=True)
-    test_loader = SpikeIterator(x_test, y_test, args.batch_size, T, in_dim, max_time, shuffle=False)
+    pin_memory = (not args.no_pin_memory) and gpu.type == 'cuda'
+    train_loader = create_fixed_time_h5_dataloader(
+    split="train",
+    batch_size=args.batch_size,
+    root_path=args.data_root,
+    dataset="SSC",
+    nb_steps=250,
+    nb_units=700,
+    max_time=1.4,
+    shuffle=True,
+    num_workers=args.workers,
+    pin_memory=pin_memory,
+)
+
+    test_loader = create_fixed_time_h5_dataloader(
+    split="test",
+    batch_size=args.batch_size,
+    root_path=args.data_root,
+    dataset="SSC",
+    nb_steps=250,
+    nb_units=700,
+    max_time=1.4,
+    shuffle=False,
+    num_workers=args.workers,
+    pin_memory=pin_memory,
+)
 else:
     raise NotImplementedError
 
@@ -221,7 +283,7 @@ print(f"number of params: {n_parameters}")
 
 logging.info(str(model))
 
-criterion = nn.CrossEntropyLoss().cuda(gpu)
+criterion = nn.CrossEntropyLoss().to(gpu)
 
 if args.optim == 'sgd':
     optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, weight_decay=args.wd, momentum=0.9)
@@ -236,40 +298,57 @@ with open(args.results_dir + '/args.json', 'w') as fid:
     json.dump(args.__dict__, fid, indent=2)
 logging.info(str(args))
 start_epoch = 0
+writer = SummaryWriter(args.results_dir, purge_step=start_epoch)
 
 if args.print_freq > len(train_loader):
-    args.print_freq = math.ceil(len(train_loader) // 2)
+    args.print_freq = max(1, math.ceil(len(train_loader) / 2))
 
 best_acc = argparse.Namespace(top1=0, top5=0)
-# For storing results
-train_res = pd.DataFrame()
-test_res = pd.DataFrame()
 for epoch in range(start_epoch, args.epochs):
+    epoch_start_time = time.time()
     adjust_learning_rate(optimizer, epoch, args)
 
     train_acc, train_loss = train(train_loader, model, criterion, optimizer, epoch, args,gpu=gpu)
-    train_loader.reset()
-    acc1, acc5 = validate(test_loader, model, criterion, args,gpu=gpu)
-    test_loader.reset()
+    acc1, acc5, test_loss = validate(test_loader, model, criterion, args,gpu=gpu)
     #scheduler.step()
 
-    is_best = acc1 > best_acc.top1
-    best_acc.top1 = max(best_acc.top1, acc1)
-    best_acc.top5 = max(best_acc.top5, acc5)
-    train_res[str(epoch)] = [train_acc.cpu().item(), train_loss]
-    test_res[str(epoch)] = [acc1.cpu()]
+    train_acc_value = scalar_value(train_acc)
+    test_acc_value = scalar_value(acc1)
+    test_acc5_value = scalar_value(acc5)
+    lr = optimizer.param_groups[0]['lr']
 
-    logging.info('Test Epoch: [{}/{}], lr: {:.6f}, acc: {:.4f}'.format(epoch, args.epochs,
-                                                                       optimizer.param_groups[0]['lr'],
-                                                                       acc1))
-    logging.info('Best test acc: {:.4f}'.format(best_acc.top1))
+    writer.add_scalar('train_loss', train_loss, epoch)
+    writer.add_scalar('train_acc', train_acc_value, epoch)
+    writer.add_scalar('test_loss', test_loss, epoch)
+    writer.add_scalar('test_acc', test_acc_value, epoch)
+    writer.add_scalar('test_acc5', test_acc5_value, epoch)
+    writer.add_scalar('lr', lr, epoch)
+
+    is_best = test_acc_value > best_acc.top1
+    best_acc.top1 = max(best_acc.top1, test_acc_value)
+    best_acc.top5 = max(best_acc.top5, test_acc5_value)
+
+    logging.info(
+        'epoch = {}, train_loss = {:.4f}, train_acc = {:.4f}, '
+        'test_loss = {:.4f}, test_acc = {:.4f}, best_test_acc = {:.4f}, '
+        'lr = {:.6f}, time = {:.2f}s'.format(
+            epoch,
+            train_loss,
+            train_acc_value,
+            test_loss,
+            test_acc_value,
+            best_acc.top1,
+            lr,
+            time.time() - epoch_start_time,
+        )
+    )
     #print('current beta values:', model)
 
-    train_res.to_csv(os.path.join(args.results_dir, 'train_res.csv'), index=False)
-    test_res.to_csv(os.path.join(args.results_dir, 'test_res.csv'), index=False)
     save_checkpoint({
         'epoch': epoch + 1,
         'best_acc': best_acc,
         'state_dict': model.state_dict(),
         'optimizer': optimizer.state_dict(),
     }, is_best=is_best, dirname=args.results_dir, filename='checkpoint.pth.tar')
+
+writer.close()
