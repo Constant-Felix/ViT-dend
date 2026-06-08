@@ -19,9 +19,9 @@ from timm.optim import create_optimizer
 from timm.scheduler import create_scheduler
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 import autoaugment
-_seed_ = 2026
+_seed_ = 2021
 import random
-random.seed(2026)
+random.seed(2021)
 root_path = os.path.abspath(__file__)
 
 torch.manual_seed(_seed_)  # use torch.manual_seed() to seed the RNG for all devices (both CPU and CUDA)
@@ -40,7 +40,7 @@ def parse_args():
     parser.add_argument('--num-classes', type=int, default=10, metavar='N',
                         help='number of label classes (default: 1000)')
     parser.add_argument('--data-path', default='/data/hyx/ViT-dend/data/cifar10-dvs/cifar10-dvs', help='dataset')
-    parser.add_argument('--device', default='cuda', help='device')
+    parser.add_argument('--device', default='cuda:2', help='device')
     parser.add_argument('-b', '--batch-size', default=16, type=int)
     parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                         help='number of data loading workers (default: 4)')
@@ -222,27 +222,21 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, pri
 
         if scaler is not None:
             with amp.autocast():
-                output = model(image)[0]  ##
+                output = model(image)
                 loss = criterion(output, target)
         else:
-            output = model(image)[0] ##
+            output = model(image)
             loss = criterion(output, target)
-        
+
         optimizer.zero_grad()
 
         if scaler is not None:
             scaler.scale(loss).backward()
-            #for name, param in model.named_parameters():
-            #    if param.requires_grad and param.grad is None:
-            #        print(f"未使用到的参数: {name}")
             scaler.step(optimizer)
             scaler.update()
 
         else:
             loss.backward()
-            #for name, param in model.named_parameters():
-            #    if param.requires_grad and param.grad is None:
-            #        print(f"未使用到的参数: {name}")
             optimizer.step()
 
         functional.reset_net(model)
@@ -277,7 +271,7 @@ def evaluate(model, criterion, data_loader, device, print_freq=100, header='Test
             image = image.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
             image = image.float()
-            output = model(image)[0]
+            output = model(image)
             loss = criterion(output, target)
             functional.reset_net(model)
 
@@ -377,7 +371,7 @@ def main(args):
 
     model = create_model(
         #'Spikingformer',
-        "QKFormer_dend_dvs",
+        "QKFormer",
         #'sglformer2',
         pretrained=False,
         drop_rate=0.,

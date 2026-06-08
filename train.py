@@ -1250,7 +1250,7 @@ def main():
                 patch_size=args.patch_size, embed_dims=args.dim, num_heads=args.num_heads, mlp_ratios=args.mlp_ratio,
                 in_channels=args.in_channels, num_classes=args.num_classes, qkv_bias=False,
                 depths=args.layer, sr_ratios=1,
-                T=args.time_steps
+                T=args.time_steps,TET=args.TET
             )    
     else:
         if args.qkformer==False:

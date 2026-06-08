@@ -2237,7 +2237,7 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
         init_tau=None,
         tau_min: float = 1.25,
         tau_max: float = 5.0,
-        compartment_tau_scale=(1.0, 2.5),
+        compartment_tau_scale=(1.0, 2.0),
         decay_input: bool = True,
         v_rest: float = 0.0,
         step_mode: str = "m",
@@ -2254,6 +2254,7 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
         input_residual_init: float = 0.0,
         detach_state_during_forward: bool = False,
         parallel_forward: bool = True,
+        shared_tau_parallel: bool = True,
     ):
         super().__init__(v_rest, step_mode, store_v_seq)
         if channels is None:
@@ -2290,6 +2291,7 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
         self.edge_gain_scale = float(edge_gain_scale)
         self.detach_state_during_forward = bool(detach_state_during_forward)
         self.parallel_forward = bool(parallel_forward)
+        self.shared_tau_parallel = bool(shared_tau_parallel)
         self.store_branch_monitor = bool(store_branch_monitor)
 
         active_branch_index = self._make_active_branch_index(
@@ -2543,6 +2545,70 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
         permute_to_time_first = (3, 4, 0, 1, 2) + tuple(range(5, len(edge_first_shape)))
         return state_edge_first.permute(permute_to_time_first).contiguous()
 
+    def _parallel_integrate_shared_tau(self, branch_input_seq: torch.Tensor, v_init: torch.Tensor):
+        if self.no_filter:
+            return branch_input_seq
+
+        # tau_compartments is already (num_branches, compartments); keep the
+        # temporal kernel at that size instead of expanding it to every edge/channel.
+        T, N = branch_input_seq.shape[:2]
+        spatial_shape = branch_input_seq.shape[5:]
+        flat_size = self.branch_degree * self.channels * self.compartments_per_branch
+
+        permute_to_edge_first = (2, 3, 4, 0, 1) + tuple(range(5, branch_input_seq.dim()))
+        branch_input_flat = branch_input_seq.permute(permute_to_edge_first).reshape(flat_size, T, -1)
+
+        v_permute_to_edge_first = (1, 2, 3, 0) + tuple(range(4, v_init.dim()))
+        v_init_flat = v_init.permute(v_permute_to_edge_first).reshape(flat_size, -1)
+
+        tau = torch.clamp(self.tau_compartments, min=1.0 + 1e-3)
+        tau = tau.to(dtype=branch_input_seq.dtype, device=branch_input_seq.device)
+        tau_matrix, tau_vec_init, tau_vec_rest, tau_flat = self._build_tau_terms(
+            tau,
+            T,
+            branch_input_seq.dtype,
+            branch_input_seq.device,
+        )
+
+        state_flat = torch.empty_like(branch_input_flat)
+        edge_branch = self._edge_index(branch_input_seq.device).reshape(-1)
+        edge_ids = torch.arange(
+            self.branch_degree * self.channels,
+            device=branch_input_seq.device,
+            dtype=torch.long,
+        )
+
+        for branch_idx in range(self.num_branches):
+            branch_edge_ids = edge_ids[edge_branch == branch_idx]
+            if branch_edge_ids.numel() == 0:
+                continue
+
+            for comp_idx in range(self.compartments_per_branch):
+                shared_idx = branch_idx * self.compartments_per_branch + comp_idx
+                flat_ids = branch_edge_ids * self.compartments_per_branch + comp_idx
+                drive = branch_input_flat[flat_ids]
+                if self.decay_input:
+                    drive = drive / tau_flat[shared_idx]
+
+                drive_2d = drive.permute(1, 0, 2).reshape(T, -1)
+                state_2d = tau_matrix[shared_idx].matmul(drive_2d)
+                state = state_2d.reshape(T, flat_ids.numel(), -1).permute(1, 0, 2)
+                state = state + tau_vec_init[shared_idx].view(1, T, 1) * v_init_flat[flat_ids].unsqueeze(1)
+                state = state + tau_vec_rest[shared_idx].view(1, T, 1) * self.v_rest
+                state_flat[flat_ids] = state
+
+        edge_first_shape = (
+            self.branch_degree,
+            self.channels,
+            self.compartments_per_branch,
+            T,
+            N,
+            *spatial_shape,
+        )
+        state_edge_first = state_flat.reshape(edge_first_shape)
+        permute_to_time_first = (3, 4, 0, 1, 2) + tuple(range(5, len(edge_first_shape)))
+        return state_edge_first.permute(permute_to_time_first).contiguous()
+
     def _normalize_distal_delta(self, delta: torch.Tensor):
         reduce_dims = [2] + list(range(4, delta.dim()))
         rms = torch.sqrt(delta.square().mean(dim=reduce_dims, keepdim=True) + 1e-6)
@@ -2737,7 +2803,10 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
 
         branch_input_seq = self._build_branch_input_sequence(x_seq)
         v_init = self._init_state(branch_input_seq[0])
-        state_seq = self._parallel_integrate(branch_input_seq, v_init)
+        if self.shared_tau_parallel:
+            state_seq = self._parallel_integrate_shared_tau(branch_input_seq, v_init)
+        else:
+            state_seq = self._parallel_integrate(branch_input_seq, v_init)
         edge_output_seq = self._compute_branch_output_sequence(state_seq)
         y_seq = self._merge_edges_sequence(edge_output_seq, x_seq)
 
@@ -2760,6 +2829,173 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
             self._distal_gate_step = None
             self._branch_output_step = None
         return y_seq
+
+class CoupledSparseChannelPreservingTrunkDistalDendCompartment(SparseChannelPreservingTrunkDistalDendCompartment):
+    """Sparse channel-preserving dendrite with directed intra-branch coupling.
+
+    This variant keeps the routing, active-edge input expansion, trunk/distal
+    readout, and edge merge from ``SparseChannelPreservingTrunkDistalDendCompartment``.
+    The only changed part is the compartment dynamics: the diagonal independent
+    transition over ``K`` compartments is replaced by a lower-bidiagonal
+    proximal-to-distal transition.
+
+    For a single active edge and channel, centered compartment voltages follow
+
+        h_0[t] = a_0 h_0[t - 1] + drive_0[t]
+        h_k[t] = a_k * ((1 - lam_k) h_k[t - 1] + lam_k h_{k - 1}[t - 1])
+                 + drive_k[t], k > 0
+
+    where ``a_k = 1 - 1 / tau_k``.  The total historical gain of compartment
+    ``k`` remains ``a_k``, so coupling redistributes the previous state between
+    self-memory and proximal input instead of increasing the recurrent gain.
+    """
+
+    def __init__(
+        self,
+        *args,
+        proximal_coupling_init: float = 0.1,
+        proximal_coupling_max: float = 0.5,
+        **kwargs,
+    ):
+        kwargs.setdefault("parallel_forward", True)
+        super().__init__(*args, **kwargs)
+        if proximal_coupling_max <= 0.0 or proximal_coupling_max > 1.0:
+            raise ValueError("proximal_coupling_max must be in (0, 1]")
+        if proximal_coupling_init < 0.0 or proximal_coupling_init > proximal_coupling_max:
+            raise ValueError("proximal_coupling_init must be in [0, proximal_coupling_max]")
+
+        self.proximal_coupling_max = float(proximal_coupling_max)
+        eps = 1e-4
+        init_ratio = float(proximal_coupling_init) / self.proximal_coupling_max
+        init_ratio = min(max(init_ratio, eps), 1.0 - eps)
+        init_logit = torch.logit(torch.tensor(init_ratio, dtype=torch.float32))
+        self.proximal_coupling_logits = nn.Parameter(
+            torch.full((self.num_branches, self.distal_count), float(init_logit))
+        )
+
+    def _edge_proximal_coupling(self, dtype, device):
+        coupling = self.proximal_coupling_max * torch.sigmoid(
+            self.proximal_coupling_logits.to(dtype=dtype, device=device)
+        )
+        return self._edge_branch_value(coupling)
+
+    def _build_decay_terms(self, decay: torch.Tensor, T: int, dtype, device):
+        decay = decay.reshape(-1).to(dtype=dtype, device=device).clamp(0.0, 1.0 - 1e-4)
+        t = torch.arange(T, dtype=dtype, device=device)
+        diff = t[:, None] - t[None, :]
+        mask = diff >= 0
+        powers = decay[:, None, None] ** diff.clamp_min(0).unsqueeze(0)
+        decay_matrix = torch.where(
+            mask.unsqueeze(0),
+            powers,
+            torch.zeros((), dtype=dtype, device=device),
+        )
+        decay_vec_init = decay[:, None] ** (t + 1.0)
+        return decay_matrix, decay_vec_init, decay
+
+    def _parallel_filter_from_decay(
+        self,
+        drive_seq: torch.Tensor,
+        h_init: torch.Tensor,
+        self_decay: torch.Tensor,
+    ):
+        T, N = drive_seq.shape[:2]
+        spatial_shape = drive_seq.shape[4:]
+        flat_size = self.branch_degree * self.channels
+
+        permute_to_edge_first = (2, 3, 0, 1) + tuple(range(4, drive_seq.dim()))
+        drive_flat = drive_seq.permute(permute_to_edge_first).reshape(flat_size, T, -1)
+
+        init_permute_to_edge_first = (1, 2, 0) + tuple(range(3, h_init.dim()))
+        h_init_flat = h_init.permute(init_permute_to_edge_first).reshape(flat_size, -1)
+
+        decay_matrix, decay_vec_init, _ = self._build_decay_terms(
+            self_decay,
+            T,
+            drive_seq.dtype,
+            drive_seq.device,
+        )
+        state_flat = torch.bmm(decay_matrix, drive_flat)
+        state_flat = state_flat + decay_vec_init[:, :, None] * h_init_flat[:, None, :]
+
+        edge_first_shape = (
+            self.branch_degree,
+            self.channels,
+            T,
+            N,
+            *spatial_shape,
+        )
+        state_edge_first = state_flat.reshape(edge_first_shape)
+        permute_to_time_first = (2, 3, 0, 1) + tuple(range(4, len(edge_first_shape)))
+        return state_edge_first.permute(permute_to_time_first).contiguous()
+
+    def _integrate(self, branch_input: torch.Tensor, v_prev: torch.Tensor):
+        if self.no_filter:
+            return branch_input
+
+        tau = torch.clamp(self.tau_compartments, min=1.0 + 1e-3)
+        tau = self._edge_branch_value(tau.to(dtype=branch_input.dtype, device=branch_input.device))
+        tau = self._view_edge_compartment(tau, branch_input)
+        decay = 1.0 - 1.0 / tau
+        drive = branch_input / tau if self.decay_input else branch_input
+
+        h_prev = v_prev - self.v_rest
+        first_state = decay[:, :, :, :1, ...] * h_prev[:, :, :, :1, ...] + drive[:, :, :, :1, ...]
+
+        coupling = self._edge_proximal_coupling(branch_input.dtype, branch_input.device)
+        coupling = self._view_edge_distal(coupling, h_prev[:, :, :, 1:, ...])
+        distal_decay = decay[:, :, :, 1:, ...]
+        distal_state = (
+            distal_decay * (1.0 - coupling) * h_prev[:, :, :, 1:, ...]
+            + distal_decay * coupling * h_prev[:, :, :, :-1, ...]
+            + drive[:, :, :, 1:, ...]
+        )
+        return torch.cat([first_state, distal_state], dim=3) + self.v_rest
+
+    def _parallel_integrate(self, branch_input_seq: torch.Tensor, v_init: torch.Tensor):
+        if self.no_filter:
+            return branch_input_seq
+
+        tau = torch.clamp(self.tau_compartments, min=1.0 + 1e-3)
+        tau = self._edge_branch_value(
+            tau.to(dtype=branch_input_seq.dtype, device=branch_input_seq.device)
+        )
+        decay = 1.0 - 1.0 / tau
+        coupling = self._edge_proximal_coupling(branch_input_seq.dtype, branch_input_seq.device)
+
+        h_init = v_init - self.v_rest
+        h_states = []
+        for k in range(self.compartments_per_branch):
+            input_k = branch_input_seq[:, :, :, :, k, ...]
+            tau_k = tau[:, :, k]
+            drive_k = input_k / tau_k.view(1, 1, self.branch_degree, self.channels, *([1] * (input_k.dim() - 4)))
+            if not self.decay_input:
+                drive_k = input_k
+
+            h_init_k = h_init[:, :, :, k, ...]
+            if k == 0:
+                self_decay = decay[:, :, k]
+            else:
+                lam = coupling[:, :, k - 1]
+                self_decay = decay[:, :, k] * (1.0 - lam)
+                lower_decay = decay[:, :, k] * lam
+                lower_shift = torch.cat(
+                    [h_init[:, :, :, k - 1, ...].unsqueeze(0), h_states[k - 1][:-1]],
+                    dim=0,
+                )
+                drive_k = drive_k + lower_decay.view(
+                    1,
+                    1,
+                    self.branch_degree,
+                    self.channels,
+                    *([1] * (input_k.dim() - 4)),
+                ) * lower_shift
+
+            h_states.append(self._parallel_filter_from_decay(drive_k, h_init_k, self_decay))
+
+        return torch.stack(h_states, dim=4) + self.v_rest
+
+
 
 class PAComponentDendCompartment(BaseDendCompartment):
     """Dendritic compartment with passive and active voltage components.

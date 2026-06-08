@@ -5,7 +5,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 
-DEFAULT_ROOT = "data"    #"/data/hyx/ViT-dend/data/ssc/extract"
+DEFAULT_ROOT = "/data/hyx/ViT-dend/data/shd/data_shd"
 DEFAULT_H5_ROOT = "data"
 
 
@@ -30,7 +30,7 @@ class SpikingJellyFrameDataset(Dataset):
         self.dtype = np.dtype(dtype)
 
         if frames_dir_name is None:
-            frames_dir_name = f"frames_number_{self.frames_number}_split_by_{self.split_by}"
+            frames_dir_name = "frames_number_250_split_by_number"
 
         self.frames_root = self._resolve_frames_root(frames_dir_name)
         self.split_root = self.frames_root / self.split

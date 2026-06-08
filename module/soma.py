@@ -84,6 +84,65 @@ def expand_tensor_cumulative(tensor, max_value=4):
 
     return binary
 
+class MaskedSlidingPSN(nn.Module):
+    def gen_gemm_weight(self, T: int):
+        weight = torch.zeros([T, T], device=self.weight.device)
+        for i in range(T):
+            end = i + 1
+            start = max(0, i + 1 - self.order)
+            length = min(end - start, self.order)
+            weight[i][start: end] = self.weight[self.order - length: self.order]
+
+        return weight
+
+
+    def __init__(self, order: int, surrogate_function=surrogate.Sigmoid(), exp_init: bool=False, backend='gemm'):
+        super().__init__()
+        self.order = order
+        self.backend = backend
+        if self.backend == 'gemm':
+            if exp_init:
+                weight = torch.ones([order])
+                for i in range(order - 2, -1, -1):
+                    weight[i] = weight[i + 1] / 2.
+
+                self.weight = nn.Parameter(weight)
+            else:
+                self.weight = torch.ones([1, order])
+                nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+                self.weight = nn.Parameter(self.weight[0])
+
+
+            self.threshold = nn.Parameter(torch.as_tensor(-1.))
+            self.surrogate_function = surrogate_function
+
+
+        elif self.backend == 'conv':
+            self.weight = torch.zeros([1, 1, order])
+            nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+            self.weight = nn.Parameter(self.weight)
+            self.threshold = nn.Parameter(torch.as_tensor(1.))
+            self.surrogate_function = surrogate_function
+
+
+    def forward(self, x_seq: torch.Tensor):
+        if self.backend == 'gemm':
+            weight = self.gen_gemm_weight(x_seq.shape[0])
+            h_seq = torch.addmm(self.threshold, weight, x_seq.flatten(1)).view(x_seq.shape)
+            return self.surrogate_function(h_seq)
+
+        elif self.backend == 'conv':
+            # x_seq.shape = [T, N, *]
+            x_seq_shape = x_seq.shape
+            # [T, N, *] -> [T, N] -> [N, T] -> [N, 1, T]
+            x_seq = x_seq.flatten(1).t().unsqueeze(1)
+            x_seq = F.pad(x_seq, pad=(self.order - 1, 0))
+            x_seq = F.conv1d(x_seq, self.weight, stride=1)
+            x_seq = x_seq.squeeze(1).t().view(x_seq_shape)
+            return self.surrogate_function(x_seq - self.threshold)
+        else:
+            raise NotImplementedError(self.backend)
+
 
 class AstroSomaMixin(MemoryModule):
     """Shared soma-side astrocyte state for spike-driven modulation."""
@@ -102,6 +161,7 @@ class AstroSomaMixin(MemoryModule):
         astro_event_threshold: float = 0.4,
         astro_event_slope: float = 8.0,
         astro_delta_weight: float = 0.5,
+        astro_update_interval: int = 1,
         store_c_seq: bool = False,
     ):
         astro_lambda = torch.as_tensor(astro_lambda, dtype=torch.float32)
@@ -120,6 +180,9 @@ class AstroSomaMixin(MemoryModule):
         self.astro_event_threshold = nn.Parameter(torch.tensor(astro_event_threshold, dtype=torch.float32))
         self.astro_delta_weight = nn.Parameter(torch.tensor(astro_delta_weight, dtype=torch.float32))
         self.astro_event_slope = float(astro_event_slope)
+        if int(astro_update_interval) <= 0:
+            raise ValueError("astro_update_interval must be positive")
+        self.astro_update_interval = int(astro_update_interval)
         self.register_memory("c", 0.0)
         self.register_memory("astro_trace", 0.0)
         self.register_memory("astro_event_gate", 0.0)
@@ -154,9 +217,11 @@ class AstroSomaMixin(MemoryModule):
         gain, bias = self.astro_decode()
         return gain * membrane + bias
 
-    def astro_pool_spike(self, spike: torch.Tensor):
+    def _astro_spike_activity(self, spike: torch.Tensor):
         scale = max(self.astro_spike_scale, 1.0)
-        activity = torch.clamp(spike / scale, min=0.0, max=1.0)
+        return torch.clamp(spike / scale, min=0.0, max=1.0)
+
+    def _astro_pool_activity(self, activity: torch.Tensor):
         kernel = self.astro_pool_kernel
         if kernel <= 1:
             return activity
@@ -178,28 +243,99 @@ class AstroSomaMixin(MemoryModule):
             )
         return activity
 
-    def astro_update(self, spike: torch.Tensor):
-        pooled_spike = self.astro_pool_spike(spike)
+    def astro_pool_spike(self, spike: torch.Tensor):
+        return self._astro_pool_activity(self._astro_spike_activity(spike))
+
+    def astro_pool_spike_sequence(self, spike_seq: torch.Tensor):
+        activity = self._astro_spike_activity(spike_seq)
+        if activity.dim() < 4:
+            return activity
+
+        T, N = activity.shape[:2]
+        flat_activity = activity.reshape(T * N, *activity.shape[2:])
+        pooled = self._astro_pool_activity(flat_activity)
+        return pooled.reshape(T, N, *pooled.shape[1:])
+
+    def astro_update_from_pooled(
+        self,
+        pooled_spike: torch.Tensor,
+        activity_drive: torch.Tensor = None,
+        block_steps: int = 1,
+    ):
         if isinstance(self.astro_trace, float):
             self.astro_trace = torch.zeros_like(pooled_spike)
+        if isinstance(self.c, float):
+            self.c = torch.zeros_like(pooled_spike)
+
+        block_steps = int(block_steps)
+        if block_steps <= 0:
+            raise ValueError("block_steps must be positive")
+
         trace_decay = torch.sigmoid(self.astro_trace_decay_logit)
-        next_trace = trace_decay * self.astro_trace + pooled_spike
-        write = torch.tanh(torch.relu(next_trace - self.astro_thre.abs()))
         lam = torch.sigmoid(self.astro_lambda_logit)
+        next_trace = trace_decay.pow(block_steps) * self.astro_trace + pooled_spike
+        write = torch.tanh(torch.relu(next_trace - self.astro_thre.abs()))
+        block_lam = 1.0 - (1.0 - lam).pow(block_steps)
+
+        if activity_drive is None:
+            activity_drive = pooled_spike.abs()
+
         if self.astro_event_write:
             delta_drive = (write - self.c).abs()
-            activity_drive = pooled_spike.abs()
-            event_drive = activity_drive + self.astro_delta_weight.abs() * delta_drive
+            event_drive = activity_drive.abs() + self.astro_delta_weight.abs() * delta_drive
             event_gate = torch.sigmoid(
                 self.astro_event_slope * (event_drive - self.astro_event_threshold.abs())
             )
             #event_gate = event_gate * (event_drive > 0).to(event_gate.dtype)
         else:
             event_gate = torch.ones_like(write)
+
         self.astro_trace = next_trace
-        self.c = (1.0 - lam * event_gate) * self.c + lam * event_gate * write
+        self.c = (1.0 - block_lam * event_gate) * self.c + block_lam * event_gate * write
         self.astro_event_gate = event_gate.detach()
+        return self.c
+
+    def astro_update(self, spike: torch.Tensor):
+        pooled_spike = self.astro_pool_spike(spike)
+        self.astro_update_from_pooled(
+            pooled_spike,
+            activity_drive=pooled_spike.abs(),
+            block_steps=1,
+        )
         self.firing_rate = spike.float().mean()
+        return self.c
+
+    def astro_update_block(self, spike_seq: torch.Tensor):
+        pooled_seq = self.astro_pool_spike_sequence(spike_seq)
+        if pooled_seq.shape[0] == 1:
+            self.astro_update_from_pooled(
+                pooled_seq[0],
+                activity_drive=pooled_seq[0].abs(),
+                block_steps=1,
+            )
+            self.firing_rate = spike_seq.float().mean()
+            return self.c
+
+        trace_decay = torch.sigmoid(self.astro_trace_decay_logit)
+        block_steps = pooled_seq.shape[0]
+        powers = trace_decay.pow(
+            torch.arange(
+                block_steps - 1,
+                -1,
+                -1,
+                device=pooled_seq.device,
+                dtype=pooled_seq.dtype,
+            )
+        )
+        powers = powers.view(block_steps, *([1] * (pooled_seq.dim() - 1)))
+        trace_drive = (powers * pooled_seq).sum(dim=0)
+        activity_drive = pooled_seq.mean(dim=0).abs()
+        self.astro_update_from_pooled(
+            trace_drive,
+            activity_drive=activity_drive,
+            block_steps=block_steps,
+        )
+        self.firing_rate = spike_seq.float().mean()
         return self.c
 
     def reset_astro_state(self):
@@ -663,11 +799,12 @@ class AstroPSNIntergerSoma_ssf(neuron.BaseNode, AstroSomaMixin):
         v_threshold: float = 1., v_reset: float = 0., detach_reset: bool = True,
         decay_input: bool = True, step_mode='m', backend='torch', thre=4,
         surrogate_function: Callable = surrogate.Sigmoid(),
-        astro_lambda: float = 0.2, astro_trace_decay: float = 0.8,
+        astro_lambda: float = 0.2, astro_trace_decay: float = 0.9,
         astro_gain: float = 0.5, astro_bias_gain: float = 0.0, astro_thre: float = 0.4,
-        astro_pool_kernel: int = 5, astro_pool_mode: str = "avg",
+        astro_pool_kernel: int = 3, astro_pool_mode: str = "avg",
         astro_event_write: bool = False, astro_event_threshold: float = 0.05,
         astro_event_slope: float = 10.0, astro_delta_weight: float = 0.5,
+        astro_update_interval: int = 1,  ##
         store_c_seq: bool = False,
     ):
         super().__init__(
@@ -708,6 +845,7 @@ class AstroPSNIntergerSoma_ssf(neuron.BaseNode, AstroSomaMixin):
             astro_event_threshold=astro_event_threshold,
             astro_event_slope=astro_event_slope,
             astro_delta_weight=astro_delta_weight,
+            astro_update_interval=astro_update_interval,
             store_c_seq=store_c_seq,
         )
 
@@ -749,15 +887,28 @@ class AstroPSNIntergerSoma_ssf(neuron.BaseNode, AstroSomaMixin):
         c_seq = [] if self.store_c_seq else None
         last_mem = None
 
-        for i in range(x.shape[0]):
-            mem = self.astro_modulate_membrane(mem_seq[i])
-            spike = self.qtrick(mem)
-            self.astro_update(spike)
-            if self.store_c_seq:
-                c_seq.append(self.c)
+        S = self.astro_update_interval
+        if S <= 1:
+            for i in range(x.shape[0]):
+                mem = self.astro_modulate_membrane(mem_seq[i])
+                spike = self.qtrick(mem)
+                self.astro_update(spike)
+                if self.store_c_seq:
+                    c_seq.append(self.c)
 
-            last_mem = mem
-            output[i] = spike
+                last_mem = mem
+                output[i] = spike
+        else:
+            for start in range(0, x.shape[0], S):
+                end = min(start + S, x.shape[0])
+                mem = self.astro_modulate_membrane(mem_seq[start:end])
+                spike = self.qtrick(mem)
+                self.astro_update_block(spike)
+                if self.store_c_seq:
+                    c_seq.extend([self.c] * (end - start))
+
+                last_mem = mem[-1]
+                output[start:end] = spike
 
         self.v = last_mem.detach()
         self.firing_rate = output.float().mean()

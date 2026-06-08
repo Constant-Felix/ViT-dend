@@ -345,7 +345,7 @@ class IFNode5PorderMaskD(nn.Module):
     
 
 class CIFAR10Net(nn.Module):
-    def __init__(self, channels, class_num: int, T: int=32, P:int=-1,num_branches=4,compartments_per_branch=2,branch_degree=2):
+    def __init__(self, channels, class_num: int, T: int=32, P:int=-1,num_branches=8,compartments_per_branch=2,branch_degree=2):
         super().__init__()
         conv = []
         for i in range(2):
@@ -386,7 +386,7 @@ from datetime import datetime
 def main():
 
     parser = argparse.ArgumentParser(description='Classify Sequential CIFAR10/100')
-    parser.add_argument('-device', default='cuda:0', help='device')
+    parser.add_argument('-device', default='cuda:4', help='device')
     parser.add_argument('-b', default=128, type=int, help='batch size')
     parser.add_argument('-epochs', default=256, type=int, metavar='N',
                         help='number of total epochs to run')

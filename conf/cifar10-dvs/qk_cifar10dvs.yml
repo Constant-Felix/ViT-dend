@@ -2,7 +2,7 @@ epochs: 100 #100
 time_steps: 16
 dim: 256
 num_heads: 16
-num_compartment: 2
+#num_compartment: 2
 in_channels: 2
 patch_size: 16
 mlp_ratio: 1

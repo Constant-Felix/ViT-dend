@@ -40,8 +40,8 @@ def setup_logging(log_file='log.txt'):
 def reset_states(model):
     for m in model.modules():
         if hasattr(m, 'reset'):
-            if not isinstance(m, base.MemoryModule):
-                print(f'Trying to call `reset()` of {m}, which is not base.MemoryModule')
+            #if not isinstance(m, base.MemoryModule):
+            #    print(f'Trying to call `reset()` of {m}, which is not base.MemoryModule')
             m.reset()
 
 def temporal_loop_stack(input, op):
