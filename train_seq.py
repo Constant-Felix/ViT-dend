@@ -356,7 +356,7 @@ class CIFAR10Net(nn.Module):
                     in_channels = channels
                 conv.append(layer.Conv1d(in_channels, channels, kernel_size=3, padding=1, bias=False))
                 conv.append(layer.BatchNorm1d(channels))
-                conv.append(SparseChannelPreservingTrunkDistalDendCompartment(channels,num_branches=num_branches,compartment_tau_scale=compartments_per_branch,c_sub=channels,branch_degree=branch_degree))
+                conv.append(SparseChannelPreservingTrunkDistalDendCompartment(channels,num_branches=num_branches,compartment_tau_scale=compartments_per_branch,c_sub=channels,branch_degree=branch_degree,learn_comp_gain=False,learn_edge_gain=False))
                 conv.append(soma.AstroPSNIntergerSoma_ssf(psn_order=T))
 
             conv.append(layer.AvgPool1d(2))
@@ -367,7 +367,7 @@ class CIFAR10Net(nn.Module):
         self.fc = nn.Sequential(
             layer.Flatten(),
             layer.Linear(channels * 8, channels * 8 // 4),
-            SparseChannelPreservingTrunkDistalDendCompartment(channels * 2,num_branches=num_branches,compartment_tau_scale=compartments_per_branch,c_sub=channels,branch_degree=branch_degree),
+            SparseChannelPreservingTrunkDistalDendCompartment(channels * 2,num_branches=num_branches,compartment_tau_scale=compartments_per_branch,c_sub=channels,branch_degree=branch_degree,learn_comp_gain=False,learn_edge_gain=False),
             soma.AstroPSNIntergerSoma_ssf(psn_order=T),
             layer.Linear(channels * 8 // 4, class_num),
         )
@@ -380,13 +380,13 @@ class CIFAR10Net(nn.Module):
         x_seq = self.fc(self.conv(x_seq))  # [W, N, C]
         return x_seq.mean(0)
 
-# python train_seq.py -data-dir /data/hyx/ViT-dend/data/cifar10 -amp -class-num 10 -channels 128  -warmup-epochs 0  -epochs 400 -opt adamw -lr 0.001
+# python train_seq.py -data-dir /data/hyx/ViT-dend/data/cifar100 -amp -class-num 100 -channels 128  -warmup-epochs 0  -epochs 400 -opt adamw -lr 0.001 -resume logs/pt/None_e400_b128_adamw_lr0.001_c128_20260608-112508_amp_P32/checkpoint_latest.pth
 
 from datetime import datetime
 def main():
 
     parser = argparse.ArgumentParser(description='Classify Sequential CIFAR10/100')
-    parser.add_argument('-device', default='cuda:4', help='device')
+    parser.add_argument('-device', default='cuda:5', help='device')
     parser.add_argument('-b', default=128, type=int, help='batch size')
     parser.add_argument('-epochs', default=256, type=int, metavar='N',
                         help='number of total epochs to run')

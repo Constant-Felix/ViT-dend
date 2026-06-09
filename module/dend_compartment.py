@@ -2237,7 +2237,7 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
         init_tau=None,
         tau_min: float = 1.25,
         tau_max: float = 5.0,
-        compartment_tau_scale=(1.0, 2.0),
+        compartment_tau_scale=(1.0, 2.5),
         decay_input: bool = True,
         v_rest: float = 0.0,
         step_mode: str = "m",
@@ -2246,6 +2246,7 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
         no_filter: bool = False,
         merge_norm: str = "sqrt",
         learn_edge_gain: bool = True,
+        learn_comp_gain: bool = True,
         edge_gain_scale: float = 0.5,
         distal_gain_init: float = 0.1,
         distal_residual_init: float = 0.0,
@@ -2288,6 +2289,7 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
         self.no_filter = no_filter
         self.merge_norm = merge_norm
         self.learn_edge_gain = bool(learn_edge_gain)
+        self.learn_comp_gain = bool(learn_comp_gain)
         self.edge_gain_scale = float(edge_gain_scale)
         self.detach_state_during_forward = bool(detach_state_during_forward)
         self.parallel_forward = bool(parallel_forward)
@@ -2440,6 +2442,8 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
         return torch.ones_like(gain)
 
     def _edge_compartment_input_gain(self, dtype, device):
+        if self.learn_comp_gain == False:
+            return torch.full((self.branch_degree, self.channels, self.compartments_per_branch),1.0).to(dtype=dtype,device=device)
         raw = F.softplus(self.compartment_input_logits.to(dtype=dtype, device=device)) + 1e-4
         normalized = self.compartments_per_branch * raw / raw.sum(dim=-1, keepdim=True).clamp_min(1e-6)
         return self._edge_branch_value(normalized)
@@ -2570,7 +2574,7 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
             branch_input_seq.device,
         )
 
-        state_flat = torch.empty_like(branch_input_flat)
+        state_flat = torch.empty_like(branch_input_flat,dtype=branch_input_seq.dtype, device=branch_input_seq.device)
         edge_branch = self._edge_index(branch_input_seq.device).reshape(-1)
         edge_ids = torch.arange(
             self.branch_degree * self.channels,
