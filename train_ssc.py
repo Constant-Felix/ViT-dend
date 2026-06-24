@@ -69,23 +69,23 @@ class ff_SHD(nn.Module):
         layers += [layer.Conv1d(in_dim, hidden[0],kernel_size=1),
                    #layer.BatchNorm1d(hidden[0]),
                    nn.Dropout(drop),
-                   SparseChannelPreservingTrunkDistalDendCompartment(channels=hidden[0],num_branches=8,compartments_per_branch=6,branch_degree=2,shared_tau_parallel=False), #,branch_readout_mode="linear"),#,learn_edge_gain=False,learn_comp_gain=False),
+                   SparseChannelPreservingTrunkDistalDendCompartment(channels=hidden[0],num_branches=16,compartments_per_branch=8,branch_degree=4,shared_tau_parallel=False), #,branch_readout_mode="linear"),#,learn_edge_gain=False,learn_comp_gain=False),
                    #nn.Identity(),
                    #soma.MaskedSlidingPSN(order=T,surrogate_function=surrogate.Sigmoid())]
                    #soma.IntergerSoma_ssf(decay_input=False)]
                    #soma.PSNIntergerSoma_ssf(psn_order=T)]
-                   soma.SelectiveAstroPSNIntergerSoma_ssf(psn_order=T,astro_update_interval=25,astro_pool_kernel=5)] 
-                   #soma.AstroPSNIntergerSoma_ssf(psn_order=T,astro_update_interval=25,astro_pool_kernel=5)]  #需要试astro_event_write=True
+                   #soma.SelectiveAstroPSNIntergerSoma_ssf(psn_order=T,astro_update_interval=25,astro_pool_kernel=5)] 
+                   soma.AstroPSNIntergerSoma_ssf(psn_order=T,astro_update_interval=5,astro_pool_kernel=5)]  #需要试astro_event_write=True
         layers += [layer.Conv1d(hidden[0], hidden[1],kernel_size=1),
                    #layer.BatchNorm1d(hidden[1]),
                    nn.Dropout(drop),
-                   SparseChannelPreservingTrunkDistalDendCompartment(channels=hidden[1],num_branches=8,compartments_per_branch=6,branch_degree=2,shared_tau_parallel=False),  #,branch_readout_mode="linear"), #,learn_edge_gain=False,learn_comp_gain=False),
+                   SparseChannelPreservingTrunkDistalDendCompartment(channels=hidden[1],num_branches=16,compartments_per_branch=8,branch_degree=4,shared_tau_parallel=False),  #,branch_readout_mode="linear"), #,learn_edge_gain=False,learn_comp_gain=False),
                    #nn.Identity(),
                    #soma.MaskedSlidingPSN(order=T,surrogate_function=surrogate.Sigmoid())]
                    #soma.IntergerSoma_ssf(decay_input=False)]
                    #soma.PSNIntergerSoma_ssf(psn_order=T)]
-                   soma.SelectiveAstroPSNIntergerSoma_ssf(psn_order=T,astro_update_interval=25,astro_pool_kernel=5)]
-                   #soma.AstroPSNIntergerSoma_ssf(psn_order=T,astro_update_interval=25,astro_pool_kernel=5)]
+                   #soma.SelectiveAstroPSNIntergerSoma_ssf(psn_order=T,astro_update_interval=25,astro_pool_kernel=5)]
+                   soma.AstroPSNIntergerSoma_ssf(psn_order=T,astro_update_interval=5,astro_pool_kernel=5)]
         layers += [layer.Conv1d(hidden[1], out_dim,kernel_size=1)]
         self.features = nn.Sequential(*layers)
 
@@ -211,7 +211,7 @@ def accuracy(output, target, topk=(1,)):
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 
-# python train_ssc.py --task SSC --device cuda:6     --lr 0.0005 --epochs 100 --schedule 40 80 --batch-size 64        --epochs 400 --workers 16 --cos   --optim sgd    --lr 0.1
+# python train_ssc.py --task SSC --device cuda:3     --lr 0.0005 --epochs 100 --schedule 40 80 --batch-size 64        --epochs 400 --workers 16 --cos   --optim sgd    --lr 0.1
 
 parser = argparse.ArgumentParser(description='Sequential SHD/SSC')
 parser.add_argument('--task', default='SSC', type=str, help='SHD, SSC')
