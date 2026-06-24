@@ -356,7 +356,7 @@ class CIFAR10Net(nn.Module):
                     in_channels = channels
                 conv.append(layer.Conv1d(in_channels, channels, kernel_size=3, padding=1, bias=False))
                 conv.append(layer.BatchNorm1d(channels))
-                conv.append(SparseChannelPreservingTrunkDistalDendCompartment(channels,num_branches=num_branches,compartment_tau_scale=compartments_per_branch,c_sub=channels,branch_degree=branch_degree,learn_comp_gain=False,learn_edge_gain=False))
+                conv.append(SparseChannelPreservingTrunkDistalDendCompartment(channels,num_branches=num_branches,compartments_tau_scale=compartments_per_branch,c_sub=channels,branch_degree=branch_degree,learn_comp_gain=False,learn_edge_gain=False))
                 conv.append(soma.AstroPSNIntergerSoma_ssf(psn_order=T))
 
             conv.append(layer.AvgPool1d(2))
@@ -367,7 +367,7 @@ class CIFAR10Net(nn.Module):
         self.fc = nn.Sequential(
             layer.Flatten(),
             layer.Linear(channels * 8, channels * 8 // 4),
-            SparseChannelPreservingTrunkDistalDendCompartment(channels * 2,num_branches=num_branches,compartment_tau_scale=compartments_per_branch,c_sub=channels,branch_degree=branch_degree,learn_comp_gain=False,learn_edge_gain=False),
+            SparseChannelPreservingTrunkDistalDendCompartment(channels * 2,num_branches=num_branches,compartments_tau_scale=compartments_per_branch,c_sub=channels,branch_degree=branch_degree,learn_comp_gain=False,learn_edge_gain=False),
             soma.AstroPSNIntergerSoma_ssf(psn_order=T),
             layer.Linear(channels * 8 // 4, class_num),
         )

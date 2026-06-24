@@ -143,6 +143,45 @@ class MaskedSlidingPSN(nn.Module):
         else:
             raise NotImplementedError(self.backend)
 
+class DecayPorderMaskedLinear(nn.Linear):
+    def __init__(self, P: int, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.P = P
+        mask1 = torch.ones_like(self.weight.data)
+        mask0 = torch.tril(mask1) * torch.triu(mask1, -(P - 1))
+        self.register_buffer('mask0', mask0)
+        self.register_buffer('mask1', mask1)
+        self.k = 0.
+        # k should be set as epoch / (epochs - 1)
+
+    @staticmethod
+    @torch.jit.script
+    def gen_mask(k: float, mask0: torch.Tensor, mask1: torch.Tensor):
+        return k * mask0 + (1. - k) * mask1
+
+    @staticmethod
+    @torch.jit.script
+    def gen_masked_weight(weight: torch.Tensor, k: float, mask0: torch.Tensor, mask1: torch.Tensor):
+        return weight * (k * mask0 + (1. - k) * mask1)
+
+    def masked_weight(self):
+        return self.gen_masked_weight(self.weight, self.k, self.mask0, self.mask1)
+
+    def forward(self, x: torch.Tensor):
+        return F.linear(x, self.weight * self.gen_mask(self.k, self.mask0, self.mask1), self.bias)
+    
+class IFNode5PorderMaskD(nn.Module):
+    def __init__(self, T: int, surrogate_function: surrogate.SurrogateFunctionBase, P: int):
+        super().__init__()
+        self.surrogate_function = surrogate_function
+        self.fc = DecayPorderMaskedLinear(P, T, T)
+        nn.init.constant_(self.fc.bias, -1)
+
+    def forward(self, x_seq: torch.Tensor):
+        # x_seq.shape = [T, N, *]
+        h_seq = torch.addmm(self.fc.bias.unsqueeze(1), self.fc.masked_weight(), x_seq.flatten(1))
+        spike = self.surrogate_function(h_seq)
+        return spike.view(x_seq.shape)    
 
 class AstroSomaMixin(MemoryModule):
     """Shared soma-side astrocyte state for spike-driven modulation."""
@@ -224,7 +263,7 @@ class AstroSomaMixin(MemoryModule):
     def _astro_pool_activity(self, activity: torch.Tensor):
         kernel = self.astro_pool_kernel
         if kernel <= 1:
-            return activity
+            return activity       
 
         padding = kernel // 2
         if activity.dim() >= 4:
@@ -915,6 +954,167 @@ class AstroPSNIntergerSoma_ssf(neuron.BaseNode, AstroSomaMixin):
         if self.store_c_seq:
             self.c_seq = torch.stack(c_seq)
         return output
+
+class SelectiveAstroPSNIntergerSoma_ssf(AstroPSNIntergerSoma_ssf):
+    """Astro-PSN-SSF soma with selective membrane commits.
+
+    The PSN and astrocyte path first produces a membrane proposal. A per-element
+    binary gate then decides whether that proposal is committed to the soma
+    membrane state. Astrocyte updates can optionally see only committed spikes,
+    so carried timesteps do not repeatedly write to the slow astrocyte state.
+    """
+
+    def __init__(
+        self,
+        psn_order: int = 32,
+        psn_exp_init: bool = False,
+        psn_backend: str = "gemm",
+        psn_threshold_init: float = 0.0,
+        tau: float = 2.,
+        v_threshold: float = 1., v_reset: float = 0., detach_reset: bool = True,
+        decay_input: bool = True, step_mode='m', backend='torch', thre=4,
+        surrogate_function: Callable = surrogate.Sigmoid(),
+        astro_lambda: float = 0.2, astro_trace_decay: float = 0.9,
+        astro_gain: float = 0.5, astro_bias_gain: float = 0.0, astro_thre: float = 0.4,
+        astro_pool_kernel: int = 3, astro_pool_mode: str = "avg",
+        astro_event_write: bool = False, astro_event_threshold: float = 0.05,
+        astro_event_slope: float = 10.0, astro_delta_weight: float = 0.5,
+        astro_update_interval: int = 1,
+        store_c_seq: bool = False,
+        su_gate_threshold: float = 0.05,
+        su_gate_slope: float = 8.0,
+        su_gate_learnable: bool = True,
+        su_force_first_update: bool = True,
+        su_gated_astro_spike: bool = True,
+        store_su_gate_seq: bool = False,
+    ):
+        super().__init__(
+            psn_order=psn_order,
+            psn_exp_init=psn_exp_init,
+            psn_backend=psn_backend,
+            psn_threshold_init=psn_threshold_init,
+            tau=tau,
+            v_threshold=v_threshold,
+            v_reset=v_reset,
+            detach_reset=detach_reset,
+            decay_input=decay_input,
+            step_mode=step_mode,
+            backend=backend,
+            thre=thre,
+            surrogate_function=surrogate_function,
+            astro_lambda=astro_lambda,
+            astro_trace_decay=astro_trace_decay,
+            astro_gain=astro_gain,
+            astro_bias_gain=astro_bias_gain,
+            astro_thre=astro_thre,
+            astro_pool_kernel=astro_pool_kernel,
+            astro_pool_mode=astro_pool_mode,
+            astro_event_write=astro_event_write,
+            astro_event_threshold=astro_event_threshold,
+            astro_event_slope=astro_event_slope,
+            astro_delta_weight=astro_delta_weight,
+            astro_update_interval=astro_update_interval,
+            store_c_seq=store_c_seq,
+        )
+        if su_gate_threshold < 0:
+            raise ValueError("su_gate_threshold must be non-negative")
+        if su_gate_slope <= 0:
+            raise ValueError("su_gate_slope must be positive")
+
+        threshold = torch.tensor(float(su_gate_threshold), dtype=torch.float32)
+        if su_gate_learnable:
+            self.su_gate_threshold = nn.Parameter(threshold)
+        else:
+            self.register_buffer("su_gate_threshold", threshold)
+        self.su_gate_slope = float(su_gate_slope)
+        self.su_force_first_update = bool(su_force_first_update)
+        self.su_gated_astro_spike = bool(su_gated_astro_spike)
+        self.store_su_gate_seq = bool(store_su_gate_seq)
+        self.register_memory("su_update_rate", 0.0)
+        self.register_memory("su_gate_seq", None)
+
+    def _init_committed_membrane(self, ref: torch.Tensor):
+        if isinstance(self.v, torch.Tensor) and self.v.shape == ref.shape:
+            return self.v.to(device=ref.device, dtype=ref.dtype), False
+
+        if isinstance(self.v, torch.Tensor):
+            init_value = self.v_reset if self.v_reset is not None else 0.0
+        else:
+            init_value = self.v
+        return torch.full_like(ref, float(init_value)), True
+
+    def _selective_gate(
+        self,
+        proposal: torch.Tensor,
+        prev_mem: torch.Tensor,
+        force_update: bool = False,
+    ):
+        if force_update:
+            return torch.ones_like(proposal)
+
+        threshold = self.su_gate_threshold.abs().to(
+            device=proposal.device, dtype=proposal.dtype
+        )
+        delta = (proposal - prev_mem).abs()
+        soft_gate = torch.sigmoid(self.su_gate_slope * (delta - threshold))
+        hard_gate = (delta > threshold).to(dtype=proposal.dtype)
+        return hard_gate - soft_gate.detach() + soft_gate
+
+    def multi_step_forward(self, x: torch.Tensor):
+        self.c_float_to_tensor(x[0])
+        mem_seq = self.psn_membrane_forward(x)
+        output = torch.zeros_like(x)
+        c_seq = [] if self.store_c_seq else None
+        gate_seq = [] if self.store_su_gate_seq else None
+
+        prev_mem, force_first_update = self._init_committed_membrane(mem_seq[0])
+        last_mem = prev_mem
+
+        S = self.astro_update_interval
+        for start in range(0, x.shape[0], S):
+            end = min(start + S, x.shape[0])
+            proposal_block = self.astro_modulate_membrane(mem_seq[start:end])
+            astro_spike_block = []
+
+            for offset, proposal in enumerate(proposal_block):
+                force_update = (
+                    self.su_force_first_update
+                    and force_first_update
+                    and start == 0
+                    and offset == 0
+                )
+                gate = self._selective_gate(
+                    proposal, prev_mem, force_update=force_update
+                )
+                mem = prev_mem + gate * (proposal - prev_mem)
+                spike = self.qtrick(mem)
+                astro_spike = gate * spike if self.su_gated_astro_spike else spike
+
+                output[start + offset] = spike
+                astro_spike_block.append(astro_spike)
+                if self.store_su_gate_seq:
+                    gate_seq.append(gate.detach())
+
+                prev_mem = mem
+                last_mem = mem
+
+            astro_spike_block = torch.stack(astro_spike_block)
+            self.astro_update_block(astro_spike_block)
+            if self.store_c_seq:
+                c_seq.extend([self.c] * (end - start))
+
+        self.v = last_mem.detach()
+        self.firing_rate = output.float().mean()
+        if self.store_c_seq:
+            self.c_seq = torch.stack(c_seq)
+        if self.store_su_gate_seq:
+            self.su_gate_seq = torch.stack(gate_seq)
+            self.su_update_rate = self.su_gate_seq.float().mean().detach()
+        else:
+            self.su_gate_seq = None
+            self.su_update_rate = 0.0
+        return output
+
 
 class FullPSNIntergerSoma_ssf(neuron.BaseNode):
     """SSF integer soma with the original full PSN temporal matrix.
