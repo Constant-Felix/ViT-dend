@@ -84,6 +84,22 @@ def expand_tensor_cumulative(tensor, max_value=4):
 
     return binary
 
+class IFNode5(nn.Module):
+    def __init__(self, T: int, surrogate_function=surrogate.Sigmoid()):
+        super().__init__()
+        self.surrogate_function = surrogate_function
+        self.fc = nn.Linear(T, T)
+
+        nn.init.kaiming_uniform_(self.fc.weight, a=math.sqrt(5))
+        nn.init.constant_(self.fc.bias, -1)
+
+    def forward(self, x_seq: torch.Tensor):
+        # x_seq.shape = [T, N, *]
+        h_seq = torch.addmm(self.fc.bias.unsqueeze(1), self.fc.weight, x_seq.flatten(1))
+        spike = self.surrogate_function(h_seq)
+        return spike.view(x_seq.shape)
+
+
 class MaskedSlidingPSN(nn.Module):
     def gen_gemm_weight(self, T: int):
         weight = torch.zeros([T, T], device=self.weight.device)
@@ -171,10 +187,11 @@ class DecayPorderMaskedLinear(nn.Linear):
         return F.linear(x, self.weight * self.gen_mask(self.k, self.mask0, self.mask1), self.bias)
     
 class IFNode5PorderMaskD(nn.Module):
-    def __init__(self, T: int, surrogate_function: surrogate.SurrogateFunctionBase, P: int):
+    def __init__(self, T: int, P: int, surrogate_function=surrogate.Sigmoid()):
         super().__init__()
         self.surrogate_function = surrogate_function
         self.fc = DecayPorderMaskedLinear(P, T, T)
+        nn.init.kaiming_uniform_(self.fc.weight, a=math.sqrt(5))
         nn.init.constant_(self.fc.bias, -1)
 
     def forward(self, x_seq: torch.Tensor):
@@ -196,6 +213,7 @@ class AstroSomaMixin(MemoryModule):
         astro_spike_scale: float = 1.0,
         astro_pool_kernel: int = 3,
         astro_pool_mode: str = "avg",
+        astro_channel_pool_when_length1: bool = False,
         astro_event_write: bool = False,
         astro_event_threshold: float = 0.4,
         astro_event_slope: float = 8.0,
@@ -211,10 +229,11 @@ class AstroSomaMixin(MemoryModule):
         self.astro_trace_decay_logit = nn.Parameter(torch.logit(astro_trace_decay))
         self.astro_gain = nn.Parameter(torch.tensor(astro_gain, dtype=torch.float32))
         self.astro_bias_gain = nn.Parameter(torch.tensor(astro_bias_gain, dtype=torch.float32))
-        self.astro_thre = nn.Parameter(torch.tensor(astro_thre, dtype=torch.float32))
+        self.astro_thre = nn.Parameter(torch.tensor(astro_thre, dtype=torch.float32))  ##
         self.astro_spike_scale = float(astro_spike_scale)
         self.astro_pool_kernel = int(astro_pool_kernel)
         self.astro_pool_mode = astro_pool_mode
+        self.astro_channel_pool_when_length1 = bool(astro_channel_pool_when_length1)
         self.astro_event_write = bool(astro_event_write)
         self.astro_event_threshold = nn.Parameter(torch.tensor(astro_event_threshold, dtype=torch.float32))
         self.astro_delta_weight = nn.Parameter(torch.tensor(astro_delta_weight, dtype=torch.float32))
@@ -258,7 +277,7 @@ class AstroSomaMixin(MemoryModule):
 
     def _astro_spike_activity(self, spike: torch.Tensor):
         scale = max(self.astro_spike_scale, 1.0)
-        return torch.clamp(spike / scale, min=0.0, max=1.0)
+        return torch.clamp(spike.abs() / scale, min=0.0, max=1.0)
 
     def _astro_pool_activity(self, activity: torch.Tensor):
         kernel = self.astro_pool_kernel
@@ -274,6 +293,18 @@ class AstroSomaMixin(MemoryModule):
                 padding=padding, count_include_pad=False
             )
         if activity.dim() == 3:
+            if self.astro_channel_pool_when_length1 and activity.shape[-1] == 1:
+                channel_activity = activity.transpose(1, 2)
+                if self.astro_pool_mode == "max":
+                    pooled = F.max_pool1d(
+                        channel_activity, kernel_size=kernel, stride=1, padding=padding
+                    )
+                else:
+                    pooled = F.avg_pool1d(
+                        channel_activity, kernel_size=kernel, stride=1,
+                        padding=padding, count_include_pad=False
+                    )
+                return pooled.transpose(1, 2)
             if self.astro_pool_mode == "max":
                 return F.max_pool1d(activity, kernel_size=kernel, stride=1, padding=padding)
             return F.avg_pool1d(
@@ -312,9 +343,11 @@ class AstroSomaMixin(MemoryModule):
 
         trace_decay = torch.sigmoid(self.astro_trace_decay_logit)
         lam = torch.sigmoid(self.astro_lambda_logit)
-        next_trace = trace_decay.pow(block_steps) * self.astro_trace + pooled_spike
+        next_trace = trace_decay * self.astro_trace + pooled_spike  ##
+        #next_trace = trace_decay * self.astro_trace + (1-trace_decay) * pooled_spike
         write = torch.tanh(torch.relu(next_trace - self.astro_thre.abs()))
-        block_lam = 1.0 - (1.0 - lam).pow(block_steps)
+        #block_lam = 1.0 - (1.0 - lam).pow(block_steps) ##
+        block_lam = lam
 
         if activity_drive is None:
             activity_drive = pooled_spike.abs()
@@ -367,8 +400,9 @@ class AstroSomaMixin(MemoryModule):
             )
         )
         powers = powers.view(block_steps, *([1] * (pooled_seq.dim() - 1)))
-        trace_drive = (powers * pooled_seq).sum(dim=0)
-        activity_drive = pooled_seq.mean(dim=0).abs()
+        #trace_drive = (powers * pooled_seq).sum(dim=0)
+        trace_drive = pooled_seq.mean(dim=0)
+        activity_drive = pooled_seq.mean(dim=0)
         self.astro_update_from_pooled(
             trace_drive,
             activity_drive=activity_drive,
@@ -390,6 +424,7 @@ class AstroSomaMixin(MemoryModule):
             self.c = self.c.detach()
         if isinstance(self.astro_trace, torch.Tensor):
             self.astro_trace = self.astro_trace.detach()
+
 
 class MultiSpike8(nn.Module):
 
@@ -818,7 +853,141 @@ class PSNIntergerSoma_ssf(neuron.BaseNode):
         self.firing_rate = output.float().mean()
         return output
 
+class AstroMaskedSlidingPSN(AstroSomaMixin):
+    """MaskedSlidingPSN with spike-driven astrocyte membrane modulation."""
 
+    def __init__(
+        self,
+        order: int,
+        surrogate_function=surrogate.Sigmoid(),
+        exp_init: bool = False,
+        backend: str = 'gemm',
+        astro_lambda: float = 0.2,
+        astro_trace_decay: float = 0.9,
+        astro_gain: float = 0.5,
+        astro_bias_gain: float = 0.0,
+        astro_thre: float = 0.4,
+        astro_spike_scale: float = 1.0,
+        astro_pool_kernel: int = 3,
+        astro_pool_mode: str = "avg",
+        astro_event_write: bool = False,
+        astro_event_threshold: float = 0.05,
+        astro_event_slope: float = 10.0,
+        astro_delta_weight: float = 0.5,
+        astro_update_interval: int = 1,
+        store_c_seq: bool = False,
+    ):
+        super().__init__()
+        if order <= 0:
+            raise ValueError("order must be positive")
+        if backend not in ("gemm", "conv"):
+            raise ValueError("backend must be 'gemm' or 'conv'")
+        self.order = int(order)
+        self.psn_backend = backend
+        self.surrogate_function = surrogate_function
+
+        if self.psn_backend == 'gemm':
+            if exp_init:
+                weight = torch.ones([self.order])
+                for i in range(self.order - 2, -1, -1):
+                    weight[i] = weight[i + 1] / 2.
+                self.weight = nn.Parameter(weight)
+            else:
+                weight = torch.ones([1, self.order])
+                nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
+                self.weight = nn.Parameter(weight[0])
+            self.threshold = nn.Parameter(torch.as_tensor(-1.)) ##
+        else:
+            weight = torch.zeros([1, 1, self.order])
+            nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
+            self.weight = nn.Parameter(weight)
+            self.threshold = nn.Parameter(torch.as_tensor(1.)) ##
+
+        self._init_astro_state(
+            astro_lambda=astro_lambda,
+            astro_trace_decay=astro_trace_decay,
+            astro_gain=astro_gain,
+            astro_bias_gain=astro_bias_gain,
+            astro_thre=astro_thre,
+            astro_spike_scale=astro_spike_scale,
+            astro_pool_kernel=astro_pool_kernel,
+            astro_pool_mode=astro_pool_mode,
+            astro_event_write=astro_event_write,
+            astro_event_threshold=astro_event_threshold,
+            astro_event_slope=astro_event_slope,
+            astro_delta_weight=astro_delta_weight,
+            astro_update_interval=astro_update_interval,
+            store_c_seq=store_c_seq,
+        )
+
+    def gen_gemm_weight(self, T: int):
+        weight = torch.zeros([T, T], device=self.weight.device)
+        for i in range(T):
+            end = i + 1
+            start = max(0, i + 1 - self.order)
+            length = min(end - start, self.order)
+            weight[i][start:end] = self.weight[self.order - length:self.order]
+        return weight
+
+    def psn_membrane_forward(self, x_seq: torch.Tensor):
+        if self.psn_backend == 'gemm':
+            weight = self.gen_gemm_weight(x_seq.shape[0]).to(
+                device=x_seq.device, dtype=x_seq.dtype
+            )
+            threshold = self.threshold.to(device=x_seq.device, dtype=x_seq.dtype)
+            h_seq = torch.addmm(threshold, weight, x_seq.flatten(1))
+            return h_seq.view(x_seq.shape)
+
+        if self.psn_backend == 'conv':
+            x_shape = x_seq.shape
+            x_flat = x_seq.flatten(1).t().unsqueeze(1)
+            x_flat = F.pad(x_flat, pad=(self.order - 1, 0))
+            kernel = self.weight.to(device=x_seq.device, dtype=x_seq.dtype)
+            mem = F.conv1d(x_flat, kernel, stride=1)
+            mem = mem.squeeze(1).t().view(x_shape)
+            threshold = self.threshold.to(device=x_seq.device, dtype=x_seq.dtype)
+            return mem - threshold
+
+        raise NotImplementedError(self.psn_backend)
+
+    def single_step_forward(self, x: torch.Tensor):
+        return self.forward(x.unsqueeze(0))[0]
+
+    def forward(self, x_seq: torch.Tensor):
+        self.c_float_to_tensor(x_seq[0])
+        mem_seq = self.psn_membrane_forward(x_seq)
+        output = torch.zeros_like(x_seq)
+        c_seq = [] if self.store_c_seq else None
+        last_mem = None
+
+        S = self.astro_update_interval
+        if S <= 1:
+            for i in range(x_seq.shape[0]):
+                mem = self.astro_modulate_membrane(mem_seq[i]-self.threshold)
+                spike = self.surrogate_function(mem+self.threshold)
+                self.astro_update(spike)
+                if self.store_c_seq:
+                    c_seq.append(self.c)
+
+                last_mem = mem
+                output[i] = spike
+        else:
+            for start in range(0, x_seq.shape[0], S):
+                end = min(start + S, x_seq.shape[0])
+                mem = self.astro_modulate_membrane(mem_seq[start:end]-self.threshold)
+                spike = self.surrogate_function(mem+self.threshold)
+                self.astro_update_block(spike)
+                if self.store_c_seq:
+                    c_seq.extend([self.c] * (end - start))
+
+                last_mem = mem[-1]
+                output[start:end] = spike
+
+        self.v = last_mem.detach()
+        self.firing_rate = output.float().mean()
+        if self.store_c_seq:
+            self.c_seq = torch.stack(c_seq)
+        return output
 
 class AstroPSNIntergerSoma_ssf(neuron.BaseNode, AstroSomaMixin):
     """Astro-SSF soma whose pre-SSF membrane is generated by a PSN time kernel.
@@ -841,6 +1010,7 @@ class AstroPSNIntergerSoma_ssf(neuron.BaseNode, AstroSomaMixin):
         astro_lambda: float = 0.2, astro_trace_decay: float = 0.9,
         astro_gain: float = 0.5, astro_bias_gain: float = 0.0, astro_thre: float = 0.4,
         astro_pool_kernel: int = 3, astro_pool_mode: str = "avg",
+        astro_channel_pool_when_length1: bool = False,
         astro_event_write: bool = False, astro_event_threshold: float = 0.05,
         astro_event_slope: float = 10.0, astro_delta_weight: float = 0.5,
         astro_update_interval: int = 1,  ##
@@ -880,6 +1050,7 @@ class AstroPSNIntergerSoma_ssf(neuron.BaseNode, AstroSomaMixin):
             astro_spike_scale=float(thre),
             astro_pool_kernel=astro_pool_kernel,
             astro_pool_mode=astro_pool_mode,
+            astro_channel_pool_when_length1=astro_channel_pool_when_length1,
             astro_event_write=astro_event_write,
             astro_event_threshold=astro_event_threshold,
             astro_event_slope=astro_event_slope,
@@ -977,6 +1148,7 @@ class SelectiveAstroPSNIntergerSoma_ssf(AstroPSNIntergerSoma_ssf):
         astro_lambda: float = 0.2, astro_trace_decay: float = 0.9,
         astro_gain: float = 0.5, astro_bias_gain: float = 0.0, astro_thre: float = 0.4,
         astro_pool_kernel: int = 3, astro_pool_mode: str = "avg",
+        astro_channel_pool_when_length1: bool = False,
         astro_event_write: bool = False, astro_event_threshold: float = 0.05,
         astro_event_slope: float = 10.0, astro_delta_weight: float = 0.5,
         astro_update_interval: int = 1,
@@ -1009,6 +1181,7 @@ class SelectiveAstroPSNIntergerSoma_ssf(AstroPSNIntergerSoma_ssf):
             astro_thre=astro_thre,
             astro_pool_kernel=astro_pool_kernel,
             astro_pool_mode=astro_pool_mode,
+            astro_channel_pool_when_length1=astro_channel_pool_when_length1,
             astro_event_write=astro_event_write,
             astro_event_threshold=astro_event_threshold,
             astro_event_slope=astro_event_slope,

@@ -27,7 +27,11 @@ import torch.backends.cudnn as cudnn
 from pathlib import Path
 from functools import partial
 import sys
-from ssc_dataset import create_spikingjelly_frame_dataloader,create_fixed_time_h5_dataloader
+from ssc_dataset import (
+    create_asrc_style_ssc_dataloader,
+    create_spikingjelly_frame_dataloader,
+    create_fixed_time_h5_dataloader,
+)
 from torch.utils.data.dataloader import default_collate
 from torchvision.transforms import autoaugment, transforms
 from torchvision.transforms.functional import InterpolationMode
@@ -35,6 +39,7 @@ from module import dendrite,dend_compartment,soma,neuron,wiring
 from spikingjelly.activation_based import functional, surrogate, layer
 from spikingjelly.clock_driven.neuron import MultiStepParametricLIFNode, MultiStepLIFNode
 from module.dend_compartment import ChannelPreservingTrunkDistalDendCompartment,SparseChannelPreservingTrunkDistalDendCompartment,CoupledSparseChannelPreservingTrunkDistalDendCompartment
+from  module.soma import DecayPorderMaskedLinear
 
 def setup_train_logging(log_file):
     logger = logging.getLogger()
@@ -62,31 +67,55 @@ def scalar_value(value):
     return float(value)
 
 #device = 'cuda'
-class ff_SHD(nn.Module):
-    def __init__(self, in_dim=700, hidden=[128,128], out_dim=35,drop=0.0,T=250):
+class ff_SSC(nn.Module):
+    def __init__(self, in_dim=700, hidden=[256,256,256], out_dim=35,drop=0.2,T=250):  ##
         super().__init__()
         layers = []
         layers += [layer.Conv1d(in_dim, hidden[0],kernel_size=1),
                    #layer.BatchNorm1d(hidden[0]),
                    nn.Dropout(drop),
-                   SparseChannelPreservingTrunkDistalDendCompartment(channels=hidden[0],num_branches=16,compartments_per_branch=8,branch_degree=4,shared_tau_parallel=False), #,branch_readout_mode="linear"),#,learn_edge_gain=False,learn_comp_gain=False),
+                   SparseChannelPreservingTrunkDistalDendCompartment(channels=hidden[0],num_branches=8,compartments_per_branch=6,branch_degree=1,learn_comp_gain=True,learn_edge_gain=True,merge_norm='mean'), #,branch_readout_mode="linear"),#,learn_edge_gain=False,learn_comp_gain=False),
                    #nn.Identity(),
-                   #soma.MaskedSlidingPSN(order=T,surrogate_function=surrogate.Sigmoid())]
+                   #soma.AstroMaskedSlidingPSN(order=T,exp_init=True,astro_update_interval=1,astro_gain=0.2)]
+                   soma.MaskedSlidingPSN(order=T,surrogate_function=surrogate.Sigmoid(),exp_init=True)]
+                   #soma.IFNode5PorderMaskD(T=T,P=250)]
                    #soma.IntergerSoma_ssf(decay_input=False)]
-                   #soma.PSNIntergerSoma_ssf(psn_order=T)]
-                   #soma.SelectiveAstroPSNIntergerSoma_ssf(psn_order=T,astro_update_interval=25,astro_pool_kernel=5)] 
-                   soma.AstroPSNIntergerSoma_ssf(psn_order=T,astro_update_interval=5,astro_pool_kernel=5)]  #需要试astro_event_write=True
+                   #soma.PSNIntergerSoma_ssf(psn_order=T,psn_exp_init=True)]
+                   #soma.SelectiveAstroPSNIntergerSoma_ssf(psn_order=T,astro_update_interval=25,astro_pool_kernel=5)]
+                   #soma.IFNode5(T=T)]
+                   #soma.AstroPSNIntergerSoma_ssf(psn_order=T,astro_update_interval=5,astro_gain=0.2,astro_lambda=0.05,astro_trace_decay=0.8,astro_pool_kernel=5,astro_thre=0.8)] 
+                   #soma.AstroPSNIntergerSoma_ssf(psn_order=T,astro_update_interval=5,astro_pool_kernel=9,astro_channel_pool_when_length1=True,astro_thre=0.2)]  #需要试astro_event_write=True
         layers += [layer.Conv1d(hidden[0], hidden[1],kernel_size=1),
                    #layer.BatchNorm1d(hidden[1]),
                    nn.Dropout(drop),
-                   SparseChannelPreservingTrunkDistalDendCompartment(channels=hidden[1],num_branches=16,compartments_per_branch=8,branch_degree=4,shared_tau_parallel=False),  #,branch_readout_mode="linear"), #,learn_edge_gain=False,learn_comp_gain=False),
+                   SparseChannelPreservingTrunkDistalDendCompartment(channels=hidden[1],num_branches=8,compartments_per_branch=6,branch_degree=1,learn_comp_gain=True,learn_edge_gain=True,merge_norm='mean'),  #,branch_readout_mode="linear"), #,learn_edge_gain=False,learn_comp_gain=False),
                    #nn.Identity(),
-                   #soma.MaskedSlidingPSN(order=T,surrogate_function=surrogate.Sigmoid())]
+                   #soma.AstroMaskedSlidingPSN(order=T,exp_init=True,astro_update_interval=1,astro_gain=0.2)]
+                   soma.MaskedSlidingPSN(order=T,surrogate_function=surrogate.Sigmoid(),exp_init=True)]
+                   #soma.IFNode5PorderMaskD(T=T,P=250)]
                    #soma.IntergerSoma_ssf(decay_input=False)]
-                   #soma.PSNIntergerSoma_ssf(psn_order=T)]
+                   #soma.PSNIntergerSoma_ssf(psn_order=T,psn_exp_init=True)]
                    #soma.SelectiveAstroPSNIntergerSoma_ssf(psn_order=T,astro_update_interval=25,astro_pool_kernel=5)]
-                   soma.AstroPSNIntergerSoma_ssf(psn_order=T,astro_update_interval=5,astro_pool_kernel=5)]
-        layers += [layer.Conv1d(hidden[1], out_dim,kernel_size=1)]
+                   #soma.IFNode5(T=T)]
+                   #soma.AstroPSNIntergerSoma_ssf(psn_order=T,astro_update_interval=5,astro_gain=0.2,astro_lambda=0.05,astro_trace_decay=0.8,astro_pool_kernel=5,astro_thre=0.8)] 
+                   #soma.AstroPSNIntergerSoma_ssf(psn_order=T,astro_update_interval=5,astro_pool_kernel=9,astro_channel_pool_when_length1=True,astro_thre=0.2)]
+        layers += [layer.Conv1d(hidden[1], hidden[2],kernel_size=1),
+                   #layer.BatchNorm1d(hidden[1]),
+                   nn.Dropout(drop),
+                   SparseChannelPreservingTrunkDistalDendCompartment(channels=hidden[1],num_branches=8,compartments_per_branch=6,branch_degree=1,learn_comp_gain=True,learn_edge_gain=True,merge_norm='mean'),  #,branch_readout_mode="linear"), #,learn_edge_gain=False,learn_comp_gain=False),
+                   #nn.Identity(),
+                   #soma.AstroMaskedSlidingPSN(order=T,exp_init=True,astro_update_interval=1,astro_gain=0.2)]
+                   soma.MaskedSlidingPSN(order=T,surrogate_function=surrogate.Sigmoid(),exp_init=True)]
+                   #soma.IFNode5PorderMaskD(T=T,P=250)]
+                   #soma.IntergerSoma_ssf(decay_input=False)]
+                   #soma.PSNIntergerSoma_ssf(psn_order=T,psn_exp_init=True)]
+                   #soma.SelectiveAstroPSNIntergerSoma_ssf(psn_order=T,astro_update_interval=25,astro_pool_kernel=5)]
+                   #soma.IFNode5(T=T)]
+                   #soma.AstroPSNIntergerSoma_ssf(psn_order=T,astro_update_interval=5,astro_gain=0.2,astro_lambda=0.05,astro_trace_decay=0.8,astro_pool_kernel=5,astro_thre=0.8)] 
+                   #soma.AstroPSNIntergerSoma_ssf(psn_order=T,astro_update_interval=5,astro_pool_kernel=9,astro_channel_pool_when_length1=True,astro_thre=0.2)]
+        layers += [layer.Conv1d(hidden[2], out_dim,kernel_size=1)]
+                   #nn.Dropout(drop),  ##
+                   #soma.IFNode5(T=T)] ##
         self.features = nn.Sequential(*layers)
 
         functional.set_step_mode(self, 'm')
@@ -97,6 +126,115 @@ class ff_SHD(nn.Module):
         assert x.dim() == 4, "dimension of x is not correct!"
 
         x = self.features(x).squeeze(-1)
+        return x.mean(0)
+    
+class ff_SHD(nn.Module):
+    def __init__(self, in_dim=700, hidden=256, out_dim=20, drop=0.2,T=250):  ##
+        super().__init__()
+        layers = []
+        layers += [layer.Conv1d(in_dim, hidden,kernel_size=1),
+                   #layer.BatchNorm1d(hidden[0]),
+                   nn.Dropout(drop),
+                   SparseChannelPreservingTrunkDistalDendCompartment(channels=hidden,num_branches=10,compartments_per_branch=6,branch_degree=1,learn_comp_gain=True,learn_edge_gain=True,merge_norm='mean'), #,branch_readout_mode="linear"),#,learn_edge_gain=False,learn_comp_gain=False),
+                   #nn.Identity(),
+                   #soma.AstroMaskedSlidingPSN(order=T,exp_init=True,astro_update_interval=25)]
+                   soma.MaskedSlidingPSN(order=T,surrogate_function=surrogate.Sigmoid(),exp_init=True)]
+                   #soma.IFNode5PorderMaskD(T=T,P=250)]
+                   #soma.IntergerSoma_ssf(decay_input=False)]
+                   #soma.PSNIntergerSoma_ssf(psn_order=T)]
+                   #soma.SelectiveAstroPSNIntergerSoma_ssf(psn_order=T,astro_update_interval=25,astro_pool_kernel=5)]
+                   #soma.IFNode5(T=T)]
+                   #soma.AstroPSNIntergerSoma_ssf(psn_order=T,astro_update_interval=5,astro_gain=0.2,astro_lambda=0.05,astro_trace_decay=0.8,astro_pool_kernel=5,astro_thre=0.8)] 
+                   #soma.AstroPSNIntergerSoma_ssf(psn_order=T,astro_update_interval=5,astro_pool_kernel=9,astro_channel_pool_when_length1=True,astro_thre=0.2)]  #需要试astro_event_write=True
+        layers += [layer.Conv1d(hidden, out_dim,kernel_size=1)]
+                   #nn.Dropout(drop),  ##
+                   #soma.IFNode5(T=T)] ##
+        self.features = nn.Sequential(*layers)
+
+        functional.set_step_mode(self, 'm')
+
+    def forward(self, x): # x [N, T, F]
+        x = x.transpose(0, 1)
+        x = x.unsqueeze(-1)
+        assert x.dim() == 4, "dimension of x is not correct!"
+
+        x = self.features(x).squeeze(-1)
+        return x.mean(0)    
+
+class DendSomaResidualBlock(nn.Module):
+    def __init__(self, channels, drop=0.0, T=250):
+        super().__init__()
+        self.dend1 = SparseChannelPreservingTrunkDistalDendCompartment(
+            channels=channels,
+            num_branches=8,
+            compartments_per_branch=4,
+            branch_degree=1,
+            merge_norm='mean'
+        )
+        self.dend2 = SparseChannelPreservingTrunkDistalDendCompartment(
+            channels=channels,
+            num_branches=8,
+            compartments_per_branch=4,
+            branch_degree=1,
+            merge_norm='mean'
+        )
+        self.conv1 = layer.Conv1d(channels, channels, kernel_size=1)
+        #self.bn1 = layer.BatchNorm1d(channels)
+        self.drop = nn.Dropout(drop)
+
+        self.soma1 = soma.PSNIntergerSoma_ssf(
+            psn_order=T,
+            psn_exp_init=True
+        )
+        self.soma2 = soma.PSNIntergerSoma_ssf(
+            psn_order=T,
+            psn_exp_init=True
+        )
+        self.conv2 = layer.Conv1d(channels, channels, kernel_size=1)
+        #self.bn2 = layer.BatchNorm1d(channels)
+
+    def forward(self, x):
+        identity = x
+
+        out = self.conv1(x)
+        out = self.dend1(out)
+        out = self.soma1(out)
+        out = out + identity
+        identity = out
+
+        out = self.conv2(out)
+        out = self.dend2(out)
+        out = self.soma2(out)
+        #out = self.bn1(out)
+        #out = self.drop(out)
+        out = out + identity
+        #out = self.bn2(out)
+
+        return out
+
+class ff_SHD_res(nn.Module):
+    def __init__(self, in_dim=700, hidden=128, out_dim=20, drop=0.0, T=250, depth=1):
+        super().__init__()
+
+        self.stem = layer.Conv1d(in_dim, hidden, kernel_size=1)
+
+        self.blocks = nn.Sequential(*[
+            DendSomaResidualBlock(hidden, drop=drop, T=T)
+            for _ in range(depth)
+        ])
+
+        self.head = layer.Conv1d(hidden, out_dim, kernel_size=1)
+
+        functional.set_step_mode(self, 'm')
+
+    def forward(self, x):  # [N, T, F]
+        x = x.transpose(0, 1)  # [T, N, F]
+        x = x.unsqueeze(-1)    # [T, N, F, 1]
+
+        x = self.stem(x)
+        x = self.blocks(x)
+        x = self.head(x).squeeze(-1)
+
         return x.mean(0)
 
 def train(train_loader, model, criterion, optimizer, epoch, args, gpu):
@@ -211,7 +349,8 @@ def accuracy(output, target, topk=(1,)):
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 
-# python train_ssc.py --task SSC --device cuda:3     --lr 0.0005 --epochs 100 --schedule 40 80 --batch-size 64        --epochs 400 --workers 16 --cos   --optim sgd    --lr 0.1
+# python train_ssc.py --task SSC --device cuda:7 --lr 0.005 --wd 5e-4 --cos --ssc-preprocess asrc --ssc-n-bins 5      --batch-size 128  --epochs 100 --schedule 40 80 --batch-size 64        --epochs 400 --workers 16 --cos   --optim sgd    --lr 0.1
+# python train_ssc.py --task SHD --device cuda:1 --lr 0.005 --data-root /data/hyx/ViT-dend/data/shd/data_shd --wd 5e-4 --cos
 
 parser = argparse.ArgumentParser(description='Sequential SHD/SSC')
 parser.add_argument('--task', default='SSC', type=str, help='SHD, SSC')
@@ -231,6 +370,10 @@ parser.add_argument("--workers", type=int, default=8)
 parser.add_argument('--cos', action='store_true', default=False, help='use cosine lr schedule')
 parser.add_argument('--data-root', default='/data/hyx/ViT-dend/data/ssc', type=str,
                     help='path to extract/ or frames_number_250_split_by_number/')
+parser.add_argument('--ssc-preprocess', default='current', choices=['current', 'asrc'],
+                    help='SSC preprocessing pipeline: current fixed-time bins or ASRC-SNN style')
+parser.add_argument('--ssc-n-bins', default=5, type=int,
+                    help='channel bin size for ASRC-SNN style SSC preprocessing')
 parser.add_argument('--device', default=None, type=str, help="device, e.g. 'cuda', 'cuda:5', or 'cpu'")
 parser.add_argument('--no-pin-memory', action='store_true', default=False, help='disable DataLoader pinned memory')
 
@@ -255,33 +398,68 @@ torch.backends.cudnn.benchmark = True
 
 if args.task.upper() == 'SSC' or args.task.upper() == 'SHD':
     T = 250
-    in_dim = 700
+    out_dim = 35 if args.task.upper() == 'SSC' else 20
     pin_memory = (not args.no_pin_memory) and gpu.type == 'cuda'
-    train_loader = create_fixed_time_h5_dataloader(
-    split="train",
-    batch_size=args.batch_size,
-    root_path=args.data_root,
-    nb_steps=250,
-    nb_units=700,
-    shuffle=True,
-    num_workers=args.workers,
-    pin_memory=pin_memory,
-)
+    if args.ssc_preprocess == 'asrc':
+        if args.task.upper() != 'SSC':
+            raise ValueError("--ssc-preprocess asrc is only intended for SSC")
+        if 700 % args.ssc_n_bins != 0:
+            raise ValueError("700 must be divisible by --ssc-n-bins")
+        in_dim = 700 // args.ssc_n_bins
+        train_loader = create_asrc_style_ssc_dataloader(
+            split="train",
+            batch_size=args.batch_size,
+            root_path=args.data_root,
+            nb_steps=250,
+            nb_units=700,
+            n_bins=args.ssc_n_bins,
+            shuffle=True,
+            num_workers=args.workers,
+            pin_memory=pin_memory,
+        )
 
-    test_loader = create_fixed_time_h5_dataloader(
-    split="test",
-    batch_size=args.batch_size,
-    root_path=args.data_root,
-    nb_steps=250,
-    nb_units=700,
-    shuffle=False,
-    num_workers=args.workers,
-    pin_memory=pin_memory,
-)
+        test_loader = create_asrc_style_ssc_dataloader(
+            split="test",
+            batch_size=args.batch_size,
+            root_path=args.data_root,
+            nb_steps=250,
+            nb_units=700,
+            n_bins=args.ssc_n_bins,
+            shuffle=False,
+            num_workers=args.workers,
+            pin_memory=pin_memory,
+        )
+    else:
+        in_dim = 700
+        train_loader = create_fixed_time_h5_dataloader(
+            split="train",
+            batch_size=args.batch_size,
+            root_path=args.data_root,
+            nb_steps=250,
+            nb_units=700,
+            shuffle=True,
+            num_workers=args.workers,
+            pin_memory=pin_memory,
+        )
+
+        test_loader = create_fixed_time_h5_dataloader(
+            split="test",
+            batch_size=args.batch_size,
+            root_path=args.data_root,
+            nb_steps=250,
+            nb_units=700,
+            shuffle=False,
+            num_workers=args.workers,
+            pin_memory=pin_memory,
+        )
 else:
     raise NotImplementedError
 
-model = ff_SHD(in_dim=in_dim, out_dim=35,T=T).to(gpu)
+if args.task.upper() == 'SHD':
+    #model = ff_SHD(in_dim=in_dim, out_dim=out_dim,T=T).to(gpu)
+    model = ff_SHD_res(in_dim=in_dim,out_dim=out_dim,T=T).to(gpu)    
+else:
+    model = ff_SSC(in_dim=in_dim,out_dim=out_dim,T=T).to(gpu)    
 n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print(f"number of params: {n_parameters}")
 
@@ -309,6 +487,10 @@ if args.print_freq > len(train_loader):
 
 best_acc = argparse.Namespace(top1=0, top5=0)
 for epoch in range(start_epoch, args.epochs):
+    for m in model.modules():
+        if isinstance(m, DecayPorderMaskedLinear):
+            mk = epoch / (args.epochs - 1)
+            m.k = min(mk * 8, 1.)
     epoch_start_time = time.time()
     adjust_learning_rate(optimizer, epoch, args)
 

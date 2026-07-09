@@ -30,7 +30,7 @@ class SpikingJellyFrameDataset(Dataset):
         self.dtype = np.dtype(dtype)
 
         if frames_dir_name is None:
-            frames_dir_name = "frames_number_250_split_by_number"
+            frames_dir_name = "frames_fixed_1s_binary_250"
 
         self.frames_root = self._resolve_frames_root(frames_dir_name)
         self.split_root = self.frames_root / self.split
@@ -304,3 +304,137 @@ def create_fixed_time_h5_dataloader(
         kwargs["persistent_workers"] = persistent_workers
         kwargs["prefetch_factor"] = 2
     return DataLoader(dataset_obj, **kwargs)
+
+
+def asrc_style_events_to_frames(
+    times,
+    units,
+    nb_steps=250,
+    nb_units=700,
+    max_time=1.4,
+    n_bins=5,
+    dtype=np.float32,
+    time_bins=None,
+):
+    """Replicate the ASRC-SNN SSC event-to-frame preprocessing.
+
+    The ASRC-SNN code first maps event times with ``np.digitize`` over
+    ``np.linspace(0, max_time, nb_steps)``, writes binary spikes into 700 input
+    channels, then sums every ``n_bins`` adjacent channels.
+    """
+    nb_steps = int(nb_steps)
+    nb_units = int(nb_units)
+    n_bins = int(n_bins)
+    if nb_steps <= 0:
+        raise ValueError("nb_steps must be positive")
+    if nb_units <= 0:
+        raise ValueError("nb_units must be positive")
+    if n_bins <= 0:
+        raise ValueError("n_bins must be positive")
+    if nb_units % n_bins != 0:
+        raise ValueError("nb_units must be divisible by n_bins")
+
+    dtype = np.dtype(dtype)
+    dense = np.zeros((nb_steps, nb_units), dtype=dtype)
+    if len(times) > 0:
+        if time_bins is None:
+            time_bins = np.linspace(0, max_time, num=nb_steps)
+        time_index = np.digitize(times, time_bins)
+        units = np.asarray(units, dtype=np.int64)
+        valid = (
+            (time_index >= 0)
+            & (time_index < nb_steps)
+            & (units >= 0)
+            & (units < nb_units)
+        )
+        if np.any(valid):
+            dense[time_index[valid], units[valid]] = 1.0
+
+    if n_bins > 1:
+        binned_len = nb_units // n_bins
+        dense = dense.reshape(nb_steps, binned_len, n_bins).sum(axis=-1)
+        dense = dense.astype(dtype, copy=False)
+    return dense
+
+
+class ASRCStyleSSCH5Dataset(FixedTimeBinH5Dataset):
+    """Load SSC H5 files with the preprocessing used by the ASRC-SNN code."""
+
+    def __init__(
+        self,
+        root_path=DEFAULT_H5_ROOT,
+        split="train",
+        dataset="SSC",
+        nb_steps=250,
+        nb_units=700,
+        max_time=1.4,
+        n_bins=5,
+        dtype=np.float32,
+    ):
+        self.n_bins = int(n_bins)
+        if self.n_bins <= 0:
+            raise ValueError("n_bins must be positive")
+        if int(nb_units) % self.n_bins != 0:
+            raise ValueError("nb_units must be divisible by n_bins")
+        self.time_bins = np.linspace(0, float(max_time), num=int(nb_steps))
+        super().__init__(
+            root_path=root_path,
+            split=split,
+            dataset=dataset,
+            nb_steps=nb_steps,
+            nb_units=nb_units,
+            max_time=max_time,
+            dtype=dtype,
+            binary=True,
+        )
+        self.input_dim = self.nb_units // self.n_bins
+
+    def _events_to_frames(self, times, units):
+        return asrc_style_events_to_frames(
+            times,
+            units,
+            nb_steps=self.nb_steps,
+            nb_units=self.nb_units,
+            max_time=self.max_time,
+            n_bins=self.n_bins,
+            dtype=self.dtype,
+            time_bins=self.time_bins,
+        )
+    
+def create_asrc_style_ssc_dataloader(
+    split,
+    batch_size,
+    root_path=DEFAULT_H5_ROOT,
+    dataset="SSC",
+    nb_steps=250,
+    nb_units=700,
+    max_time=1.4,
+    n_bins=5,
+    shuffle=True,
+    num_workers=0,
+    pin_memory=True,
+    drop_last=False,
+    persistent_workers=True,
+    dtype=np.float32,
+):
+    dataset_obj = ASRCStyleSSCH5Dataset(
+        root_path=root_path,
+        split=split,
+        dataset=dataset,
+        nb_steps=nb_steps,
+        nb_units=nb_units,
+        max_time=max_time,
+        n_bins=n_bins,
+        dtype=dtype,
+    )
+    kwargs = dict(
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=drop_last,
+    )
+    if num_workers > 0:
+        kwargs["persistent_workers"] = persistent_workers
+        kwargs["prefetch_factor"] = 2
+    return DataLoader(dataset_obj, **kwargs)    
