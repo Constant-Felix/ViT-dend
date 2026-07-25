@@ -8,10 +8,11 @@ The relationship (wiring) among a set of compartments is not considered here.
 """
 
 import abc
-from typing import Callable
+from typing import Callable, Optional
 import torch.nn.functional as F
 import torch
 import torch.nn as nn
+import math
 from spikingjelly.activation_based import base
 
 
@@ -2224,6 +2225,13 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
     size of the branch parameter library and ``d`` is ``branch_degree``.  Scaling
     ``num_branches`` therefore adds candidate branch dynamics without forcing
     every channel to materialize every branch.
+
+    Set ``free_window_order`` to a positive integer ``P`` to replace the
+    exponential compartment integration with the causal GEMM sliding window
+    used by ``MaskedSlidingPSN``.  Each branch owns one learnable vector of
+    length ``P`` and all compartments routed to that branch share it.  This
+    mode is stateless across forward calls and requires multi-step parallel
+    execution, matching the original SPSN computation.
     """
 
     def __init__(
@@ -2257,6 +2265,7 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
         parallel_forward: bool = True,
         shared_tau_parallel: bool = True,
         branch_readout_mode: str = "trunk_distal",
+        free_window_order: Optional[int] = None,
     ):
         super().__init__(v_rest, step_mode, store_v_seq)
         if channels is None:
@@ -2279,6 +2288,19 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
             raise ValueError("branch_readout_mode must be 'trunk_distal' or 'linear'")
         if tau_min <= 1.0 or tau_max <= 1.0:
             raise ValueError("tau_min and tau_max should be larger than 1")
+        if free_window_order is not None:
+            if isinstance(free_window_order, bool) or not isinstance(free_window_order, int):
+                raise TypeError("free_window_order must be None or a positive integer")
+            if free_window_order <= 0:
+                raise ValueError("free_window_order must be positive when enabled")
+            if no_filter:
+                raise ValueError("free_window_order and no_filter cannot be enabled together")
+            if step_mode != "m":
+                raise ValueError("free_window_order requires step_mode='m'")
+            if not parallel_forward:
+                raise ValueError("free_window_order requires parallel_forward=True")
+            if detach_state_during_forward:
+                raise ValueError("free_window_order requires detach_state_during_forward=False")
 
         self.channels = int(channels)
         self.c_sub = self.channels
@@ -2297,6 +2319,7 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
         self.detach_state_during_forward = bool(detach_state_during_forward)
         self.parallel_forward = bool(parallel_forward)
         self.shared_tau_parallel = bool(shared_tau_parallel)
+        self.free_window_order = free_window_order
         self.branch_readout_mode = branch_readout_mode
         self.store_branch_monitor = bool(store_branch_monitor)
 
@@ -2321,7 +2344,16 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
             tau_max=tau_max,
             compartment_tau_scale=compartment_tau_scale,
         )
-        self.tau_compartments = nn.Parameter(tau_data.clone().detach().float())
+        self.tau_compartments = nn.Parameter(
+            tau_data.clone().detach().float(),
+            requires_grad=self.free_window_order is None,
+        )
+        if self.free_window_order is None:
+            self.register_parameter("free_window_weight", None)
+        else:
+            free_window_weight = torch.ones(self.num_branches, self.free_window_order)
+            nn.init.kaiming_uniform_(free_window_weight, a=math.sqrt(5))  # sqrt(5) default for uniform init for window
+            self.free_window_weight = nn.Parameter(free_window_weight)
 
         if self.learn_edge_gain:
             self.edge_channel_gain = nn.Parameter(torch.zeros(self.num_branches, self.channels))
@@ -2487,6 +2519,11 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
         return self.v
 
     def _integrate(self, branch_input: torch.Tensor, v_prev: torch.Tensor):
+        if self.free_window_order is not None:
+            raise RuntimeError(
+                "free_window_order uses the original SPSN whole-sequence GEMM and "
+                "is unavailable in single-step or sequential execution"
+            )
         if self.no_filter:
             return branch_input
 
@@ -2523,6 +2560,79 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
         tau_vec_init = decay[:, None] ** (t + 1.0)
         tau_vec_rest = 1.0 - tau_vec_init
         return tau_matrix, tau_vec_init, tau_vec_rest, tau
+
+    def _gen_free_window_gemm_weight(self, T: int, dtype, device):
+        """Build the original SPSN causal sliding matrix for every branch."""
+        gemm_weight = torch.zeros(
+            self.num_branches,
+            T,
+            T,
+            dtype=dtype,
+            device=device,
+        )
+        free_window_weight = self.free_window_weight.to(dtype=dtype, device=device)
+        for i in range(T):
+            end = i + 1
+            start = max(0, i + 1 - self.free_window_order)
+            length = min(end - start, self.free_window_order)
+            gemm_weight[:, i, start:end] = free_window_weight[
+                :, self.free_window_order - length:self.free_window_order
+            ]
+        return gemm_weight
+
+    def _parallel_integrate_free_window(self, branch_input_seq: torch.Tensor):
+        """Apply one branch-shared SPSN window to all its compartments."""
+        T, N = branch_input_seq.shape[:2]
+        spatial_shape = branch_input_seq.shape[5:]
+        flat_size = self.branch_degree * self.channels * self.compartments_per_branch
+
+        permute_to_edge_first = (2, 3, 4, 0, 1) + tuple(range(5, branch_input_seq.dim()))
+        branch_input_flat = branch_input_seq.permute(permute_to_edge_first).reshape(flat_size, T, -1)
+        gemm_weight = self._gen_free_window_gemm_weight(
+            T,
+            branch_input_seq.dtype,
+            branch_input_seq.device,
+        )
+
+        state_flat = torch.empty_like(branch_input_flat)
+        edge_branch = self._edge_index(branch_input_seq.device).reshape(-1)
+        edge_ids = torch.arange(
+            self.branch_degree * self.channels,
+            device=branch_input_seq.device,
+            dtype=torch.long,
+        )
+        comp_ids = torch.arange(
+            self.compartments_per_branch,
+            device=branch_input_seq.device,
+            dtype=torch.long,
+        )
+
+        for branch_idx in range(self.num_branches):
+            branch_edge_ids = edge_ids[edge_branch == branch_idx]
+            if branch_edge_ids.numel() == 0:
+                continue
+
+            flat_ids = (
+                branch_edge_ids[:, None] * self.compartments_per_branch
+                + comp_ids[None, :]
+            ).reshape(-1)
+            drive = branch_input_flat[flat_ids]
+            drive_2d = drive.permute(1, 0, 2).reshape(T, -1)
+            state_2d = gemm_weight[branch_idx].matmul(drive_2d)
+            state = state_2d.reshape(T, flat_ids.numel(), -1).permute(1, 0, 2)
+            state_flat[flat_ids] = state.to(dtype=state_flat.dtype)
+
+        edge_first_shape = (
+            self.branch_degree,
+            self.channels,
+            self.compartments_per_branch,
+            T,
+            N,
+            *spatial_shape,
+        )
+        state_edge_first = state_flat.reshape(edge_first_shape)
+        permute_to_time_first = (3, 4, 0, 1, 2) + tuple(range(5, len(edge_first_shape)))
+        return state_edge_first.permute(permute_to_time_first).contiguous()
 
     def _parallel_integrate(self, branch_input_seq: torch.Tensor, v_init: torch.Tensor):
         if self.no_filter:
@@ -2859,15 +2969,25 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
             raise ValueError("Expected multi-step input shape [T, N, C, ...]")
         if x_seq.shape[2] != self.channels:
             raise ValueError(f"Expected {self.channels} input channels, but got {x_seq.shape[2]}")
+        if self.free_window_order is not None and (
+            (not self.parallel_forward) or self.detach_state_during_forward
+        ):
+            raise RuntimeError(
+                "free_window_order requires parallel_forward=True and "
+                "detach_state_during_forward=False"
+            )
         if (not self.parallel_forward) or self.detach_state_during_forward:
             return self._sequential_multi_step_forward(x_seq)
 
         branch_input_seq = self._build_branch_input_sequence(x_seq)
-        v_init = self._init_state(branch_input_seq[0])
-        if self.shared_tau_parallel:
-            state_seq = self._parallel_integrate_shared_tau(branch_input_seq, v_init)
+        if self.free_window_order is not None:
+            state_seq = self._parallel_integrate_free_window(branch_input_seq)
         else:
-            state_seq = self._parallel_integrate(branch_input_seq, v_init)
+            v_init = self._init_state(branch_input_seq[0])
+            if self.shared_tau_parallel:
+                state_seq = self._parallel_integrate_shared_tau(branch_input_seq, v_init)
+            else:
+                state_seq = self._parallel_integrate(branch_input_seq, v_init)
         edge_output_seq = self._compute_branch_output_sequence(state_seq, branch_input_seq)
         y_seq = self._merge_edges_sequence(edge_output_seq, x_seq)
 

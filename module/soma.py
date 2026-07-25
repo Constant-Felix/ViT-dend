@@ -1774,6 +1774,182 @@ class LIFSoma(BaseSoma):
             return spike_seq
 
 
+class Triangle(torch.autograd.Function):
+    """Triangle surrogate copied from ASRC-SNN."""
+
+    @staticmethod
+    def forward(ctx, input, gamma=1.0):
+        out = input.ge(0.0).float()
+        gamma_tensor = input.new_tensor([gamma])
+        ctx.save_for_backward(input, out, gamma_tensor)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, _, gamma_tensor = ctx.saved_tensors
+        gamma = gamma_tensor[0].item()
+        triangle = (gamma - input.abs()).clamp(min=0.0) / (gamma * gamma)
+        return grad_output * triangle, None
+
+
+class LIFNODE(MemoryModule):
+    """LIFNODE from ASRC-SNN, using this project's MemoryModule."""
+
+    def __init__(
+        self,
+        decay_para=0.5,
+        v_threshold=1.0,
+        surrogate_function=Triangle.apply,
+        hard_reset=False,
+        detach_reset=False,
+        step_mode="s",
+        channel=None,
+    ):
+        super().__init__()
+        del channel
+        if not 0.0 <= float(decay_para) < 1.0:
+            raise ValueError("decay_para must be in [0, 1)")
+        if step_mode not in {"s", "m"}:
+            raise ValueError("step_mode must be 's' or 'm'")
+
+        self.register_memory("v", 0.0)
+        self.register_buffer(
+            "decay_para", torch.tensor(float(decay_para), dtype=torch.float32)
+        )
+        self.v_threshold = float(v_threshold)
+        self.surrogate_function = surrogate_function
+        self.hard_reset = bool(hard_reset)
+        self.detach_reset = bool(detach_reset)
+        self.step_mode = step_mode
+
+    def single_step_forward(self, x: torch.Tensor):
+        if isinstance(self.v, float):
+            self.v = torch.full_like(x, self.v)
+
+        self.v = self.v * self.decay_para + x
+        spike = self.surrogate_function(self.v - self.v_threshold)
+        spike_for_reset = spike.detach() if self.detach_reset else spike
+        if self.hard_reset:
+            self.v = self.v * (1.0 - spike_for_reset)
+        else:
+            self.v = self.v - spike_for_reset * self.v_threshold
+        return spike
+
+    def multi_step_forward(self, x_seq: torch.Tensor):
+        if x_seq.dim() != 3:
+            raise ValueError("LIFNODE expects [T, N, C] in multi-step mode")
+        return torch.stack(
+            [self.single_step_forward(x_seq[t]) for t in range(x_seq.shape[0])]
+        )
+
+    def forward(self, x: torch.Tensor):
+        if self.step_mode == "s":
+            return self.single_step_forward(x)
+        return self.multi_step_forward(x)
+
+
+class skip_RecurrentContainer(MemoryModule):
+    """SRC container; multi-step input is adapted to project shape [T, N, C]."""
+
+    def __init__(self, sub_module: nn.Module, step_mode="s", hid_dim=64, skip=21):
+        super().__init__()
+        if getattr(sub_module, "step_mode", "s") != "s":
+            raise ValueError("sub_module must use single-step mode")
+        if int(skip) <= 0:
+            raise ValueError("skip must be positive")
+
+        self.step_mode = step_mode
+        self.sub_module = sub_module
+        self.skip = int(skip)
+        self.mlp = nn.Linear(int(hid_dim), int(hid_dim), bias=False)
+        self.register_memory("y", None)
+        nn.init.orthogonal_(self.mlp.weight, gain=1.0)
+
+    def single_step_forward(self, x: torch.Tensor):
+        if self.y is None:
+            self.y = x.new_zeros(self.skip, x.shape[0], x.shape[1])
+
+        spike = self.sub_module(self.mlp(self.y[-1]) + x)
+        self.y = torch.roll(self.y, 1, 0)
+        self.y[0] = spike
+        return spike
+
+    def multi_step_forward(self, x_seq: torch.Tensor):
+        if x_seq.dim() != 3:
+            raise ValueError("SRC expects [T, N, C]")
+        return torch.stack(
+            [self.single_step_forward(x_seq[t]) for t in range(x_seq.shape[0])]
+        )
+
+    def forward(self, x: torch.Tensor):
+        if self.step_mode == "s":
+            return self.single_step_forward(x)
+        return self.multi_step_forward(x)
+
+
+class adskip_RecurrentContainer(MemoryModule):
+    """ASRC container; multi-step input is adapted to project shape [T, N, C]."""
+
+    def __init__(
+        self,
+        sub_module: nn.Module,
+        step_mode="s",
+        hid_dim=64,
+        skip=21,
+        skip_para=None,
+        de_tau=0.96,
+    ):
+        super().__init__()
+        if getattr(sub_module, "step_mode", "s") != "s":
+            raise ValueError("sub_module must use single-step mode")
+        if int(skip) <= 0:
+            raise ValueError("skip must be positive")
+
+        self.step_mode = step_mode
+        self.sub_module = sub_module
+        self.skip = int(skip)
+        self.tau = nn.Parameter(torch.ones(1), requires_grad=False)
+        self.de_tau = float(de_tau)
+        if skip_para is None:
+            self.skip_para = nn.Parameter(torch.zeros(self.skip, 1, 1))
+        else:
+            self.skip_para = skip_para
+        self.mlp = nn.Linear(int(hid_dim), int(hid_dim), bias=False)
+        self.register_memory("y", None)
+        nn.init.orthogonal_(self.mlp.weight, gain=1.0)
+
+    def single_step_forward(self, x: torch.Tensor):
+        if self.y is None:
+            self.y = x.new_zeros(self.skip, x.shape[0], x.shape[1])
+
+        if self.training:
+            weights = F.softmax(self.skip_para / self.tau, dim=0)
+            recurrent_spike = (weights * self.y).sum(0)
+        else:
+            recurrent_spike = self.y[torch.argmax(self.skip_para)]
+
+        spike = self.sub_module(self.mlp(recurrent_spike) + x)
+        self.y = torch.roll(self.y, 1, 0)
+        self.y[0] = spike
+        return spike
+
+    def multi_step_forward(self, x_seq: torch.Tensor):
+        if x_seq.dim() != 3:
+            raise ValueError("ASRC expects [T, N, C]")
+        return torch.stack(
+            [self.single_step_forward(x_seq[t]) for t in range(x_seq.shape[0])]
+        )
+
+    def forward(self, x: torch.Tensor):
+        if self.step_mode == "s":
+            return self.single_step_forward(x)
+        return self.multi_step_forward(x)
+
+    @torch.no_grad()
+    def decrease_tau(self):
+        self.tau.mul_(self.de_tau)
+
+
 class AstroLIFSoma(LIFSoma , AstroSomaMixin):  ##
     """LIF soma with spike-driven astrocyte state.
 
