@@ -1,8 +1,9 @@
-"""Train S4/MMDEND-style S4 models on local LRA pickle-zip datasets.
+"""Train S4/MMDEND-style models on official-S4 Long Range Arena data.
 
-This script mirrors the standalone training style of ``/Users/yuxuan/s4/example.py``
-while using the local ``lra_dataset.py`` loader and ``model/s4_lra.py`` model
-builder. By default it trains the activation-replaced DEND+SOMA S4 model.
+Dataset preprocessing and undisclosed training details follow the local S4
+repository. Learning rate, weight decay, batch size, and epoch count follow
+MMDEND Appendix C, Table 7. By default the S4 activation is replaced by the
+project's DEND+SOMA module.
 """
 
 from __future__ import annotations
@@ -11,7 +12,6 @@ import argparse
 import importlib.util
 import json
 import math
-import os
 import random
 import sys
 import time
@@ -19,25 +19,49 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.cuda import amp
 from tqdm.auto import tqdm
 
-from lra_dataset import get_lra_dataloaders, get_lra_task_spec
+from lra_dataset import canonicalize_lra_task, get_s4_lra_data
 
 
-SCHEDULER_PRESETS: Dict[str, Dict[str, int]] = {
+# MMDEND Appendix C, Table 7. These four values are intentionally not taken
+# from another benchmark implementation.
+MMDEND_TRAINING_PRESETS: Dict[str, Dict[str, float | int]] = {
+    "aan": {"lr": 0.01, "weight_decay": 0.05, "batch_size": 64, "epochs": 20},
+    "cifar": {"lr": 0.01, "weight_decay": 0.05, "batch_size": 50, "epochs": 200},
+    "imdb": {"lr": 0.01, "weight_decay": 0.05, "batch_size": 16, "epochs": 32},
+    "pathfinder": {
+        "lr": 0.004,
+        "weight_decay": 0.05,
+        "batch_size": 64,
+        "epochs": 200,
+    },
+    "listops": {"lr": 0.01, "weight_decay": 0.05, "batch_size": 32, "epochs": 40},
+    "pathx": {"lr": 0.001, "weight_decay": 0.05, "batch_size": 16, "epochs": 50},
+}
+
+# state-spaces/s4 configs/experiment/lra/s4-*.yaml at the local S4 revision.
+S4_SCHEDULER_PRESETS: Dict[str, Dict[str, int]] = {
     "aan": {"num_training_steps": 50000, "num_warmup_steps": 5000},
-    "retrieval": {"num_training_steps": 50000, "num_warmup_steps": 5000},
-    "cifar": {"num_training_steps": 180000, "num_warmup_steps": 900},
-    "image": {"num_training_steps": 180000, "num_warmup_steps": 900},
+    "cifar": {"num_training_steps": 180000, "num_warmup_steps": 18000},
     "imdb": {"num_training_steps": 50000, "num_warmup_steps": 5000},
-    "text": {"num_training_steps": 50000, "num_warmup_steps": 5000},
     "pathfinder": {"num_training_steps": 500000, "num_warmup_steps": 50000},
-    "listops": {"num_training_steps": 80000, "num_warmup_steps": 1000},
+    "listops": {"num_training_steps": 120000, "num_warmup_steps": 12000},
     "pathx": {"num_training_steps": 500000, "num_warmup_steps": 50000},
+}
+
+S4_TRAINING_SEEDS = {
+    "aan": 3333,
+    "cifar": 2222,
+    "imdb": 3333,
+    "pathfinder": 3333,
+    "listops": 3333,
+    "pathx": 3333,
 }
 
 
@@ -54,6 +78,7 @@ def load_s4_lra_module():
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
+    np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
@@ -63,13 +88,17 @@ def setup_optimizer(model: nn.Module, lr: float, weight_decay: float) -> optim.O
 
     all_parameters = list(model.parameters())
     base_params = [p for p in all_parameters if not hasattr(p, "_optim")]
-    optimizer = optim.AdamW(base_params, lr=lr, weight_decay=weight_decay)
+    defaults = {"lr": lr, "weight_decay": weight_decay, "betas": (0.9, 0.999)}
+    optimizer = optim.AdamW(base_params, **defaults)
 
     hps = [getattr(p, "_optim") for p in all_parameters if hasattr(p, "_optim")]
-    hps = [dict(items) for items in sorted(dict.fromkeys(frozenset(hp.items()) for hp in hps))]
+    hps = [
+        dict(items)
+        for items in sorted(dict.fromkeys(frozenset(hp.items()) for hp in hps))
+    ]
     for hp in hps:
         params = [p for p in all_parameters if getattr(p, "_optim", None) == hp]
-        optimizer.add_param_group({"params": params, **hp})
+        optimizer.add_param_group({"params": params, **defaults, **hp})
 
     keys = sorted({key for hp in hps for key in hp})
     for i, group in enumerate(optimizer.param_groups):
@@ -97,13 +126,15 @@ def build_scheduler(
     if warmup_steps is None:
         warmup_steps = int(0.1 * total_steps)
 
+    # Exact lambda used by transformers.get_cosine_schedule_with_warmup,
+    # which is the scheduler registered by the official S4 pipeline.
     def lr_lambda(step: int) -> float:
         if warmup_steps > 0 and step < warmup_steps:
-            return float(step + 1) / float(warmup_steps)
-        if total_steps <= warmup_steps:
-            return 1.0
-        progress = min(1.0, float(step - warmup_steps) / float(total_steps - warmup_steps))
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
+            return float(step) / float(max(1, warmup_steps))
+        progress = float(step - warmup_steps) / float(
+            max(1, total_steps - warmup_steps)
+        )
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
     return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda), "step"
 
@@ -169,7 +200,9 @@ def run_epoch(
         total_correct += (logits.argmax(dim=1) == targets).sum().item()
         total_seen += batch_size
 
-        if print_freq > 0 and (batch_idx % print_freq == 0 or batch_idx + 1 == len(loader)):
+        if print_freq > 0 and (
+            batch_idx % print_freq == 0 or batch_idx + 1 == len(loader)
+        ):
             avg_loss = total_loss / max(total_seen, 1)
             avg_acc = 100.0 * total_correct / max(total_seen, 1)
             iterator.set_description(
@@ -177,6 +210,11 @@ def run_epoch(
                 f"loss={avg_loss:.4f} acc={avg_acc:.2f}"
             )
 
+    if total_seen == 0:
+        raise RuntimeError(
+            "The dataloader yielded no samples. With official S4 drop_last=True, "
+            "the selected subset must contain at least one full batch."
+        )
     return total_loss / total_seen, 100.0 * total_correct / total_seen
 
 
@@ -187,13 +225,40 @@ def save_checkpoint(state: dict, output_dir: Path, is_best: bool) -> None:
     if is_best:
         torch.save(state, output_dir / "model_best.pth.tar")
 
-# python train_lra_s4.py --task cifar --eval-test-every-epoch --activation dend_soma --dend-branches 8 --dend-compartments 2 --dend-branch-degree 2 --soma-psn-order 1024 --amp --batch-size 1
-
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train S4-LRA with optional DEND+SOMA activation.")
-    parser.add_argument("--task", default="listops", choices=["listops", "imdb", "text", "cifar", "image", "pathfinder"])
-    parser.add_argument("--root", default="/data/hyx/ViT-dend/data/lra_release", help="Root directory containing local LRA pickle zip folders.")
-    parser.add_argument("--s4-root", default="/data/hyx/s4", help="Official S4 repo root to add to PYTHONPATH.")
+    parser = argparse.ArgumentParser(
+        description="Train S4-LRA with optional DEND+SOMA activation."
+    )
+    parser.add_argument(
+        "--task",
+        default="listops",
+        choices=[
+            "aan",
+            "retrieval",
+            "cifar",
+            "image",
+            "imdb",
+            "text",
+            "pathfinder",
+            "listops",
+            "pathx",
+        ],
+    )
+    parser.add_argument(
+        "--root",
+        default="/data/hyx/ViT-dend/data/lra_release",
+        help="Root containing raw IMDB, CIFAR-10, ListOps, AAN, and Pathfinder data.",
+    )
+    parser.add_argument(
+        "--s4-root",
+        default="/data/hyx/s4",
+        help="Official S4 repo root to add to PYTHONPATH.", ##
+    )
+    parser.add_argument(
+        "--device",
+        default="cuda",
+        help="Torch device, for example cuda, cuda:4, or cpu.",
+    )
     parser.add_argument("--backend", default="official", choices=["official", "fallback", "auto"])
     parser.add_argument("--activation", default="dend_soma", choices=["dend_soma", "standard"])
     parser.add_argument("--output-dir", default="", help="Directory for args/checkpoints. Default creates exp/lra-*.")
@@ -219,7 +284,12 @@ def parse_args():
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--print-freq", type=int, default=50)
-    parser.add_argument("--eval-test-every-epoch", action="store_true")
+    parser.add_argument(
+        "--eval-test-every-epoch",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Match S4 by evaluating the test loader during each validation epoch.",
+    )
     parser.add_argument("--zero-pad-embedding", action="store_true", help="Use padding_idx=0 in token embedding.")
 
     parser.add_argument("--dend-branches", type=int, default=2)
@@ -237,45 +307,64 @@ def main() -> None:
         sys.path.insert(0, str(s4_root))
 
     s4_lra = load_s4_lra_module()
-    task_key = args.task.lower()
-    spec = get_lra_task_spec(task_key)
-    training_preset = dict(s4_lra.LRA_TRAINING_PRESETS.get(task_key, {}))
-    scheduler_preset = dict(SCHEDULER_PRESETS.get(task_key, {}))
+    task_key = canonicalize_lra_task(args.task)
+    args.task = task_key
+    training_preset = MMDEND_TRAINING_PRESETS[task_key]
+    scheduler_preset = S4_SCHEDULER_PRESETS[task_key]
 
-    args.epochs = args.epochs or int(training_preset.get("epochs", 1))
-    args.batch_size = args.batch_size or int(training_preset.get("batch_size", 32))
-    args.lr = args.lr if args.lr is not None else float(training_preset.get("lr", 0.01))
+    args.epochs = (
+        int(training_preset["epochs"]) if args.epochs is None else args.epochs
+    )
+    args.batch_size = (
+        int(training_preset["batch_size"])
+        if args.batch_size is None
+        else args.batch_size
+    )
+    args.lr = float(training_preset["lr"]) if args.lr is None else args.lr
     args.weight_decay = (
-        args.weight_decay
-        if args.weight_decay is not None
-        else float(training_preset.get("weight_decay", 0.05))
+        float(training_preset["weight_decay"])
+        if args.weight_decay is None
+        else args.weight_decay
     )
     if args.num_training_steps is None:
-        args.num_training_steps = scheduler_preset.get("num_training_steps")
+        args.num_training_steps = scheduler_preset["num_training_steps"]
     if args.num_warmup_steps is None:
-        args.num_warmup_steps = scheduler_preset.get("num_warmup_steps")
+        args.num_warmup_steps = scheduler_preset["num_warmup_steps"]
     if args.seed is None:
-        args.seed = 2222 if task_key in {"cifar", "image"} else 3333
+        args.seed = S4_TRAINING_SEEDS[task_key]
 
     set_seed(args.seed)
-    device = torch.device("cuda:4" if torch.cuda.is_available() else "cpu")
+    requested_device = torch.device(args.device)
+    if requested_device.type == "cuda" and not torch.cuda.is_available():
+        print(f"CUDA is unavailable; falling back from {requested_device} to cpu")
+        device = torch.device("cpu")
+    else:
+        device = requested_device
     if device.type == "cuda":
-        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.benchmark = False
 
     max_samples = {
         "train": args.max_train_samples,
-        "dev": args.max_val_samples,
+        "val": args.max_val_samples,
         "test": args.max_test_samples,
     }
     max_samples = {k: v for k, v in max_samples.items() if v is not None}
-    loaders = get_lra_dataloaders(
-        task_key,
+    data = get_s4_lra_data(
+        task=task_key,
         root=args.root,
+        s4_root=args.s4_root,
         batch_size=args.batch_size,
         num_workers=args.workers,
         max_samples=max_samples,
         max_len=args.max_len,
     )
+    spec = data.spec
+    loaders = data.loaders
+    args.data_pipeline = "official_s4"
+    args.training_hparams_source = "MMDEND Appendix C Table 7"
+    args.drop_last = True
+    args.pin_memory = True
+    args.validation_uses_test = data.validation_uses_test
 
     model_overrides = {}
     if args.d_model is not None:
@@ -329,7 +418,7 @@ def main() -> None:
         output_dir = Path(args.output_dir)
     else:
         stamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-        output_dir = Path("exp") / f"lra-{task_key}-{args.activation}-{stamp}"
+        output_dir = Path("exp") / f"lra-new-{task_key}-{args.activation}-{stamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     start_epoch = 0
@@ -353,8 +442,20 @@ def main() -> None:
     print(f"Device={device} backend={args.backend} activation={args.activation}")
     print(f"Output dir={output_dir}")
     print(
+        "Data pipeline=official S4 "
+        f"data_dir={spec.data_dir} drop_last=True pin_memory=True "
+        f"workers={args.workers}"
+    )
+    if data.validation_uses_test:
+        print(
+            "Validation protocol=official LRA IMDB: the test split is also used "
+            "for validation/checkpoint selection"
+        )
+    print(
         f"Epochs={args.epochs} batch_size={args.batch_size} "
-        f"train_batches={len(loaders['train'])} scheduler={args.scheduler}/{scheduler_interval}"
+        f"lr={args.lr} weight_decay={args.weight_decay} "
+        f"train_batches={len(loaders['train'])} scheduler={args.scheduler}/{scheduler_interval} "
+        f"warmup_steps={args.num_warmup_steps} total_steps={args.num_training_steps}"
     )
 
     for epoch in range(start_epoch, args.epochs):
@@ -390,19 +491,22 @@ def main() -> None:
 
         test_loss = test_acc = None
         if args.eval_test_every_epoch:
-            test_loss, test_acc = run_epoch(
-                loaders["test"],
-                model,
-                criterion,
-                optimizer=None,
-                scheduler=None,
-                scheduler_interval=scheduler_interval,
-                scaler=None,
-                device=device,
-                train=False,
-                print_freq=args.print_freq,
-                epoch=epoch + 1,
-            )
+            if data.validation_uses_test:
+                test_loss, test_acc = val_loss, val_acc
+            else:
+                test_loss, test_acc = run_epoch(
+                    loaders["test"],
+                    model,
+                    criterion,
+                    optimizer=None,
+                    scheduler=None,
+                    scheduler_interval=scheduler_interval,
+                    scaler=None,
+                    device=device,
+                    train=False,
+                    print_freq=args.print_freq,
+                    epoch=epoch + 1,
+                )
 
         is_best = val_acc > best_val
         best_val = max(best_val, val_acc)

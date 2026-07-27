@@ -345,7 +345,7 @@ class IFNode5PorderMaskD(nn.Module):
     
 
 class CIFAR10Net(nn.Module):
-    def __init__(self, channels, class_num: int, T: int=32, P:int=-1,num_branches=8,compartments_per_branch=4,branch_degree=2):
+    def __init__(self, channels, class_num: int, T: int=32, P:int=-1,num_branches=4,compartments_per_branch=4,branch_degree=1):
         super().__init__()
         conv = []
         for i in range(2):
@@ -356,11 +356,11 @@ class CIFAR10Net(nn.Module):
                     in_channels = channels
                 conv.append(layer.Conv1d(in_channels, channels, kernel_size=3, padding=1, bias=False))
                 conv.append(layer.BatchNorm1d(channels))
-                conv.append(SparseChannelPreservingTrunkDistalDendCompartment(channels,num_branches=num_branches,compartments_per_branch=compartments_per_branch,c_sub=channels,branch_degree=branch_degree,learn_comp_gain=True,learn_edge_gain=True,branch_readout_mode='linear'))
+                conv.append(SparseChannelPreservingTrunkDistalDendCompartment(channels,num_branches=num_branches,compartments_per_branch=compartments_per_branch,c_sub=channels,branch_degree=branch_degree,learn_comp_gain=True,learn_edge_gain=True))
                 #conv.append(soma.AstroPSNIntergerSoma_ssf(psn_order=T,psn_exp_init=True))
                 #conv.append(soma.AstroMaskedSlidingPSN(order=T,exp_init=True,astro_thre=0.4,astro_pool_kernel=5))
-                conv.append(soma.PSNIntergerSoma_ssf(psn_order=T,psn_exp_init=True))
-                #conv.append(soma.MaskedSlidingPSN(order=T,exp_init=True))
+                #conv.append(soma.PSNIntergerSoma_ssf(psn_order=T,psn_exp_init=True))
+                conv.append(soma.MaskedSlidingPSN(order=T,exp_init=True))
 
             conv.append(layer.AvgPool1d(2))
 
@@ -370,11 +370,11 @@ class CIFAR10Net(nn.Module):
         self.fc = nn.Sequential(
             layer.Flatten(),
             layer.Linear(channels * 8, channels * 8 // 4),
-            SparseChannelPreservingTrunkDistalDendCompartment(channels * 2,num_branches=num_branches,compartments_per_branch=compartments_per_branch,c_sub=channels,branch_degree=branch_degree,learn_comp_gain=True,learn_edge_gain=True,branch_readout_mode='linear'),
+            SparseChannelPreservingTrunkDistalDendCompartment(channels * 2,num_branches=num_branches,compartments_per_branch=compartments_per_branch,c_sub=channels,branch_degree=branch_degree,learn_comp_gain=True,learn_edge_gain=True),
             #soma.AstroPSNIntergerSoma_ssf(psn_order=T,psn_exp_init=True),
             #soma.AstroMaskedSlidingPSN(order=T,exp_init=True,astro_thre=0.4,astro_pool_kernel=5),
-            #soma.MaskedSlidingPSN(order=T,exp_init=True),
-            soma.PSNIntergerSoma_ssf(psn_order=T,psn_exp_init=True),
+            soma.MaskedSlidingPSN(order=T,exp_init=True),
+            #soma.PSNIntergerSoma_ssf(psn_order=T,psn_exp_init=True),
             layer.Linear(channels * 8 // 4, class_num),
         )
 
@@ -386,13 +386,13 @@ class CIFAR10Net(nn.Module):
         x_seq = self.fc(self.conv(x_seq))  # [W, N, C]
         return x_seq.mean(0)
 
-# python train_seq.py -data-dir /data/hyx/ViT-dend/data/cifar100 -amp -class-num 100 -channels 128  -warmup-epochs 0  -epochs 400 -opt sgd -lr 0.1 -wd 1e-4 -min-lr 0.00001   -resume logs/pt/None_e400_b128_adamw_lr0.001_c128_20260608-112508_amp_P32/checkpoint_latest.pth
+# python train_seq.py -data-dir /data/hyx/ViT-dend/data/cifar100 -amp -class-num 100 -channels 128  -warmup-epochs 0  -epochs 400 -opt adamw -lr 0.001 -wd 1e-4 -min-lr 0.00001   -resume logs/pt/None_e400_b128_adamw_lr0.001_c128_20260608-112508_amp_P32/checkpoint_latest.pth
 
 from datetime import datetime
 def main():
 
     parser = argparse.ArgumentParser(description='Classify Sequential CIFAR10/100')
-    parser.add_argument('-device', default='cuda:0', help='device')
+    parser.add_argument('-device', default='cuda:6', help='device')
     parser.add_argument('-b', default=128, type=int, help='batch size')
     parser.add_argument('-epochs', default=256, type=int, metavar='N',
                         help='number of total epochs to run')

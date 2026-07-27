@@ -36,7 +36,7 @@ class S4LRAConfig:
     d_state: int = 64
     n_layers: int = 6
     dropout: float = 0.0
-    tie_dropout: bool = False
+    tie_dropout: bool = True
     prenorm: bool = True
     norm: str = "batch"
     transposed: bool = False
@@ -46,6 +46,7 @@ class S4LRAConfig:
     dt_min: float = 0.001
     dt_max: float = 0.1
     n_ssm: Optional[int] = None
+    retrieval: bool = False
     use_dend_soma_activation: bool = False
     dend_soma_num_branches: int = 2
     dend_soma_compartments_per_branch: int = 4
@@ -400,6 +401,29 @@ class StandardS4Block(nn.Module):
         return x
 
 
+class RetrievalHead(nn.Module):
+    """Official S4/LRA NLI-style decoder for paired AAN documents."""
+
+    def __init__(self, d_input: int, d_model: int, n_classes: int) -> None:
+        super().__init__()
+        self.classifier = nn.Sequential(
+            nn.Linear(4 * d_input, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, n_classes),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        if x.size(0) % 2 != 0:
+            raise ValueError(
+                "AAN retrieval expects the official S4 collate order with a 2B batch"
+            )
+        first, second = x.reshape(2, x.size(0) // 2, x.size(-1)).unbind(0)
+        features = torch.cat(
+            [first, second, first - second, first * second], dim=-1
+        )
+        return self.classifier(features)
+
+
 class StandardS4ForLRA(nn.Module):
     """6-block S4 sequence classifier for LRA-style tasks.
 
@@ -418,7 +442,7 @@ class StandardS4ForLRA(nn.Module):
         d_state: int = 64,
         n_layers: int = 6,
         dropout: float = 0.0,
-        tie_dropout: bool = False,
+        tie_dropout: bool = True,
         prenorm: bool = True,
         norm: str = "batch",
         transposed: bool = False,
@@ -428,6 +452,7 @@ class StandardS4ForLRA(nn.Module):
         dt_min: float = 0.001,
         dt_max: float = 0.1,
         n_ssm: Optional[int] = None,
+        retrieval: bool = False,
         use_dend_soma_activation: bool = False,
         dend_soma_num_branches: int = 2,
         dend_soma_compartments_per_branch: int = 4,
@@ -460,6 +485,7 @@ class StandardS4ForLRA(nn.Module):
             dt_min=dt_min,
             dt_max=dt_max,
             n_ssm=n_ssm,
+            retrieval=retrieval,
             use_dend_soma_activation=use_dend_soma_activation,
             dend_soma_num_branches=dend_soma_num_branches,
             dend_soma_compartments_per_branch=dend_soma_compartments_per_branch,
@@ -507,7 +533,11 @@ class StandardS4ForLRA(nn.Module):
             self.final_norm = nn.LayerNorm(d_model) if prenorm else nn.Identity()
         else:
             raise ValueError(f"Unsupported norm: {norm}")
-        self.decoder = nn.Linear(d_model, d_output)
+        self.decoder = (
+            RetrievalHead(d_model, d_model, d_output)
+            if retrieval
+            else nn.Linear(d_model, d_output)
+        )
 
     @staticmethod
     def _select_s4_factory(backend: str) -> S4LayerFactory:
@@ -564,15 +594,15 @@ class StandardS4ForLRA(nn.Module):
 
 LRA_S4_PRESETS: Dict[str, Dict[str, object]] = {
     "listops": {
-        "n_layers": 8,
-        "d_model": 128,
-        "d_state": 64,
+        "n_layers": 6,
+        "d_model": 256,
+        "d_state": 4,
         "dropout": 0.0,
         "norm": "batch",
         "prenorm": False,
         "l_max": 2048,
         "layer_lr": {"dt": None, "A": 0.001, "B": 0.001},
-        "n_ssm": "d_model",
+        "n_ssm": 1,
     },
     "text": {
         "n_layers": 6,
@@ -606,6 +636,7 @@ LRA_S4_PRESETS: Dict[str, Dict[str, object]] = {
         "l_max": 4000,
         "layer_lr": {"dt": None, "A": 0.001, "B": 0.001},
         "n_ssm": 1,
+        "retrieval": True,
     },
     "retrieval": {
         "n_layers": 6,
@@ -617,6 +648,7 @@ LRA_S4_PRESETS: Dict[str, Dict[str, object]] = {
         "l_max": 4000,
         "layer_lr": {"dt": None, "A": 0.001, "B": 0.001},
         "n_ssm": 1,
+        "retrieval": True,
     },
     "image": {
         "n_layers": 6,
@@ -624,10 +656,10 @@ LRA_S4_PRESETS: Dict[str, Dict[str, object]] = {
         "d_state": 64,
         "dropout": 0.1,
         "tie_dropout": True,
-        "norm": "layer",
+        "norm": "batch",
         "prenorm": False,
         "l_max": 1024,
-        "n_ssm": 2,
+        "n_ssm": 1,
     },
     "cifar": {
         "n_layers": 6,
@@ -635,10 +667,10 @@ LRA_S4_PRESETS: Dict[str, Dict[str, object]] = {
         "d_state": 64,
         "dropout": 0.1,
         "tie_dropout": True,
-        "norm": "layer",
+        "norm": "batch",
         "prenorm": False,
         "l_max": 1024,
-        "n_ssm": 2,
+        "n_ssm": 1,
     },
     "pathfinder": {
         "n_layers": 6,
@@ -664,19 +696,6 @@ LRA_S4_PRESETS: Dict[str, Dict[str, object]] = {
 }
 
 
-LRA_TRAINING_PRESETS: Dict[str, Dict[str, object]] = {
-    "aan": {"lr": 0.01, "batch_size": 64, "epochs": 20, "weight_decay": 0.05},
-    "retrieval": {"lr": 0.01, "batch_size": 64, "epochs": 20, "weight_decay": 0.05},
-    "cifar": {"lr": 0.01, "batch_size": 50, "epochs": 200, "weight_decay": 0.05},
-    "image": {"lr": 0.01, "batch_size": 50, "epochs": 200, "weight_decay": 0.05},
-    "imdb": {"lr": 0.01, "batch_size": 16, "epochs": 32, "weight_decay": 0.05},
-    "text": {"lr": 0.01, "batch_size": 16, "epochs": 32, "weight_decay": 0.05},
-    "pathfinder": {"lr": 0.004, "batch_size": 64, "epochs": 200, "weight_decay": 0.05},
-    "listops": {"lr": 0.01, "batch_size": 50, "epochs": 40, "weight_decay": 0.05},
-    "pathx": {"lr": 0.001, "batch_size": 16, "epochs": 50, "weight_decay": 0.05},
-}
-
-
 def build_standard_s4_lra(
     task: str,
     d_input: int,
@@ -689,7 +708,7 @@ def build_standard_s4_lra(
 
     config = dict(LRA_S4_PRESETS.get(task.lower(), {}))
     config.update(overrides)
-    config.setdefault("n_layers", 6)
+    #config.setdefault("n_layers", 6)
     if config.get("n_ssm") == "d_model":
         config["n_ssm"] = config["d_model"]
     return StandardS4ForLRA(

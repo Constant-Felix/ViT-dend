@@ -1,362 +1,439 @@
-"""Data loading utilities for local LRA pickle-zip datasets.
+"""Official S4 data adapters for the six Long Range Arena tasks.
 
-Expected directory layout:
-
-    lra_release/
-      IMDB/lra-text.{train,dev,test}.pickle.zip
-      cifar/lra-image.{train,dev,test}.pickle.zip
-      listops/lra-listops.{train,dev,test}.pickle.zip
-      pathfinder/lra-pathfinder32-curv_contour_length_14.{train,dev,test}.pickle.zip
-
-Each pickle file is a list of dicts with ``input_ids_0`` and ``label``.
-Token tasks are trimmed back to their non-padding length and collated with
-dynamic padding plus ``lengths``, matching the official S4 loaders. Pixel tasks
-apply the official S4 transforms for the corresponding LRA task.
+The raw data lives under one project-level root, while the preprocessing,
+tokenization, splitting, and collate behavior are delegated to the local S4
+repository. This keeps the benchmark pipeline tied to the exact S4 source used
+for the model instead of maintaining a second implementation in this project.
 """
 
 from __future__ import annotations
 
-import pickle
-import zipfile
+import importlib
+import importlib.machinery
+import os
+import sys
+import types
+import warnings
 from dataclasses import dataclass
+from itertools import chain
 from pathlib import Path
-from typing import Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional
 
-import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
+
+from s4_torchtext_compat import ensure_torchtext_for_s4
+
+
+TASK_ALIASES = {
+    "text": "imdb",
+    "image": "cifar",
+    "retrieval": "aan",
+}
+
+TASK_DATA_DIRS = {
+    "imdb": "imdb",
+    "cifar": "cifar",
+    "listops": "listops-1000",
+    "aan": "tsv_data",
+    "pathfinder": "pathfinder32",
+    "pathx": "pathfinder128",
+}
+
+TOKEN_TASKS = {"imdb", "listops", "aan"}
 
 
 @dataclass(frozen=True)
 class LRATaskSpec:
     name: str
-    dirname: str
-    filename_prefix: str
     modality: str
     d_input: int
     d_output: int
     sequence_length: int
+    data_dir: Path
     vocab_size: Optional[int] = None
     padding_idx: Optional[int] = None
-    pixel_normalize: bool = False
-    pixel_mean: Optional[float] = None
-    pixel_std: Optional[float] = None
 
 
-LRA_TASKS: Dict[str, LRATaskSpec] = {
-    "imdb": LRATaskSpec(
-        name="imdb",
-        dirname="IMDB",
-        filename_prefix="lra-text",
-        modality="tokens",
-        d_input=1,
-        d_output=2,
-        sequence_length=4096,
-        vocab_size=241,
-        padding_idx=0,
-    ),
-    "text": LRATaskSpec(
-        name="imdb",
-        dirname="IMDB",
-        filename_prefix="lra-text",
-        modality="tokens",
-        d_input=1,
-        d_output=2,
-        sequence_length=4096,
-        vocab_size=241,
-        padding_idx=0,
-    ),
-    "cifar": LRATaskSpec(
-        name="cifar",
-        dirname="cifar",
-        filename_prefix="lra-image",
-        modality="pixels",
-        d_input=1,
-        d_output=10,
-        sequence_length=1024,
-        vocab_size=None,
-        pixel_normalize=True,
-        pixel_mean=122.6 / 255.0,
-        pixel_std=61.0 / 255.0,
-    ),
-    "image": LRATaskSpec(
-        name="cifar",
-        dirname="cifar",
-        filename_prefix="lra-image",
-        modality="pixels",
-        d_input=1,
-        d_output=10,
-        sequence_length=1024,
-        vocab_size=None,
-        pixel_normalize=True,
-        pixel_mean=122.6 / 255.0,
-        pixel_std=61.0 / 255.0,
-    ),
-    "listops": LRATaskSpec(
-        name="listops",
-        dirname="listops",
-        filename_prefix="lra-listops",
-        modality="tokens",
-        d_input=1,
-        d_output=10,
-        sequence_length=2048,
-        vocab_size=15,
-        padding_idx=0,
-    ),
-    "pathfinder": LRATaskSpec(
-        name="pathfinder",
-        dirname="pathfinder",
-        filename_prefix="lra-pathfinder32-curv_contour_length_14",
-        modality="pixels",
-        d_input=1,
-        d_output=2,
-        sequence_length=1024,
-        vocab_size=None,
-        pixel_normalize=True,
-    ),
-}
+@dataclass
+class LRADataBundle:
+    task: str
+    spec: LRATaskSpec
+    loaders: Dict[str, DataLoader]
+    datamodule: Any
+    validation_uses_test: bool = False
 
 
-SPLIT_ALIASES = {
-    "train": "train",
-    "val": "dev",
-    "valid": "dev",
-    "validation": "dev",
-    "dev": "dev",
-    "test": "test",
-}
-
-
-def get_lra_task_spec(task: str) -> LRATaskSpec:
+def canonicalize_lra_task(task: str) -> str:
     key = task.lower()
-    if key not in LRA_TASKS:
-        choices = ", ".join(sorted(LRA_TASKS))
+    key = TASK_ALIASES.get(key, key)
+    if key not in TASK_DATA_DIRS:
+        choices = ", ".join(sorted({*TASK_DATA_DIRS, *TASK_ALIASES}))
         raise KeyError(f"Unknown LRA task '{task}'. Available tasks: {choices}")
-    return LRA_TASKS[key]
+    return key
 
 
-def normalize_split(split: str) -> str:
-    key = split.lower()
-    if key not in SPLIT_ALIASES:
-        choices = ", ".join(sorted(SPLIT_ALIASES))
-        raise KeyError(f"Unknown split '{split}'. Available splits: {choices}")
-    return SPLIT_ALIASES[key]
+def get_lra_data_dir(root: str | Path, task: str) -> Path:
+    task = canonicalize_lra_task(task)
+    return Path(root).expanduser().resolve() / TASK_DATA_DIRS[task]
 
 
-def get_lra_zip_path(root: str | Path, task: str, split: str) -> Path:
-    spec = get_lra_task_spec(task)
-    split = normalize_split(split)
-    path = Path(root) / spec.dirname / f"{spec.filename_prefix}.{split}.pickle.zip"
-    if not path.exists():
-        raise FileNotFoundError(f"Could not find LRA split file: {path}")
-    return path
+def _validate_data_dir(task: str, data_dir: Path) -> None:
+    if not data_dir.is_dir():
+        raise FileNotFoundError(f"LRA data directory does not exist: {data_dir}")
 
+    required: Dict[str, tuple[str, ...]] = {
+        "cifar": (
+            "cifar-10-batches-py/batches.meta",
+            "cifar-10-batches-py/data_batch_1",
+            "cifar-10-batches-py/test_batch",
+        ),
+        "listops": ("basic_train.tsv", "basic_val.tsv", "basic_test.tsv"),
+        "aan": (
+            "new_aan_pairs.train.tsv",
+            "new_aan_pairs.eval.tsv",
+            "new_aan_pairs.test.tsv",
+        ),
+        "pathfinder": (
+            "curv_contour_length_14/imgs",
+            "curv_contour_length_14/metadata",
+        ),
+        "pathx": (
+            "curv_contour_length_14/imgs",
+            "curv_contour_length_14/metadata",
+        ),
+    }
+    missing = [
+        name for name in required.get(task, ()) if not (data_dir / name).exists()
+    ]
+    if missing:
+        formatted = ", ".join(str(data_dir / name) for name in missing)
+        raise FileNotFoundError(f"Incomplete {task} data; missing: {formatted}")
 
-class LRAPickleZipDataset(Dataset):
-    """Dataset for Kaggle-style LRA ``.pickle.zip`` split files."""
-
-    def __init__(
-        self,
-        root: str | Path,
-        task: str,
-        split: str,
-        max_samples: Optional[int] = None,
-        max_len: Optional[int] = None,
-        pixel_normalize: Optional[bool] = None,
-        return_lengths: Optional[bool] = None,
-        trim_padding: Optional[bool] = None,
-        preload: bool = True,
-    ) -> None:
-        self.spec = get_lra_task_spec(task)
-        self.split = normalize_split(split)
-        self.path = get_lra_zip_path(root, task, split)
-        self.max_samples = max_samples
-        self.max_len = max_len
-        self.pixel_normalize = self.spec.pixel_normalize if pixel_normalize is None else pixel_normalize
-        self.return_lengths = self.spec.modality == "tokens" if return_lengths is None else return_lengths
-        self.trim_padding = self.spec.modality == "tokens" if trim_padding is None else trim_padding
-
-        if not preload:
-            raise ValueError("LRAPickleZipDataset currently requires preload=True")
-        self.data = self._load_pickle_zip(self.path)
-        if max_samples is not None:
-            self.data = self.data[:max_samples]
-
-    @staticmethod
-    def _load_pickle_zip(path: Path):
-        with zipfile.ZipFile(path) as zf:
-            names = [name for name in zf.namelist() if not name.endswith("/")]
-            if len(names) != 1:
-                raise ValueError(f"Expected one pickle file inside {path}, found {names}")
-            with zf.open(names[0]) as f:
-                return pickle.load(f)
-
-    def _process_pixel_input(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.float()
-        if self.pixel_normalize:
-            x = x / 255.0
-        if self.spec.pixel_mean is not None or self.spec.pixel_std is not None:
-            if not self.pixel_normalize:
-                raise ValueError("pixel_mean/pixel_std expect pixel_normalize=True")
-            mean = 0.0 if self.spec.pixel_mean is None else self.spec.pixel_mean
-            std = 1.0 if self.spec.pixel_std is None else self.spec.pixel_std
-            x = (x - mean) / std
-        return x.unsqueeze(-1)
-
-    def _process_token_input(self, x: torch.Tensor):
-        x = x.long()
-        length = x.numel()
-        if self.trim_padding and self.spec.padding_idx is not None:
-            non_padding = torch.nonzero(x != self.spec.padding_idx, as_tuple=False)
-            length = int(non_padding[-1, 0].item()) + 1 if non_padding.numel() else 0
-            x = x[:length]
-        return x, torch.as_tensor(length, dtype=torch.long)
-
-    def __len__(self) -> int:
-        return len(self.data)
-
-    def __getitem__(self, index: int):
-        item = self.data[index]
-        x = torch.as_tensor(item["input_ids_0"])
-        y = torch.as_tensor(item["label"], dtype=torch.long)
-
-        if self.max_len is not None:
-            x = x[: self.max_len]
-
-        if self.spec.modality == "pixels":
-            x = self._process_pixel_input(x)
-            return x, y
-
-        x, length = self._process_token_input(x)
-        if self.return_lengths:
-            return x, y, length
-        return x, y
-
-
-def collate_lra_batch(batch, padding_idx: int = 0):
-    if len(batch[0]) == 3:
-        xs, ys, lengths = zip(*batch)
-        lengths = torch.stack(lengths).long()
-    else:
-        xs, ys = zip(*batch)
-        lengths = None
-    first = xs[0]
-
-    if first.dim() == 1:
-        if all(item.size(0) == first.size(0) for item in xs):
-            x = torch.stack(xs, dim=0)
-        else:
-            x = torch.nn.utils.rnn.pad_sequence(
-                xs,
-                batch_first=True,
-                padding_value=padding_idx,
-            )
-        if lengths is None:
-            lengths = torch.as_tensor([item.size(0) for item in xs], dtype=torch.long)
-    elif first.dim() == 2:
-        if all(item.size(0) == first.size(0) for item in xs):
-            x = torch.stack(xs, dim=0)
-        else:
-            x = torch.nn.utils.rnn.pad_sequence(xs, batch_first=True)
-    else:
-        raise ValueError(f"Unsupported LRA sample rank: {first.dim()}")
-
-    y = torch.stack(ys, dim=0).long()
-    if lengths is not None:
-        return x, y, {"lengths": lengths}
-    return x, y
-
-
-def get_lra_datasets(
-    task: str,
-    root: str | Path = "lra_release",
-    max_samples: Optional[Mapping[str, int]] = None,
-    max_len: Optional[int] = None,
-    pixel_normalize: Optional[bool] = None,
-    return_lengths: Optional[bool] = None,
-    trim_padding: Optional[bool] = None,
-) -> Dict[str, LRAPickleZipDataset]:
-    max_samples = max_samples or {}
-    return {
-        split: LRAPickleZipDataset(
-            root=root,
-            task=task,
-            split=split,
-            max_samples=max_samples.get(split),
-            max_len=max_len,
-            pixel_normalize=pixel_normalize,
-            return_lengths=return_lengths,
-            trim_padding=trim_padding,
+    if task == "imdb" and not any(data_dir.rglob("imdb-train.arrow")):
+        raise FileNotFoundError(
+            f"Could not find the Hugging Face IMDB Arrow cache below {data_dir}"
         )
-        for split in ("train", "dev", "test")
+
+
+def _prepare_s4_dataloaders_package(s4_root: Path) -> None:
+    """Create the package namespace without importing every optional loader."""
+
+    src_module = importlib.import_module("src")
+    package_name = "src.dataloaders"
+    if package_name in sys.modules:
+        return
+
+    package_dir = s4_root / "src" / "dataloaders"
+    package = types.ModuleType(package_name)
+    package.__file__ = str(package_dir / "__init__.py")
+    package.__package__ = package_name
+    package.__path__ = [str(package_dir)]
+    package.__spec__ = importlib.machinery.ModuleSpec(
+        package_name, loader=None, is_package=True
+    )
+    package.__spec__.submodule_search_locations = package.__path__
+    sys.modules[package_name] = package
+    setattr(src_module, "dataloaders", package)
+
+
+def _load_official_s4_dataset_classes(s4_root: str | Path, data_root: Path):
+    """Import S4 dataloaders after fixing the import-time DATA_PATH."""
+
+    s4_root = Path(s4_root).expanduser().resolve()
+    if not (s4_root / "src" / "dataloaders" / "lra.py").is_file():
+        raise FileNotFoundError(
+            f"Could not find the official S4 repository at {s4_root}"
+        )
+
+    os.environ["DATA_PATH"] = str(data_root)
+    if str(s4_root) not in sys.path:
+        sys.path.insert(0, str(s4_root))
+
+    torchtext_error = ensure_torchtext_for_s4()
+    if torchtext_error is not None:
+        warnings.warn(
+            "Installed the pure-Python S4 LRA torchtext compatibility layer "
+            f"because the system torchtext could not load: {torchtext_error}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    try:
+        _prepare_s4_dataloaders_package(s4_root)
+        s4_base = importlib.import_module("src.dataloaders.base")
+        s4_basic = importlib.import_module("src.dataloaders.basic")
+        s4_lra = importlib.import_module("src.dataloaders.lra")
+    except Exception as exc:
+        raise ImportError(
+            "Failed to import the official S4 dataloaders. Run with the Python "
+            "environment used by the S4 repository, including compatible "
+            "datasets, torchvision, and torchaudio packages."
+        ) from exc
+
+    CIFAR10 = s4_basic.CIFAR10
+    AAN = s4_lra.AAN
+    IMDB = s4_lra.IMDB
+    ListOps = s4_lra.ListOps
+    PathFinder = s4_lra.PathFinder
+
+    configured_root = Path(s4_base.default_data_path).resolve()
+    if configured_root != data_root:
+        raise RuntimeError(
+            "S4 dataloaders were imported before DATA_PATH was configured: "
+            f"expected {data_root}, found {configured_root}. "
+            "Start a fresh Python process."
+        )
+
+    return {
+        "imdb": IMDB,
+        "cifar": CIFAR10,
+        "listops": ListOps,
+        "aan": AAN,
+        "pathfinder": PathFinder,
+        "pathx": PathFinder,
     }
 
 
-def get_lra_dataloaders(
+def _setup_official_datamodule(datamodule: Any, task: str) -> None:
+    """Run S4 setup with compatibility for newer Hugging Face datasets."""
+
+    if task != "aan":
+        datamodule.setup()
+        return
+
+    try:
+        from datasets.arrow_dataset import Column
+    except ImportError:
+        datamodule.setup()
+        return
+
+    if getattr(Column, "__add__", None) is not None:
+        datamodule.setup()
+        return
+
+    # S4 expects Dataset columns to be Python lists and concatenates the two
+    # AAN document columns with ``+``. New datasets versions return Column
+    # objects instead. Chaining them preserves the exact S4 iteration order.
+    Column.__add__ = lambda self, other: chain(self, other)
+    try:
+        datamodule.setup()
+    finally:
+        del Column.__add__
+
+
+def _official_dataset_config(task: str, max_len: Optional[int]) -> Dict[str, Any]:
+    # Values are the resolved official S4 dataset and LRA experiment configs.
+    # The actual transforms/tokenizers remain implemented by the imported S4 classes.
+    configs: Dict[str, Dict[str, Any]] = {
+        "imdb": {
+            "l_max": 4096,
+            "level": "char",
+            "min_freq": 15,
+            "seed": 42,
+            "val_split": 0.0,
+            "append_bos": False,
+            "append_eos": True,
+            "n_workers": 4,
+        },
+        "cifar": {
+            "permute": None,
+            "grayscale": True,
+            "tokenize": False,
+            "augment": False,
+            "cutout": False,
+            "random_erasing": False,
+            "val_split": 0.1,
+            "seed": 42,
+        },
+        "listops": {
+            "l_max": 2048,
+            "append_bos": False,
+            "append_eos": True,
+            "n_workers": 4,
+        },
+        "aan": {
+            "l_max": 4000,
+            "append_bos": False,
+            "append_eos": True,
+            "n_workers": 4,
+        },
+        "pathfinder": {
+            "resolution": 32,
+            "sequential": True,
+            "tokenize": False,
+            "center": False,
+            "pool": 1,
+            "val_split": 0.1,
+            "test_split": 0.1,
+            "seed": 42,
+        },
+        "pathx": {
+            "resolution": 128,
+            "sequential": True,
+            "tokenize": False,
+            "center": False,
+            "pool": 1,
+            "val_split": 0.1,
+            "test_split": 0.1,
+            "seed": 42,
+        },
+    }
+    config = dict(configs[task])
+    if max_len is not None:
+        if task not in TOKEN_TASKS:
+            raise ValueError("--max-len is only supported for token LRA tasks")
+        config["l_max"] = max_len
+    return config
+
+
+def _limited(dataset: Optional[Dataset], limit: Optional[int]) -> Optional[Dataset]:
+    if dataset is None or limit is None:
+        return dataset
+    return Subset(dataset, range(min(limit, len(dataset))))
+
+
+def _unwrap_loader(loader, split: str) -> DataLoader:
+    if isinstance(loader, Mapping):
+        values = list(loader.values())
+        if len(values) != 1:
+            raise ValueError(f"Expected one {split} resolution, found {len(values)}")
+        loader = values[0]
+    elif isinstance(loader, (list, tuple)):
+        if len(loader) != 1:
+            raise ValueError(f"Expected one {split} loader, found {len(loader)}")
+        loader = loader[0]
+    if not isinstance(loader, DataLoader):
+        raise TypeError(
+            f"Official S4 returned an invalid {split} loader: {type(loader)}"
+        )
+    return loader
+
+
+def _build_task_spec(task: str, data_dir: Path, datamodule: Any) -> LRATaskSpec:
+    if task in TOKEN_TASKS:
+        vocab_size = int(datamodule.n_tokens)
+        padding_idx = int(datamodule.vocab["<pad>"])
+        d_input = 1
+        modality = "paired_tokens" if task == "aan" else "tokens"
+        sequence_length = int(datamodule.l_max)
+    else:
+        vocab_size = None
+        padding_idx = None
+        d_input = int(datamodule.d_input)
+        modality = "pixels"
+        sequence_length = (
+            int(datamodule.resolution**2 // datamodule.pool**2)
+            if task in {"pathfinder", "pathx"}
+            else 1024
+        )
+
+    return LRATaskSpec(
+        name=task,
+        modality=modality,
+        d_input=d_input,
+        d_output=int(datamodule.d_output),
+        sequence_length=sequence_length,
+        data_dir=data_dir,
+        vocab_size=vocab_size,
+        padding_idx=padding_idx,
+    )
+
+
+def get_s4_lra_data(
     task: str,
-    root: str | Path = "lra_release",
-    batch_size: int = 64,
+    root: str | Path,
+    s4_root: str | Path,
+    batch_size: int,
     num_workers: int = 4,
     max_samples: Optional[Mapping[str, int]] = None,
     max_len: Optional[int] = None,
-    pixel_normalize: Optional[bool] = None,
-    return_lengths: Optional[bool] = None,
-    trim_padding: Optional[bool] = None,
     pin_memory: Optional[bool] = None,
-) -> Dict[str, DataLoader]:
-    if pin_memory is None:
-        pin_memory = torch.cuda.is_available()
+) -> LRADataBundle:
+    """Build official-S4 datasets and loaders for one canonical LRA task."""
 
-    datasets = get_lra_datasets(
-        task=task,
-        root=root,
-        max_samples=max_samples,
-        max_len=max_len,
-        pixel_normalize=pixel_normalize,
-        return_lengths=return_lengths,
-        trim_padding=trim_padding,
+    task = canonicalize_lra_task(task)
+    data_root = Path(root).expanduser().resolve()
+    data_dir = get_lra_data_dir(data_root, task)
+    _validate_data_dir(task, data_dir)
+
+    if task == "imdb":
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+
+    classes = _load_official_s4_dataset_classes(s4_root, data_root)
+    config = _official_dataset_config(task, max_len=max_len)
+    s4_data_dir = data_root if task == "imdb" else data_dir
+    datamodule = classes[task](
+        _name_="pathfinder" if task == "pathx" else task,
+        data_dir=s4_data_dir,
+        **config,
     )
-    return {
-        split: DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=split == "train",
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            collate_fn=lambda batch, padding_idx=dataset.spec.padding_idx or 0: collate_lra_batch(
-                batch,
-                padding_idx=padding_idx,
-            ),
-        )
-        for split, dataset in datasets.items()
+    _setup_official_datamodule(datamodule, task)
+
+    max_samples = max_samples or {}
+    train_dataset = _limited(datamodule.dataset_train, max_samples.get("train"))
+    val_limit = max_samples.get("val", max_samples.get("dev"))
+    validation_uses_test = datamodule.dataset_val is None
+    val_source = (
+        datamodule.dataset_test
+        if validation_uses_test
+        else datamodule.dataset_val
+    )
+    val_dataset = _limited(val_source, val_limit)
+    test_dataset = _limited(datamodule.dataset_test, max_samples.get("test"))
+
+    if pin_memory is None:
+        pin_memory = True
+    loader_args = {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "drop_last": True,  # S4 configs/loader/default.yaml, including eval.
     }
+    train_loader = _unwrap_loader(
+        datamodule._train_dataloader(train_dataset, **loader_args), "train"
+    )
+    val_loader = _unwrap_loader(
+        datamodule._eval_dataloader(val_dataset, **loader_args), "validation"
+    )
+    test_loader = _unwrap_loader(
+        datamodule._eval_dataloader(test_dataset, **loader_args), "test"
+    )
+
+    spec = _build_task_spec(task, data_dir, datamodule)
+    return LRADataBundle(
+        task=task,
+        spec=spec,
+        loaders={"train": train_loader, "dev": val_loader, "test": test_loader},
+        datamodule=datamodule,
+        validation_uses_test=validation_uses_test,
+    )
 
 
-def describe_lra_release(root: str | Path = "lra_release") -> Dict[str, Dict[str, object]]:
-    summary = {}
-    for task_key in ("imdb", "cifar", "listops", "pathfinder"):
-        spec = get_lra_task_spec(task_key)
-        split_info = {}
-        for split in ("train", "dev", "test"):
-            path = get_lra_zip_path(root, task_key, split)
-            with zipfile.ZipFile(path) as zf:
-                name = zf.namelist()[0]
-                size = zf.getinfo(name).file_size
-            split_info[split] = {"path": str(path), "uncompressed_bytes": size}
-        summary[task_key] = {
-            "modality": spec.modality,
-            "d_input": spec.d_input,
-            "d_output": spec.d_output,
-            "sequence_length": spec.sequence_length,
-            "vocab_size": spec.vocab_size,
-            "padding_idx": spec.padding_idx,
-            "pixel_normalize": spec.pixel_normalize,
-            "pixel_mean": spec.pixel_mean,
-            "pixel_std": spec.pixel_std,
-            "splits": split_info,
-        }
+def describe_lra_release(root: str | Path) -> Dict[str, Dict[str, object]]:
+    root = Path(root).expanduser().resolve()
+    summary: Dict[str, Dict[str, object]] = {}
+    for task in TASK_DATA_DIRS:
+        data_dir = get_lra_data_dir(root, task)
+        try:
+            _validate_data_dir(task, data_dir)
+            valid = True
+            error = None
+        except (FileNotFoundError, ValueError) as exc:
+            valid = False
+            error = str(exc)
+        summary[task] = {"path": str(data_dir), "valid": valid, "error": error}
     return summary
 
 
 if __name__ == "__main__":
-    for task, info in describe_lra_release().items():
-        print(task, info)
+    default_root = os.getenv("DATA_PATH", "/data/hyx/ViT-dend/data/lra_release")
+    s4_root = Path('/data/hyx/s4').expanduser()
+    if s4_root.is_dir() and str(s4_root) not in sys.path:
+        sys.path.insert(0, str(s4_root))
+
+    for task_name, info in describe_lra_release(default_root).items():
+        print(task_name, info)
+
+    a = get_s4_lra_data(task='aan',root=default_root,s4_root=s4_root,batch_size=1,num_workers=8,pin_memory=True)
+    print(len(a.loaders['train']), len(a.loaders['dev']), len(a.loaders['test']))
