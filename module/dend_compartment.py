@@ -15,6 +15,26 @@ import torch.nn as nn
 import math
 from spikingjelly.activation_based import base
 
+def _causal_fft_convolution_time_first(
+    x: torch.Tensor,
+    kernel: torch.Tensor,
+) -> torch.Tensor:
+    """Apply a broadcastable causal kernel without materializing a T x T matrix."""
+    T = x.shape[0]
+    kernel_length = kernel.shape[-1]
+    if T <= 0 or kernel_length <= 0:
+        raise ValueError("x and kernel must have non-empty time dimensions")
+
+    linear_length = T + kernel_length - 1
+    n_fft = 1 << (linear_length - 1).bit_length()
+    work_dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
+    x_work = x.movedim(0, -1).to(dtype=work_dtype)
+    kernel_work = kernel.to(device=x.device, dtype=work_dtype)
+
+    x_f = torch.fft.rfft(x_work, n=n_fft, dim=-1)
+    kernel_f = torch.fft.rfft(kernel_work, n=n_fft, dim=-1)
+    y = torch.fft.irfft(x_f * kernel_f, n=n_fft, dim=-1)[..., :T]
+    return y.movedim(-1, 0).to(dtype=x.dtype)
 
 class BaseDendCompartment(base.MemoryModule, abc.ABC):
     """Base class for all dendritic compartments.
@@ -2227,11 +2247,10 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
     every channel to materialize every branch.
 
     Set ``free_window_order`` to a positive integer ``P`` to replace the
-    exponential compartment integration with the causal GEMM sliding window
-    used by ``MaskedSlidingPSN``.  Each branch owns one learnable vector of
-    length ``P`` and all compartments routed to that branch share it.  This
-    mode is stateless across forward calls and requires multi-step parallel
-    execution, matching the original SPSN computation.
+    exponential compartment integration with the causal sliding window used by
+    ``MaskedSlidingPSN``. Each branch owns one learnable vector of length ``P``
+    and all compartments routed to that branch share it. ``integration_backend``
+    selects the original dense GEMM or an equivalent FFT convolution.
     """
 
     def __init__(
@@ -2264,6 +2283,7 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
         detach_state_during_forward: bool = False,
         parallel_forward: bool = True,
         shared_tau_parallel: bool = True,
+        integration_backend: str = "gemm",
         branch_readout_mode: str = "trunk_distal",
         free_window_order: Optional[int] = None,
     ):
@@ -2286,6 +2306,8 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
             raise ValueError("merge_norm must be one of: 'sqrt', 'mean', 'sum'")
         if branch_readout_mode not in {"trunk_distal", "linear"}:
             raise ValueError("branch_readout_mode must be 'trunk_distal' or 'linear'")
+        if integration_backend not in {"gemm", "fft"}:
+            raise ValueError("integration_backend must be 'gemm' or 'fft'")
         if tau_min <= 1.0 or tau_max <= 1.0:
             raise ValueError("tau_min and tau_max should be larger than 1")
         if free_window_order is not None:
@@ -2319,6 +2341,7 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
         self.detach_state_during_forward = bool(detach_state_during_forward)
         self.parallel_forward = bool(parallel_forward)
         self.shared_tau_parallel = bool(shared_tau_parallel)
+        self.integration_backend = integration_backend
         self.free_window_order = free_window_order
         self.branch_readout_mode = branch_readout_mode
         self.store_branch_monitor = bool(store_branch_monitor)
@@ -2561,6 +2584,19 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
         tau_vec_rest = 1.0 - tau_vec_init
         return tau_matrix, tau_vec_init, tau_vec_rest, tau
 
+    def _build_exponential_fft_terms(self, tau: torch.Tensor, T: int, dtype, device):
+        work_dtype = torch.float64 if dtype == torch.float64 else torch.float32
+        tau = torch.clamp(
+            tau.to(dtype=work_dtype, device=device),
+            min=1.0 + 1e-3,
+        )
+        decay = 1.0 - 1.0 / tau
+        lags = torch.arange(T, dtype=work_dtype, device=device)
+        powers = decay.unsqueeze(-1).pow(lags)
+        kernel = powers / tau.unsqueeze(-1) if self.decay_input else powers
+        init_factor = decay.unsqueeze(-1).pow(lags + 1.0)
+        return kernel, init_factor
+
     def _gen_free_window_gemm_weight(self, T: int, dtype, device):
         """Build the original SPSN causal sliding matrix for every branch."""
         gemm_weight = torch.zeros(
@@ -2633,6 +2669,93 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
         state_edge_first = state_flat.reshape(edge_first_shape)
         permute_to_time_first = (3, 4, 0, 1, 2) + tuple(range(5, len(edge_first_shape)))
         return state_edge_first.permute(permute_to_time_first).contiguous()
+
+    def _build_fft_drive(self, x_seq: torch.Tensor):
+        """Keep the raw drive unexpanded so its FFT is shared by all edges."""
+        spatial_dims = x_seq.dim() - 3
+        spatial_ones = [1] * spatial_dims
+        work_dtype = torch.float64 if x_seq.dtype == torch.float64 else torch.float32
+        edge_gain = self._edge_channel_weight(work_dtype, x_seq.device).view(
+            1,
+            self.branch_degree,
+            self.channels,
+            1,
+            *spatial_ones,
+            1,
+        )
+        comp_gain = self._edge_compartment_input_gain(
+            work_dtype,
+            x_seq.device,
+        ).view(
+            1,
+            self.branch_degree,
+            self.channels,
+            self.compartments_per_branch,
+            *spatial_ones,
+            1,
+        )
+        drive = x_seq.unsqueeze(2).unsqueeze(4)
+        return drive, edge_gain * comp_gain
+
+    def _parallel_integrate_free_window_fft(self, x_seq: torch.Tensor):
+        """Apply branch-shared SPSN windows as causal FFT convolutions."""
+        T = x_seq.shape[0]
+        spatial_dims = x_seq.dim() - 3
+        kernel_length = min(T, self.free_window_order)
+        lag_kernel = self.free_window_weight.flip(-1)[..., :kernel_length]
+        edge_kernel = self._edge_branch_value(lag_kernel)
+        kernel = edge_kernel.view(
+            1,
+            self.branch_degree,
+            self.channels,
+            1,
+            *([1] * spatial_dims),
+            kernel_length,
+        )
+        drive, input_gain = self._build_fft_drive(x_seq)
+        return _causal_fft_convolution_time_first(drive, kernel * input_gain)
+
+    def _parallel_integrate_fft(
+        self,
+        x_seq: torch.Tensor,
+        v_init: torch.Tensor,
+    ):
+        """Apply all exponential compartment filters as FFT convolutions."""
+        if self.no_filter:
+            return self._build_branch_input_sequence(x_seq)
+
+        T = x_seq.shape[0]
+        spatial_dims = x_seq.dim() - 3
+        tau = self._edge_branch_value(self.tau_compartments)
+        kernel, init_factor = self._build_exponential_fft_terms(
+            tau,
+            T,
+            x_seq.dtype,
+            x_seq.device,
+        )
+        kernel = kernel.view(
+            1,
+            self.branch_degree,
+            self.channels,
+            self.compartments_per_branch,
+            *([1] * spatial_dims),
+            T,
+        )
+        drive, input_gain = self._build_fft_drive(x_seq)
+        state_seq = _causal_fft_convolution_time_first(drive, kernel * input_gain)
+
+        init_factor = init_factor.movedim(-1, 0).view(
+            T,
+            1,
+            self.branch_degree,
+            self.channels,
+            self.compartments_per_branch,
+            *([1] * spatial_dims),
+        )
+        init_factor = init_factor.to(dtype=state_seq.dtype)
+        state_seq = state_seq + self.v_rest
+        state_seq = state_seq + init_factor * (v_init.unsqueeze(0) - self.v_rest)
+        return state_seq
 
     def _parallel_integrate(self, branch_input_seq: torch.Tensor, v_init: torch.Tensor):
         if self.no_filter:
@@ -2979,15 +3102,35 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
         if (not self.parallel_forward) or self.detach_state_during_forward:
             return self._sequential_multi_step_forward(x_seq)
 
-        branch_input_seq = self._build_branch_input_sequence(x_seq)
-        if self.free_window_order is not None:
-            state_seq = self._parallel_integrate_free_window(branch_input_seq)
-        else:
-            v_init = self._init_state(branch_input_seq[0])
-            if self.shared_tau_parallel:
-                state_seq = self._parallel_integrate_shared_tau(branch_input_seq, v_init)
+        if self.integration_backend == "fft":
+            branch_input_step = self._build_branch_input(x_seq[0])
+            if self.free_window_order is not None:
+                state_seq = self._parallel_integrate_free_window_fft(x_seq)
             else:
-                state_seq = self._parallel_integrate(branch_input_seq, v_init)
+                v_init = self._init_state(branch_input_step)
+                state_seq = self._parallel_integrate_fft(x_seq, v_init)
+
+            needs_branch_input = (
+                self.branch_readout_mode == "linear" or self.store_branch_monitor
+            )
+            if needs_branch_input:
+                branch_input_seq = (
+                    state_seq
+                    if self.no_filter
+                    else self._build_branch_input_sequence(x_seq)
+                )
+            else:
+                branch_input_seq = None
+        else:
+            branch_input_seq = self._build_branch_input_sequence(x_seq)
+            if self.free_window_order is not None:
+                state_seq = self._parallel_integrate_free_window(branch_input_seq)
+            else:
+                v_init = self._init_state(branch_input_seq[0])
+                if self.shared_tau_parallel:
+                    state_seq = self._parallel_integrate_shared_tau(branch_input_seq, v_init)
+                else:
+                    state_seq = self._parallel_integrate(branch_input_seq, v_init)
         edge_output_seq = self._compute_branch_output_sequence(state_seq, branch_input_seq)
         y_seq = self._merge_edges_sequence(edge_output_seq, x_seq)
 

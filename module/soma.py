@@ -8,6 +8,28 @@ from spikingjelly.activation_based import surrogate
 from spikingjelly.activation_based.base import MemoryModule
 
 
+def _causal_fft_convolution_time_first(
+    x: torch.Tensor,
+    kernel: torch.Tensor,
+) -> torch.Tensor:
+    """Apply a causal temporal kernel without materializing a T x T matrix."""
+    T = x.shape[0]
+    kernel_length = kernel.shape[-1]
+    if T <= 0 or kernel_length <= 0:
+        raise ValueError("x and kernel must have non-empty time dimensions")
+
+    linear_length = T + kernel_length - 1
+    n_fft = 1 << (linear_length - 1).bit_length()
+    work_dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
+    x_work = x.movedim(0, -1).to(dtype=work_dtype)
+    kernel_work = kernel.to(device=x.device, dtype=work_dtype)
+
+    x_f = torch.fft.rfft(x_work, n=n_fft, dim=-1)
+    kernel_f = torch.fft.rfft(kernel_work, n=n_fft, dim=-1)
+    y = torch.fft.irfft(x_f * kernel_f, n=n_fft, dim=-1)[..., :T]
+    return y.movedim(-1, 0).to(dtype=x.dtype)
+
+
 class BaseSoma(neuron.BaseNode):
 
     def __init__(
@@ -102,7 +124,11 @@ class IFNode5(nn.Module):
 
 class MaskedSlidingPSN(nn.Module):
     def gen_gemm_weight(self, T: int):
-        weight = torch.zeros([T, T], device=self.weight.device)
+        weight = torch.zeros(
+            [T, T],
+            device=self.weight.device,
+            dtype=self.weight.dtype,
+        )
         for i in range(T):
             end = i + 1
             start = max(0, i + 1 - self.order)
@@ -114,9 +140,13 @@ class MaskedSlidingPSN(nn.Module):
 
     def __init__(self, order: int, surrogate_function=surrogate.Sigmoid(), exp_init: bool=False, backend='gemm'):
         super().__init__()
+        if order <= 0:
+            raise ValueError("order must be positive")
+        if backend not in ('gemm', 'conv', 'fft'):
+            raise ValueError("backend must be 'gemm', 'conv', or 'fft'")
         self.order = order
         self.backend = backend
-        if self.backend == 'gemm':
+        if self.backend in ('gemm', 'fft'):
             if exp_init:
                 weight = torch.ones([order])
                 for i in range(order - 2, -1, -1):
@@ -156,6 +186,11 @@ class MaskedSlidingPSN(nn.Module):
             x_seq = F.conv1d(x_seq, self.weight, stride=1)
             x_seq = x_seq.squeeze(1).t().view(x_seq_shape)
             return self.surrogate_function(x_seq - self.threshold)
+        elif self.backend == 'fft':
+            kernel_length = min(x_seq.shape[0], self.order)
+            lag_kernel = self.weight.flip(0)[:kernel_length]
+            h_seq = _causal_fft_convolution_time_first(x_seq, lag_kernel)
+            return self.surrogate_function(h_seq + self.threshold)
         else:
             raise NotImplementedError(self.backend)
 
@@ -795,8 +830,8 @@ class PSNIntergerSoma_ssf(neuron.BaseNode):
         )
         if psn_order <= 0:
             raise ValueError("psn_order must be positive")
-        if psn_backend not in ("gemm", "conv"):
-            raise ValueError("psn_backend must be 'gemm' or 'conv'")
+        if psn_backend not in ("gemm", "conv", "fft"):
+            raise ValueError("psn_backend must be 'gemm', 'conv', or 'fft'")
 
         self.psn_order = int(psn_order)
         self.psn_backend = psn_backend
@@ -833,6 +868,12 @@ class PSNIntergerSoma_ssf(neuron.BaseNode):
         if self.psn_backend == "gemm":
             weight = self.gen_gemm_weight(x.shape[0], device=x.device, dtype=x.dtype)
             mem = torch.matmul(weight, x.flatten(1)).view_as(x)
+            return mem + self.psn_threshold.to(device=x.device, dtype=x.dtype)
+
+        if self.psn_backend == "fft":
+            kernel_length = min(x.shape[0], self.psn_order)
+            lag_kernel = self.psn_weight.flip(0)[:kernel_length]
+            mem = _causal_fft_convolution_time_first(x, lag_kernel)
             return mem + self.psn_threshold.to(device=x.device, dtype=x.dtype)
 
         x_shape = x.shape

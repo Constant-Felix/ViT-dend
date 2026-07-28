@@ -51,8 +51,13 @@ class S4LRAConfig:
     dend_soma_num_branches: int = 2
     dend_soma_compartments_per_branch: int = 4
     dend_soma_branch_degree: int = 2
-    dend_soma_psn_order: int = 32
-    dend_soma_psn_backend: str = "gemm"
+    dend_soma_dend_backend: str = "fft"
+    dend_soma_soma_type: str = "masked_sliding_psn"
+    dend_soma_psn_order: Optional[int] = None
+    dend_soma_psn_backend: str = "fft"
+    dend_soma_psn_exp_init: bool = False
+    dend_soma_psn_threshold_init: float = 0.0
+    dend_soma_ssf_thre: int = 4
     backend: str = "official"
 
 
@@ -216,7 +221,7 @@ class DropoutNd(nn.Module):
 
 
 class DendSomaS4Activation(nn.Module):
-    """Adapter from S4 activation tensors to time-first DEND+SOMA tensors."""
+    """Apply the channel-preserving dendrite and a selectable PSN soma."""
 
     def __init__(
         self,
@@ -226,8 +231,13 @@ class DendSomaS4Activation(nn.Module):
         num_branches: int = 2,
         compartments_per_branch: int = 4,
         branch_degree: int = 2,
+        dend_backend: str = "fft",
+        soma_type: str = "masked_sliding_psn",
         psn_order: int = 32,
-        psn_backend: str = "gemm",
+        psn_backend: str = "fft",
+        psn_exp_init: bool = False,
+        psn_threshold_init: float = 0.0,
+        ssf_thre: int = 4,
     ) -> None:
         super().__init__()
         SparseChannelPreservingTrunkDistalDendCompartment = load_local_class(
@@ -235,26 +245,55 @@ class DendSomaS4Activation(nn.Module):
             "_vit_dend_dend_compartment",
             "SparseChannelPreservingTrunkDistalDendCompartment",
         )
-        AstroPSNIntergerSoma_ssf = load_local_class(
-            "module/soma.py",
-            "_vit_dend_soma",
-            "IntergerSoma_ssf",  ##
-        )
+
+        soma_type = soma_type.lower()
+        supported_soma_types = {"masked_sliding_psn", "psn_integer_ssf"}
+        if soma_type not in supported_soma_types:
+            choices = ", ".join(sorted(supported_soma_types))
+            raise ValueError(f"soma_type must be one of: {choices}")
+        if psn_order <= 0:
+            raise ValueError("psn_order must be positive")
+        if psn_backend not in {"gemm", "conv", "fft"}:
+            raise ValueError("psn_backend must be 'gemm', 'conv', or 'fft'")
+        if soma_type == "psn_integer_ssf" and ssf_thre <= 0:
+            raise ValueError("ssf_thre must be positive")
 
         self.d_model = d_model
         self.transposed = transposed
+        self.soma_type = soma_type
         self.dend = SparseChannelPreservingTrunkDistalDendCompartment(
             channels=d_model,
             num_branches=num_branches,
             compartments_per_branch=compartments_per_branch,
             branch_degree=branch_degree,
+            integration_backend=dend_backend,
             step_mode="m",
         )
-        self.soma = AstroPSNIntergerSoma_ssf(
-            psn_order=psn_order,
-            psn_backend=psn_backend,
-            step_mode="m",
-        )
+        if self.soma_type == "masked_sliding_psn":
+            MaskedSlidingPSN = load_local_class(
+                "module/soma.py",
+                "_vit_dend_soma",
+                "MaskedSlidingPSN",
+            )
+            self.soma = MaskedSlidingPSN(
+                order=psn_order,
+                exp_init=psn_exp_init,
+                backend=psn_backend,
+            )
+        else:
+            PSNIntergerSoma_ssf = load_local_class(
+                "module/soma.py",
+                "_vit_dend_soma",
+                "PSNIntergerSoma_ssf",
+            )
+            self.soma = PSNIntergerSoma_ssf(
+                psn_order=psn_order,
+                psn_exp_init=psn_exp_init,
+                psn_backend=psn_backend,
+                psn_threshold_init=psn_threshold_init,
+                thre=ssf_thre,
+                step_mode="m",
+            )
 
     def _reset_state(self) -> None:
         if hasattr(self.dend, "reset"):
@@ -329,14 +368,27 @@ class StandardS4Block(nn.Module):
         dend_soma_num_branches: int = 2,
         dend_soma_compartments_per_branch: int = 4,
         dend_soma_branch_degree: int = 2,
-        dend_soma_psn_order: int = 32,
-        dend_soma_psn_backend: str = "gemm",
+        dend_soma_dend_backend: str = "fft",
+        dend_soma_soma_type: str = "masked_sliding_psn",
+        dend_soma_psn_order: Optional[int] = None,
+        dend_soma_psn_backend: str = "fft",
+        dend_soma_psn_exp_init: bool = False,
+        dend_soma_psn_threshold_init: float = 0.0,
+        dend_soma_ssf_thre: int = 4,
         s4_layer_factory: Optional[S4LayerFactory] = None,
     ) -> None:
         super().__init__()
         self.prenorm = prenorm
         self.norm_kind = norm.lower()
         self.transposed = transposed
+
+        if use_dend_soma_activation and dend_soma_psn_order is None:
+            if l_max is None:
+                raise ValueError(
+                    "dend_soma_psn_order must be set when the sequence length "
+                    "l_max is unknown"
+                )
+            dend_soma_psn_order = l_max
 
         if s4_layer_factory is None:
             s4_layer_factory = DiagonalSSMLayer
@@ -362,8 +414,13 @@ class StandardS4Block(nn.Module):
                     num_branches=dend_soma_num_branches,
                     compartments_per_branch=dend_soma_compartments_per_branch,
                     branch_degree=dend_soma_branch_degree,
+                    dend_backend=dend_soma_dend_backend,
+                    soma_type=dend_soma_soma_type,
                     psn_order=dend_soma_psn_order,
                     psn_backend=dend_soma_psn_backend,
+                    psn_exp_init=dend_soma_psn_exp_init,
+                    psn_threshold_init=dend_soma_psn_threshold_init,
+                    ssf_thre=dend_soma_ssf_thre,
                 ),
             )
         self.dropout = (
@@ -457,11 +514,23 @@ class StandardS4ForLRA(nn.Module):
         dend_soma_num_branches: int = 2,
         dend_soma_compartments_per_branch: int = 4,
         dend_soma_branch_degree: int = 2,
-        dend_soma_psn_order: int = 32,
-        dend_soma_psn_backend: str = "gemm",
+        dend_soma_dend_backend: str = "fft",
+        dend_soma_soma_type: str = "masked_sliding_psn",
+        dend_soma_psn_order: Optional[int] = None,
+        dend_soma_psn_backend: str = "fft",
+        dend_soma_psn_exp_init: bool = False,
+        dend_soma_psn_threshold_init: float = 0.0,
+        dend_soma_ssf_thre: int = 4,
         backend: str = "official",
     ) -> None:
         super().__init__()
+        if use_dend_soma_activation and dend_soma_psn_order is None:
+            if l_max is None:
+                raise ValueError(
+                    "dend_soma_psn_order must be set when the sequence length "
+                    "l_max is unknown"
+                )
+            dend_soma_psn_order = l_max
         self.vocab_size = vocab_size
         self.transposed = transposed
         self.prenorm = prenorm
@@ -490,8 +559,13 @@ class StandardS4ForLRA(nn.Module):
             dend_soma_num_branches=dend_soma_num_branches,
             dend_soma_compartments_per_branch=dend_soma_compartments_per_branch,
             dend_soma_branch_degree=dend_soma_branch_degree,
+            dend_soma_dend_backend=dend_soma_dend_backend,
+            dend_soma_soma_type=dend_soma_soma_type,
             dend_soma_psn_order=dend_soma_psn_order,
             dend_soma_psn_backend=dend_soma_psn_backend,
+            dend_soma_psn_exp_init=dend_soma_psn_exp_init,
+            dend_soma_psn_threshold_init=dend_soma_psn_threshold_init,
+            dend_soma_ssf_thre=dend_soma_ssf_thre,
             backend=backend,
         )
 
@@ -520,8 +594,13 @@ class StandardS4ForLRA(nn.Module):
                     dend_soma_num_branches=dend_soma_num_branches,
                     dend_soma_compartments_per_branch=dend_soma_compartments_per_branch,
                     dend_soma_branch_degree=dend_soma_branch_degree,
+                    dend_soma_dend_backend=dend_soma_dend_backend,
+                    dend_soma_soma_type=dend_soma_soma_type,
                     dend_soma_psn_order=dend_soma_psn_order,
                     dend_soma_psn_backend=dend_soma_psn_backend,
+                    dend_soma_psn_exp_init=dend_soma_psn_exp_init,
+                    dend_soma_psn_threshold_init=dend_soma_psn_threshold_init,
+                    dend_soma_ssf_thre=dend_soma_ssf_thre,
                     s4_layer_factory=s4_layer_factory,
                 )
                 for _ in range(n_layers)

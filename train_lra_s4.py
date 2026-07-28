@@ -295,8 +295,46 @@ def parse_args():
     parser.add_argument("--dend-branches", type=int, default=2)
     parser.add_argument("--dend-compartments", type=int, default=4)
     parser.add_argument("--dend-branch-degree", type=int, default=2)
-    parser.add_argument("--soma-psn-order", type=int, default=32)
-    parser.add_argument("--soma-psn-backend", default="gemm", choices=["gemm", "conv"])
+    parser.add_argument(
+        "--dend-integration-backend",
+        default="fft",
+        choices=["gemm", "fft"],
+    )
+    parser.add_argument(
+        "--soma-type",
+        default="masked_sliding_psn",
+        choices=["masked_sliding_psn", "psn_integer_ssf"],
+        help="Soma used after the channel-preserving dendrite in every S4 block.",
+    )
+    parser.add_argument(
+        "--soma-psn-order",
+        type=int,
+        default=None,
+        help="Temporal window order; defaults to the loaded dataset sequence length.",
+    )
+    parser.add_argument(
+        "--soma-psn-backend",
+        default="fft",
+        choices=["gemm", "conv", "fft"],
+    )
+    parser.add_argument(
+        "--soma-psn-exp-init",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use exponential initialization for the selected PSN when supported.",
+    )
+    parser.add_argument(
+        "--soma-psn-threshold-init",
+        type=float,
+        default=0.0,
+        help="Initial temporal bias for psn_integer_ssf; ignored by masked_sliding_psn.",
+    )
+    parser.add_argument(
+        "--soma-ssf-thre",
+        type=int,
+        default=4,
+        help="Signed SSF clipping level for psn_integer_ssf.",
+    )
     return parser.parse_args()
 
 
@@ -360,6 +398,8 @@ def main() -> None:
     )
     spec = data.spec
     loaders = data.loaders
+    if args.activation == "dend_soma" and args.soma_psn_order is None:
+        args.soma_psn_order = spec.sequence_length
     args.data_pipeline = "official_s4"
     args.training_hparams_source = "MMDEND Appendix C Table 7"
     args.drop_last = True
@@ -381,8 +421,13 @@ def main() -> None:
                 "dend_soma_num_branches": args.dend_branches,
                 "dend_soma_compartments_per_branch": args.dend_compartments,
                 "dend_soma_branch_degree": args.dend_branch_degree,
+                "dend_soma_dend_backend": args.dend_integration_backend,
+                "dend_soma_soma_type": args.soma_type,
                 "dend_soma_psn_order": args.soma_psn_order,
                 "dend_soma_psn_backend": args.soma_psn_backend,
+                "dend_soma_psn_exp_init": args.soma_psn_exp_init,
+                "dend_soma_psn_threshold_init": args.soma_psn_threshold_init,
+                "dend_soma_ssf_thre": args.soma_ssf_thre,
             }
         )
 
@@ -440,6 +485,14 @@ def main() -> None:
 
     print(f"Task={task_key} spec={spec}")
     print(f"Device={device} backend={args.backend} activation={args.activation}")
+    if args.activation == "dend_soma":
+        print(
+            "DEND+SOMA "
+            f"branches={args.dend_branches} compartments={args.dend_compartments} "
+            f"branch_degree={args.dend_branch_degree} "
+            f"dend_backend={args.dend_integration_backend} soma={args.soma_type} "
+            f"psn_order={args.soma_psn_order} psn_backend={args.soma_psn_backend}"
+        )
     print(f"Output dir={output_dir}")
     print(
         "Data pipeline=official S4 "
