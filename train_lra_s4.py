@@ -2,8 +2,8 @@
 
 Dataset preprocessing and undisclosed training details follow the local S4
 repository. Learning rate, weight decay, batch size, and epoch count follow
-MMDEND Appendix C, Table 7. By default the S4 activation is replaced by the
-project's DEND+SOMA module.
+MMDEND Appendix C, Table 7. By default both non-identity S4 activation sites
+use the project's DEND+SOMA modules.
 """
 
 from __future__ import annotations
@@ -225,10 +225,10 @@ def save_checkpoint(state: dict, output_dir: Path, is_best: bool) -> None:
     if is_best:
         torch.save(state, output_dir / "model_best.pth.tar")
 
-# python train_lra_s4.py --task listops --device cuda:3 --lr 0.005 --weight-decay 5e-4 --activation standard    --soma-type psn_integer_ssf
+# python train_lra_s4.py --task listops --device cuda:6 --lr 0.005 --weight-decay 5e-4 --activation standard    --soma-type psn_integer_ssf
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train S4-LRA with optional DEND+SOMA activation."
+        description="Train S4-LRA with optional DEND+SOMA activations."
     )
     parser.add_argument(
         "--task",
@@ -293,7 +293,7 @@ def parse_args():
     )
     parser.add_argument("--zero-pad-embedding", action="store_true", help="Use padding_idx=0 in token embedding.")
 
-    parser.add_argument("--dend-branches", type=int, default=6)
+    parser.add_argument("--dend-branches", type=int, default=8)
     parser.add_argument("--dend-compartments", type=int, default=2)
     parser.add_argument("--dend-branch-degree", type=int, default=1)
     parser.add_argument(
@@ -305,7 +305,10 @@ def parse_args():
         "--soma-type",
         default="masked_sliding_psn",
         choices=["masked_sliding_psn", "psn_integer_ssf"],
-        help="Soma used after the channel-preserving dendrite in every S4 block.",
+        help=(
+            "Soma used after the channel-preserving dendrite at both "
+            "replacement sites in every S4 block."
+        ),
     )
     parser.add_argument(
         "--soma-psn-order",
@@ -335,6 +338,15 @@ def parse_args():
         type=int,
         default=4,
         help="Signed SSF clipping level for psn_integer_ssf.",
+    )
+    parser.add_argument(
+        "--dend-soma-activation-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Recompute each DEND+SOMA activation during backward to reduce "
+            "long-sequence activation memory."
+        ),
     )
     return parser.parse_args()
 
@@ -400,7 +412,7 @@ def main() -> None:
     spec = data.spec
     loaders = data.loaders
     if args.activation == "dend_soma" and args.soma_psn_order is None:
-        args.soma_psn_order = spec.sequence_length
+        args.soma_psn_order = spec.sequence_length // 2  ##
     args.data_pipeline = "official_s4"
     args.training_hparams_source = "MMDEND Appendix C Table 7"
     args.drop_last = True
@@ -429,6 +441,9 @@ def main() -> None:
                 "dend_soma_psn_exp_init": args.soma_psn_exp_init,
                 "dend_soma_psn_threshold_init": args.soma_psn_threshold_init,
                 "dend_soma_ssf_thre": args.soma_ssf_thre,
+                "dend_soma_activation_checkpoint": (
+                    args.dend_soma_activation_checkpoint
+                ),
             }
         )
 
@@ -492,7 +507,8 @@ def main() -> None:
             f"branches={args.dend_branches} compartments={args.dend_compartments} "
             f"branch_degree={args.dend_branch_degree} "
             f"dend_backend={args.dend_integration_backend} soma={args.soma_type} "
-            f"psn_order={args.soma_psn_order} psn_backend={args.soma_psn_backend}"
+            f"psn_order={args.soma_psn_order} psn_backend={args.soma_psn_backend} "
+            f"activation_checkpoint={args.dend_soma_activation_checkpoint}"
         )
     print(f"Output dir={output_dir}")
     print(

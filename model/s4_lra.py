@@ -3,8 +3,8 @@
 MMDEND reports that its LRA experiments follow the S4 architecture from
 Gu et al. and replace the activation layer inside each of 6 S4 blocks with a
 2-branch, 4-compartment MMDEND. This file keeps the original S4-style block by
-default and can optionally replace that activation with the project's
-DEND+SOMA modules.
+default and can optionally replace both of its non-identity activation sites
+with the project's DEND+SOMA modules.
 
 The public S4 repository exposes the paper-faithful optimized S4Block. If that
 repository is on PYTHONPATH, use backend="official". The local fallback below
@@ -20,6 +20,7 @@ from typing import Callable, Dict, Mapping, Optional, Union
 
 import torch
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 
 LayerLR = Union[float, Mapping[str, Optional[float]], None]
@@ -58,6 +59,7 @@ class S4LRAConfig:
     dend_soma_psn_exp_init: bool = False
     dend_soma_psn_threshold_init: float = 0.0
     dend_soma_ssf_thre: int = 4
+    dend_soma_activation_checkpoint: bool = True
     backend: str = "official"
 
 
@@ -86,8 +88,6 @@ def resolve_official_s4block() -> S4LayerFactory:
         dt_min: float = 0.001,
         dt_max: float = 0.1,
         n_ssm: Optional[int] = None,
-        final_act = None,
-        activation = None
     ) -> nn.Module:
         return S4Block(
             d_model,
@@ -102,8 +102,6 @@ def resolve_official_s4block() -> S4LayerFactory:
             init="legs",
             bidirectional=bidirectional,
             n_ssm=n_ssm,
-            final_act=final_act,
-            activation=activation
         )
 
     return factory
@@ -242,6 +240,7 @@ class DendSomaS4Activation(nn.Module):
         psn_exp_init: bool = False,
         psn_threshold_init: float = 0.0,
         ssf_thre: int = 4,
+        activation_checkpoint: bool = True,
     ) -> None:
         super().__init__()
         SparseChannelPreservingTrunkDistalDendCompartment = load_local_class(
@@ -265,6 +264,7 @@ class DendSomaS4Activation(nn.Module):
         self.d_model = d_model
         self.transposed = transposed
         self.soma_type = soma_type
+        self.activation_checkpoint = bool(activation_checkpoint)
         self.dend = SparseChannelPreservingTrunkDistalDendCompartment(
             channels=d_model,
             num_branches=num_branches,
@@ -305,11 +305,28 @@ class DendSomaS4Activation(nn.Module):
         if hasattr(self.soma, "reset"):
             self.soma.reset()
 
+    def _forward_time_first(self, x_seq: Tensor) -> Tensor:
+        # Reset inside the checkpointed region so backward recomputation starts
+        # from the same zero-state trajectory as the original forward pass.
+        self._reset_state()
+        return self.soma(self.dend(x_seq))
+
+    def _apply_time_first(self, x_seq: Tensor) -> Tensor:
+        if (
+            self.activation_checkpoint
+            and self.training
+            and torch.is_grad_enabled()
+        ):
+            return checkpoint(
+                self._forward_time_first,
+                x_seq,
+                use_reentrant=False,
+            )
+        return self._forward_time_first(x_seq)
+
     def forward(self, x: Tensor) -> Tensor:
         if x.dim() != 3:
             raise ValueError(f"Expected 3D S4 activation input, got {tuple(x.shape)}")
-
-        self._reset_state()
 
         if self.transposed:
             if x.size(1) != self.d_model:
@@ -318,7 +335,7 @@ class DendSomaS4Activation(nn.Module):
                     f"got {tuple(x.shape)}"
                 )
             x_seq = x.permute(2, 0, 1).contiguous()
-            y_seq = self.soma(self.dend(x_seq))
+            y_seq = self._apply_time_first(x_seq)
             return y_seq.permute(1, 2, 0).contiguous()
 
         if x.size(-1) != self.d_model:
@@ -326,21 +343,60 @@ class DendSomaS4Activation(nn.Module):
                 f"Expected input shape (B, L, {self.d_model}), got {tuple(x.shape)}"
             )
         x_seq = x.transpose(0, 1).contiguous()
-        y_seq = self.soma(self.dend(x_seq))
+        y_seq = self._apply_time_first(x_seq)
         return y_seq.transpose(0, 1).contiguous()
 
 
-def replace_s4_activation(s4_module: nn.Module, activation: nn.Module) -> None: ###
-    """Replace the main activation inside an S4 layer/block."""
+class DendSomaGLUGate(nn.Module):
+    """Preserve the GLU ``2H -> H`` contract with a DEND+SOMA gate."""
 
-    if hasattr(s4_module, "final_act"):
-        s4_module.final_act = activation
-        return
+    def __init__(self, gate_activation: nn.Module, dim: int = -1) -> None:
+        super().__init__()
+        self.gate_activation = gate_activation
+        self.dim = int(dim)
+
+    def forward(self, x: Tensor) -> Tensor:
+        if x.size(self.dim) % 2 != 0:
+            raise ValueError(
+                "DendSomaGLUGate requires an even feature dimension, "
+                f"got shape {tuple(x.shape)} along dim={self.dim}"
+            )
+        value, gate = x.chunk(2, dim=self.dim)
+        return value * self.gate_activation(gate)
+
+
+def replace_s4_activations(
+    s4_module: nn.Module,
+    main_activation: nn.Module,
+    final_gate_activation: nn.Module,
+) -> None:
+    """Replace the main GELU and the sigmoid gate inside the final GLU."""
+
+    if hasattr(s4_module, "layer") and hasattr(s4_module.layer, "activation"):
+        s4_module.layer.activation = main_activation
+    elif hasattr(s4_module, "activation"):
+        s4_module.activation = main_activation
     else:
         raise AttributeError(
-            "Could not find the S4 activation to replace. Expected either "
+            "Could not find the main S4 activation. Expected either "
             "`s4.layer.activation` or `s4.activation`."
         )
+
+    output_linear = getattr(s4_module, "output_linear", None)
+    if not isinstance(output_linear, nn.Sequential) or len(output_linear) < 2:
+        raise AttributeError(
+            "Expected the S4 output transform to be Linear/Conv + GLU."
+        )
+    original_final_activation = output_linear[-1]
+    if not isinstance(original_final_activation, nn.GLU):
+        raise TypeError(
+            "Expected the final S4 activation to be nn.GLU, got "
+            f"{type(original_final_activation).__name__}."
+        )
+    output_linear[-1] = DendSomaGLUGate(
+        final_gate_activation,
+        dim=original_final_activation.dim,
+    )
 
 
 class StandardS4Block(nn.Module):
@@ -377,6 +433,7 @@ class StandardS4Block(nn.Module):
         dend_soma_psn_exp_init: bool = False,
         dend_soma_psn_threshold_init: float = 0.0,
         dend_soma_ssf_thre: int = 4,
+        dend_soma_activation_checkpoint: bool = True,
         s4_layer_factory: Optional[S4LayerFactory] = None,
     ) -> None:
         super().__init__()
@@ -394,63 +451,47 @@ class StandardS4Block(nn.Module):
 
         if s4_layer_factory is None:
             s4_layer_factory = DiagonalSSMLayer
-        if not use_dend_soma_activation:    
-            self.s4 = s4_layer_factory(
-                d_model,
-                d_state,
-                dropout,
-                transposed,
-                tie_dropout=tie_dropout,
-                bidirectional=bidirectional,
-                l_max=l_max,
-                layer_lr=layer_lr,
-                dt_min=dt_min,
-                dt_max=dt_max,
-                n_ssm=n_ssm,
-            )
-        else:
-            self.s4 = s4_layer_factory(
-                d_model,
-                d_state,
-                dropout,
-                transposed,
-                tie_dropout=tie_dropout,
-                bidirectional=bidirectional,
-                l_max=l_max,
-                layer_lr=layer_lr,
-                dt_min=dt_min,
-                dt_max=dt_max,
-                n_ssm=n_ssm,
-                activation=DendSomaS4Activation(
+        self.s4 = s4_layer_factory(
+            d_model,
+            d_state,
+            dropout,
+            transposed,
+            tie_dropout=tie_dropout,
+            bidirectional=bidirectional,
+            l_max=l_max,
+            layer_lr=layer_lr,
+            dt_min=dt_min,
+            dt_max=dt_max,
+            n_ssm=n_ssm,
+        )
+        if use_dend_soma_activation:
+            activation_transposed = isinstance(self.s4, DiagonalSSMLayer)
+            activation_kwargs = {
+                "transposed": activation_transposed,
+                "num_branches": dend_soma_num_branches,
+                "compartments_per_branch": dend_soma_compartments_per_branch,
+                "branch_degree": dend_soma_branch_degree,
+                "dend_backend": dend_soma_dend_backend,
+                "soma_type": dend_soma_soma_type,
+                "psn_order": dend_soma_psn_order,
+                "psn_backend": dend_soma_psn_backend,
+                "psn_exp_init": dend_soma_psn_exp_init,
+                "psn_threshold_init": dend_soma_psn_threshold_init,
+                "ssf_thre": dend_soma_ssf_thre,
+                "activation_checkpoint": dend_soma_activation_checkpoint,
+            }
+            replace_s4_activations(
+                self.s4,
+                main_activation=DendSomaS4Activation(
                     d_model,
-                    transposed=False,
-                    num_branches=dend_soma_num_branches,
-                    compartments_per_branch=dend_soma_compartments_per_branch,
-                    branch_degree=dend_soma_branch_degree,
-                    dend_backend=dend_soma_dend_backend,
-                    soma_type=dend_soma_soma_type,
-                    psn_order=dend_soma_psn_order,
-                    psn_backend=dend_soma_psn_backend,
-                    psn_exp_init=dend_soma_psn_exp_init,
-                    psn_threshold_init=dend_soma_psn_threshold_init,
-                    ssf_thre=dend_soma_ssf_thre,
+                    **activation_kwargs,
                 ),
-                final_act=DendSomaS4Activation(
+                final_gate_activation=DendSomaS4Activation(
                     d_model,
-                    transposed=False,
-                    num_branches=dend_soma_num_branches,
-                    compartments_per_branch=dend_soma_compartments_per_branch,
-                    branch_degree=dend_soma_branch_degree,
-                    dend_backend=dend_soma_dend_backend,
-                    soma_type=dend_soma_soma_type,
-                    psn_order=dend_soma_psn_order,
-                    psn_backend=dend_soma_psn_backend,
-                    psn_exp_init=dend_soma_psn_exp_init,
-                    psn_threshold_init=dend_soma_psn_threshold_init,
-                    ssf_thre=dend_soma_ssf_thre,
-                )
-            )    
-        
+                    **activation_kwargs,
+                ),
+            )
+
         self.dropout = (
             DropoutNd(dropout, tie=True, transposed=transposed)
             if tie_dropout and dropout > 0.0
@@ -549,6 +590,7 @@ class StandardS4ForLRA(nn.Module):
         dend_soma_psn_exp_init: bool = False,
         dend_soma_psn_threshold_init: float = 0.0,
         dend_soma_ssf_thre: int = 4,
+        dend_soma_activation_checkpoint: bool = True,
         backend: str = "official",
     ) -> None:
         super().__init__()
@@ -594,6 +636,7 @@ class StandardS4ForLRA(nn.Module):
             dend_soma_psn_exp_init=dend_soma_psn_exp_init,
             dend_soma_psn_threshold_init=dend_soma_psn_threshold_init,
             dend_soma_ssf_thre=dend_soma_ssf_thre,
+            dend_soma_activation_checkpoint=dend_soma_activation_checkpoint,
             backend=backend,
         )
 
@@ -629,6 +672,7 @@ class StandardS4ForLRA(nn.Module):
                     dend_soma_psn_exp_init=dend_soma_psn_exp_init,
                     dend_soma_psn_threshold_init=dend_soma_psn_threshold_init,
                     dend_soma_ssf_thre=dend_soma_ssf_thre,
+                    dend_soma_activation_checkpoint=dend_soma_activation_checkpoint,
                     s4_layer_factory=s4_layer_factory,
                 )
                 for _ in range(n_layers)
@@ -835,7 +879,7 @@ def build_dend_soma_s4_lra(
     backend: str = "official",
     **overrides,
 ) -> StandardS4ForLRA:
-    """Build the LRA S4 backbone with DEND+SOMA replacing each S4 activation."""
+    """Build LRA S4 with DEND+SOMA at both activation sites per block."""
 
     overrides.setdefault("use_dend_soma_activation", True)
     return build_standard_s4_lra(
@@ -846,3 +890,4 @@ def build_dend_soma_s4_lra(
         backend=backend,
         **overrides,
     )
+
