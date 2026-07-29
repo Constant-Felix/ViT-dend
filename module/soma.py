@@ -6,13 +6,13 @@ from spikingjelly.activation_based import neuron as ner
 from spikingjelly.activation_based import neuron
 from spikingjelly.activation_based import surrogate
 from spikingjelly.activation_based.base import MemoryModule
+from torch.utils.checkpoint import checkpoint
 
 
-def _causal_fft_convolution_time_first(
+def _causal_fft_convolution_impl(
     x: torch.Tensor,
     kernel: torch.Tensor,
 ) -> torch.Tensor:
-    """Apply a causal temporal kernel without materializing a T x T matrix."""
     T = x.shape[0]
     kernel_length = kernel.shape[-1]
     if T <= 0 or kernel_length <= 0:
@@ -26,8 +26,27 @@ def _causal_fft_convolution_time_first(
 
     x_f = torch.fft.rfft(x_work, n=n_fft, dim=-1)
     kernel_f = torch.fft.rfft(kernel_work, n=n_fft, dim=-1)
-    y = torch.fft.irfft(x_f * kernel_f, n=n_fft, dim=-1)[..., :T]
+    # Materialize the causal crop. A plain slice would retain the complete
+    # zero-padded irfft storage, which is close to 2T when P is close to T.
+    y = torch.fft.irfft(x_f * kernel_f, n=n_fft, dim=-1)[..., :T].clone(
+        memory_format=torch.contiguous_format
+    )
     return y.movedim(-1, 0).to(dtype=x.dtype)
+
+
+def _causal_fft_convolution_time_first(
+    x: torch.Tensor,
+    kernel: torch.Tensor,
+) -> torch.Tensor:
+    """Apply a causal kernel while recomputing FFT workspaces in backward."""
+    if torch.is_grad_enabled() and (x.requires_grad or kernel.requires_grad):
+        return checkpoint(
+            _causal_fft_convolution_impl,
+            x,
+            kernel,
+            use_reentrant=False,
+        )
+    return _causal_fft_convolution_impl(x, kernel)
 
 
 class BaseSoma(neuron.BaseNode):

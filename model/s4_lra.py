@@ -86,6 +86,8 @@ def resolve_official_s4block() -> S4LayerFactory:
         dt_min: float = 0.001,
         dt_max: float = 0.1,
         n_ssm: Optional[int] = None,
+        final_act = None,
+        activation = None
     ) -> nn.Module:
         return S4Block(
             d_model,
@@ -100,6 +102,8 @@ def resolve_official_s4block() -> S4LayerFactory:
             init="legs",
             bidirectional=bidirectional,
             n_ssm=n_ssm,
+            final_act=final_act,
+            activation=activation
         )
 
     return factory
@@ -326,19 +330,17 @@ class DendSomaS4Activation(nn.Module):
         return y_seq.transpose(0, 1).contiguous()
 
 
-def replace_s4_activation(s4_module: nn.Module, activation: nn.Module) -> None:
+def replace_s4_activation(s4_module: nn.Module, activation: nn.Module) -> None: ###
     """Replace the main activation inside an S4 layer/block."""
 
-    if hasattr(s4_module, "layer") and hasattr(s4_module.layer, "activation"):
-        s4_module.layer.activation = activation
+    if hasattr(s4_module, "final_act"):
+        s4_module.final_act = activation
         return
-    if hasattr(s4_module, "activation"):
-        s4_module.activation = activation
-        return
-    raise AttributeError(
-        "Could not find the S4 activation to replace. Expected either "
-        "`s4.layer.activation` or `s4.activation`."
-    )
+    else:
+        raise AttributeError(
+            "Could not find the S4 activation to replace. Expected either "
+            "`s4.layer.activation` or `s4.activation`."
+        )
 
 
 class StandardS4Block(nn.Module):
@@ -392,25 +394,36 @@ class StandardS4Block(nn.Module):
 
         if s4_layer_factory is None:
             s4_layer_factory = DiagonalSSMLayer
-        self.s4 = s4_layer_factory(
-            d_model,
-            d_state,
-            dropout,
-            transposed,
-            tie_dropout=tie_dropout,
-            bidirectional=bidirectional,
-            l_max=l_max,
-            layer_lr=layer_lr,
-            dt_min=dt_min,
-            dt_max=dt_max,
-            n_ssm=n_ssm,
-        )
-        if use_dend_soma_activation:
-            replace_s4_activation(
-                self.s4,
-                DendSomaS4Activation(
+        if not use_dend_soma_activation:    
+            self.s4 = s4_layer_factory(
+                d_model,
+                d_state,
+                dropout,
+                transposed,
+                tie_dropout=tie_dropout,
+                bidirectional=bidirectional,
+                l_max=l_max,
+                layer_lr=layer_lr,
+                dt_min=dt_min,
+                dt_max=dt_max,
+                n_ssm=n_ssm,
+            )
+        else:
+            self.s4 = s4_layer_factory(
+                d_model,
+                d_state,
+                dropout,
+                transposed,
+                tie_dropout=tie_dropout,
+                bidirectional=bidirectional,
+                l_max=l_max,
+                layer_lr=layer_lr,
+                dt_min=dt_min,
+                dt_max=dt_max,
+                n_ssm=n_ssm,
+                activation=DendSomaS4Activation(
                     d_model,
-                    transposed=isinstance(self.s4, DiagonalSSMLayer),
+                    transposed=False,
                     num_branches=dend_soma_num_branches,
                     compartments_per_branch=dend_soma_compartments_per_branch,
                     branch_degree=dend_soma_branch_degree,
@@ -422,7 +435,22 @@ class StandardS4Block(nn.Module):
                     psn_threshold_init=dend_soma_psn_threshold_init,
                     ssf_thre=dend_soma_ssf_thre,
                 ),
-            )
+                final_act=DendSomaS4Activation(
+                    d_model,
+                    transposed=False,
+                    num_branches=dend_soma_num_branches,
+                    compartments_per_branch=dend_soma_compartments_per_branch,
+                    branch_degree=dend_soma_branch_degree,
+                    dend_backend=dend_soma_dend_backend,
+                    soma_type=dend_soma_soma_type,
+                    psn_order=dend_soma_psn_order,
+                    psn_backend=dend_soma_psn_backend,
+                    psn_exp_init=dend_soma_psn_exp_init,
+                    psn_threshold_init=dend_soma_psn_threshold_init,
+                    ssf_thre=dend_soma_ssf_thre,
+                )
+            )    
+        
         self.dropout = (
             DropoutNd(dropout, tie=True, transposed=transposed)
             if tie_dropout and dropout > 0.0

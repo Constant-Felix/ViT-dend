@@ -225,6 +225,7 @@ def save_checkpoint(state: dict, output_dir: Path, is_best: bool) -> None:
     if is_best:
         torch.save(state, output_dir / "model_best.pth.tar")
 
+# python train_lra_s4.py --task listops --device cuda:3 --lr 0.005 --weight-decay 5e-4 --activation standard    --soma-type psn_integer_ssf
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Train S4-LRA with optional DEND+SOMA activation."
@@ -292,9 +293,9 @@ def parse_args():
     )
     parser.add_argument("--zero-pad-embedding", action="store_true", help="Use padding_idx=0 in token embedding.")
 
-    parser.add_argument("--dend-branches", type=int, default=2)
-    parser.add_argument("--dend-compartments", type=int, default=4)
-    parser.add_argument("--dend-branch-degree", type=int, default=2)
+    parser.add_argument("--dend-branches", type=int, default=6)
+    parser.add_argument("--dend-compartments", type=int, default=2)
+    parser.add_argument("--dend-branch-degree", type=int, default=1)
     parser.add_argument(
         "--dend-integration-backend",
         default="fft",
@@ -588,7 +589,7 @@ def main() -> None:
 
     best_path = output_dir / "model_best.pth.tar"
     if best_path.exists():
-        best = torch.load(best_path, map_location=device)
+        best = torch.load(best_path, map_location=device,weights_only=False)
         model.load_state_dict(best["state_dict"])
     test_loss, test_acc = run_epoch(
         loaders["test"],
