@@ -2304,7 +2304,7 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
         detach_state_during_forward: bool = False,
         parallel_forward: bool = True,
         shared_tau_parallel: bool = True,
-        integration_backend: str = "gemm",
+        integration_backend: str = "fft",
         branch_readout_mode: str = "trunk_distal",
         free_window_order: Optional[int] = None,
     ):

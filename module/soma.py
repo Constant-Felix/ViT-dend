@@ -157,7 +157,7 @@ class MaskedSlidingPSN(nn.Module):
         return weight
 
 
-    def __init__(self, order: int, surrogate_function=surrogate.Sigmoid(), exp_init: bool=False, backend='gemm'):
+    def __init__(self, order: int, surrogate_function=surrogate.Sigmoid(), exp_init: bool=False, backend='fft'):
         super().__init__()
         if order <= 0:
             raise ValueError("order must be positive")
@@ -837,7 +837,7 @@ class PSNIntergerSoma_ssf(neuron.BaseNode):
         self,
         psn_order: int = 32,
         psn_exp_init: bool = False,
-        psn_backend: str = "gemm",
+        psn_backend: str = "fft",
         psn_threshold_init: float = 0.0,
         tau: float = 2.,
         v_threshold: float = 1., v_reset: float = 0., detach_reset: bool = True,

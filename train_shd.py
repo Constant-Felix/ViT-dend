@@ -77,9 +77,46 @@ class DropoutNd(nn.Module):
         if not self.transposed:
             x = rearrange(x, 'b d ... -> b ... d')
         return x
+
+
+class DendSomaNeuron(nn.Module):
+    def __init__(self, channels, T, neuron_lr, soma_type='masked'):
+        super().__init__()
+        self.channels = channels
+        self.T = T
+        self.dend = SparseChannelPreservingTrunkDistalDendCompartment(
+            channels=channels,
+            num_branches=8,
+            compartments_per_branch=4,
+            branch_degree=1,
+            learn_comp_gain=True,
+            learn_edge_gain=True,
+            merge_norm='mean',
+        )
+        if soma_type == 'masked':
+            self.soma = MaskedSlidingPSN(order=T, exp_init=True)
+        elif soma_type == 'psn_ssf':
+            self.soma = PSNIntergerSoma_ssf(psn_order=T, psn_exp_init=True)
+        else:
+            raise ValueError(f'Unsupported soma type: {soma_type}')
+
+        module = self.soma
+        for parameter in module.parameters():
+            parameter._optim = {'lr': neuron_lr}
+
+    def forward(self, x):
+        if x.dim() != 2 or x.shape[0] % self.T != 0:
+            raise ValueError(f'Expected flattened input [T * B, C], got {tuple(x.shape)}')
+        x = x.reshape(self.T, -1, self.channels)
+        self.dend.reset()
+        if hasattr(self.soma, 'reset'):
+            self.soma.reset()
+        x = self.dend(x)
+        x = self.soma(x)
+        return x.flatten(0, 1)
     
 class SHDNet_ours(nn.Module):
-    def __init__(self, lr, d_state, d_input, d_model, d_out, T, dropout=0.2, bn=False):
+    def __init__(self, lr, d_state, d_input, d_model, d_out, T, dropout=0.2, bn=False, soma_type='masked'):
         super().__init__()
         self.lr = lr
         self.d_state = d_state
@@ -89,21 +126,21 @@ class SHDNet_ours(nn.Module):
             self.hidden1 = nn.Sequential(
                 nn.Linear(d_input, d_model),
                 nn.BatchNorm1d(d_model),
-                PMSN_neuron(d_model=d_model, lr=self.lr, d_state=self.d_state, T=T),
+                DendSomaNeuron(channels=d_model, T=T, neuron_lr=self.lr, soma_type=soma_type),
             )
             self.hidden2 = nn.Sequential(
                 nn.Linear(d_model, d_model),
                 nn.BatchNorm1d(d_model),
-                PMSN_neuron(d_model=d_model, lr=self.lr, d_state=self.d_state, T=T),
+                DendSomaNeuron(channels=d_model, T=T, neuron_lr=self.lr, soma_type=soma_type),
             )
         else:
             self.hidden1 = nn.Sequential(
                 nn.Linear(d_input, d_model),
-                PMSN_neuron(d_model=d_model, lr=self.lr, d_state=self.d_state, T=T),
+                DendSomaNeuron(channels=d_model, T=T, neuron_lr=self.lr, soma_type=soma_type),
             )
             self.hidden2 = nn.Sequential(
                 nn.Linear(d_model, d_model),
-                PMSN_neuron(d_model=d_model, lr=self.lr, d_state=self.d_state, T=T),
+                DendSomaNeuron(channels=d_model, T=T, neuron_lr=self.lr, soma_type=soma_type),
             )
 
         self.fc = nn.Sequential(nn.Linear(d_model, d_out))
@@ -127,7 +164,8 @@ class SHDNet_ours(nn.Module):
 
         out_spikes_counter = x.view(T, B, -1)
         return out_spikes_counter.mean(dim=0)
-    
+
+# python train_shd.py --soma masked --data_path /data/hyx/ViT-dend/data/shd/data_shd/download --dropout 0.1 --lr 0.005 --neuron_lr 0.005 --dropout 0.1
 def parse_args():
     parser = argparse.ArgumentParser(description='SHD PMSN Training')
 
@@ -144,6 +182,7 @@ def parse_args():
     parser.add_argument('--d_state', '--d-state', default=4, type=int, help='PMSN state dimension')
     parser.add_argument('--dropout', default=0.2, type=float, help='Dropout')
     parser.add_argument('--T', default=250, type=int, help='Number of time steps')
+    parser.add_argument('--soma', choices=('masked', 'psn_ssf'), default='masked')
 
     parser.add_argument('--data_path', default='/data/hyx/ViT-dend/data/shd', type=str, help='SHD dataset root path')
     parser.add_argument('--ckpt_path', '--ckpt-path', default='exp/shd', type=str, help='Checkpoint path')
@@ -170,6 +209,7 @@ def build_model(args, device):
         dropout=args.dropout,
         lr=args.neuron_lr,
         T=args.T,
+        soma_type=args.soma,
     ).to(device)
 
 
