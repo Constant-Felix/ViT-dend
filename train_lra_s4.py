@@ -1,9 +1,11 @@
 """Train S4/MMDEND-style models on official-S4 Long Range Arena data.
 
 Dataset preprocessing and undisclosed training details follow the local S4
-repository. Learning rate, weight decay, batch size, and epoch count follow
-MMDEND Appendix C, Table 7. By default both non-identity S4 activation sites
-use the project's DEND+SOMA modules.
+repository. Base learning rate, base weight decay, batch size, and epoch count
+follow MMDEND Appendix C, Table 7. DEND and SOMA use dedicated optimizer
+groups. By default the activation immediately after FFTConv in each S4 block
+uses the project's DEND+SOMA module; the output GLU and residual path retain
+their original S4 definitions.
 """
 
 from __future__ import annotations
@@ -83,27 +85,132 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def setup_optimizer(model: nn.Module, lr: float, weight_decay: float) -> optim.Optimizer:
-    """Create AdamW groups, respecting S4 parameters with custom ``_optim`` attrs."""
+def setup_optimizer(
+    model: nn.Module,
+    lr: float,
+    weight_decay: float,
+    *,
+    dend_lr: float = 1e-3,
+    dend_weight_decay: float = 0.0,
+    soma_lr: float = 5e-4,
+    soma_weight_decay: float = 0.0,
+) -> optim.Optimizer:
+    """Create disjoint AdamW groups for base, S4, DEND, and SOMA parameters."""
 
-    all_parameters = list(model.parameters())
-    base_params = [p for p in all_parameters if not hasattr(p, "_optim")]
-    defaults = {"lr": lr, "weight_decay": weight_decay, "betas": (0.9, 0.999)}
-    optimizer = optim.AdamW(base_params, **defaults)
+    hyperparameters = {
+        "lr": lr,
+        "weight_decay": weight_decay,
+        "dend_lr": dend_lr,
+        "dend_weight_decay": dend_weight_decay,
+        "soma_lr": soma_lr,
+        "soma_weight_decay": soma_weight_decay,
+    }
+    for name, value in hyperparameters.items():
+        if value < 0.0:
+            raise ValueError(f"{name} must be non-negative, got {value}")
 
-    hps = [getattr(p, "_optim") for p in all_parameters if hasattr(p, "_optim")]
-    hps = [
-        dict(items)
-        for items in sorted(dict.fromkeys(frozenset(hp.items()) for hp in hps))
+    named_parameters = [
+        (name, parameter)
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
     ]
-    for hp in hps:
-        params = [p for p in all_parameters if getattr(p, "_optim", None) == hp]
-        optimizer.add_param_group({"params": params, **defaults, **hp})
 
-    keys = sorted({key for hp in hps for key in hp})
-    for i, group in enumerate(optimizer.param_groups):
-        group_hps = " ".join(f"{key}={group.get(key, None)}" for key in keys)
-        print(f"Optimizer group {i}: {len(group['params'])} tensors {group_hps}".rstrip())
+    def belongs_to(name: str, component: str) -> bool:
+        return component in name.split(".")
+
+    dend_parameters = [
+        parameter
+        for name, parameter in named_parameters
+        if belongs_to(name, "dend")
+    ]
+    soma_parameters = [
+        parameter
+        for name, parameter in named_parameters
+        if belongs_to(name, "soma")
+    ]
+    component_ids = {
+        id(parameter) for parameter in dend_parameters + soma_parameters
+    }
+
+    s4_parameters = [
+        parameter
+        for _, parameter in named_parameters
+        if id(parameter) not in component_ids and hasattr(parameter, "_optim")
+    ]
+    base_parameters = [
+        parameter
+        for _, parameter in named_parameters
+        if id(parameter) not in component_ids and not hasattr(parameter, "_optim")
+    ]
+
+    parameter_groups = []
+    if base_parameters:
+        parameter_groups.append(
+            {"params": base_parameters, "group_name": "base"}
+        )
+
+    s4_hyperparameters = []
+    seen_s4_hyperparameters = set()
+    for parameter in s4_parameters:
+        custom = getattr(parameter, "_optim")
+        key = frozenset(custom.items())
+        if key not in seen_s4_hyperparameters:
+            seen_s4_hyperparameters.add(key)
+            s4_hyperparameters.append(custom)
+    for index, custom in enumerate(s4_hyperparameters):
+        parameters = [
+            parameter
+            for parameter in s4_parameters
+            if getattr(parameter, "_optim") == custom
+        ]
+        parameter_groups.append(
+            {
+                "params": parameters,
+                "group_name": f"s4_custom_{index}",
+                **custom,
+            }
+        )
+
+    if dend_parameters:
+        parameter_groups.append(
+            {
+                "params": dend_parameters,
+                "group_name": "dend",
+                "lr": dend_lr,
+                "weight_decay": dend_weight_decay,
+            }
+        )
+    if soma_parameters:
+        parameter_groups.append(
+            {
+                "params": soma_parameters,
+                "group_name": "soma",
+                "lr": soma_lr,
+                "weight_decay": soma_weight_decay,
+            }
+        )
+
+    assigned_ids = [
+        id(parameter)
+        for group in parameter_groups
+        for parameter in group["params"]
+    ]
+    expected_ids = {id(parameter) for _, parameter in named_parameters}
+    if len(assigned_ids) != len(set(assigned_ids)):
+        raise RuntimeError("A parameter was assigned to more than one optimizer group")
+    if set(assigned_ids) != expected_ids:
+        raise RuntimeError("Some trainable parameters were not assigned to an optimizer group")
+
+    defaults = {"lr": lr, "weight_decay": weight_decay, "betas": (0.9, 0.999)}
+    optimizer = optim.AdamW(parameter_groups, **defaults)
+
+    for index, group in enumerate(optimizer.param_groups):
+        parameter_count = sum(parameter.numel() for parameter in group["params"])
+        print(
+            f"Optimizer group {index} ({group['group_name']}): "
+            f"{len(group['params'])} tensors {parameter_count} parameters "
+            f"lr={group['lr']} weight_decay={group['weight_decay']}"
+        )
 
     return optimizer
 
@@ -225,7 +332,7 @@ def save_checkpoint(state: dict, output_dir: Path, is_best: bool) -> None:
     if is_best:
         torch.save(state, output_dir / "model_best.pth.tar")
 
-# python train_lra_s4.py --task listops --device cuda:6 --lr 0.005 --weight-decay 5e-4 --activation standard    --soma-type psn_integer_ssf
+# python train_lra_s4.py --task cifar --device cuda:4 --lr 0.005 --weight-decay 5e-4 --activation standard    --soma-type psn_integer_ssf
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Train S4-LRA with optional DEND+SOMA activations."
@@ -294,8 +401,22 @@ def parse_args():
     parser.add_argument("--zero-pad-embedding", action="store_true", help="Use padding_idx=0 in token embedding.")
 
     parser.add_argument("--dend-branches", type=int, default=8)
-    parser.add_argument("--dend-compartments", type=int, default=2)
-    parser.add_argument("--dend-branch-degree", type=int, default=1)
+    parser.add_argument("--dend-compartments", type=int, default=4)
+    parser.add_argument("--dend-branch-degree", type=int, default=2)
+    parser.add_argument(
+        "--dend-lr",
+        type=float,
+        default=1e-3,
+        help="Peak learning rate for all trainable DEND parameters.",
+    )
+    parser.add_argument(
+        "--dend-weight-decay",
+        "--dend-wd",
+        dest="dend_weight_decay",
+        type=float,
+        default=0.0,
+        help="AdamW weight decay for DEND parameters.",
+    )
     parser.add_argument(
         "--dend-integration-backend",
         default="fft",
@@ -306,9 +427,23 @@ def parse_args():
         default="masked_sliding_psn",
         choices=["masked_sliding_psn", "psn_integer_ssf"],
         help=(
-            "Soma used after the channel-preserving dendrite at both "
-            "replacement sites in every S4 block."
+            "Soma used after the channel-preserving dendrite that replaces "
+            "the post-FFTConv activation in every S4 block."
         ),
+    )
+    parser.add_argument(
+        "--soma-lr",
+        type=float,
+        default=5e-4,
+        help="Peak learning rate for all trainable SOMA parameters.",
+    )
+    parser.add_argument(
+        "--soma-weight-decay",
+        "--soma-wd",
+        dest="soma_weight_decay",
+        type=float,
+        default=0.0,
+        help="AdamW weight decay for SOMA parameters.",
     )
     parser.add_argument(
         "--soma-psn-order",
@@ -412,9 +547,11 @@ def main() -> None:
     spec = data.spec
     loaders = data.loaders
     if args.activation == "dend_soma" and args.soma_psn_order is None:
-        args.soma_psn_order = spec.sequence_length // 2  ##
+        args.soma_psn_order = spec.sequence_length  ##
     args.data_pipeline = "official_s4"
     args.training_hparams_source = "MMDEND Appendix C Table 7"
+    if args.activation == "dend_soma":
+        args.training_hparams_source += " with dedicated DEND/SOMA optimizer groups"
     args.drop_last = True
     args.pin_memory = True
     args.validation_uses_test = data.validation_uses_test
@@ -464,7 +601,15 @@ def main() -> None:
     ).to(device)
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = setup_optimizer(model, args.lr, args.weight_decay)
+    optimizer = setup_optimizer(
+        model,
+        args.lr,
+        args.weight_decay,
+        dend_lr=args.dend_lr,
+        dend_weight_decay=args.dend_weight_decay,
+        soma_lr=args.soma_lr,
+        soma_weight_decay=args.soma_weight_decay,
+    )
     scheduler, scheduler_interval = build_scheduler(
         optimizer,
         args.scheduler,
@@ -506,7 +651,10 @@ def main() -> None:
             "DEND+SOMA "
             f"branches={args.dend_branches} compartments={args.dend_compartments} "
             f"branch_degree={args.dend_branch_degree} "
-            f"dend_backend={args.dend_integration_backend} soma={args.soma_type} "
+            f"dend_backend={args.dend_integration_backend} "
+            f"dend_lr={args.dend_lr} dend_wd={args.dend_weight_decay} "
+            f"soma={args.soma_type} soma_lr={args.soma_lr} "
+            f"soma_wd={args.soma_weight_decay} "
             f"psn_order={args.soma_psn_order} psn_backend={args.soma_psn_backend} "
             f"activation_checkpoint={args.dend_soma_activation_checkpoint}"
         )

@@ -3,8 +3,9 @@
 MMDEND reports that its LRA experiments follow the S4 architecture from
 Gu et al. and replace the activation layer inside each of 6 S4 blocks with a
 2-branch, 4-compartment MMDEND. This file keeps the original S4-style block by
-default and can optionally replace both of its non-identity activation sites
-with the project's DEND+SOMA modules.
+default and can optionally replace the activation immediately after FFTConv
+with the project's DEND+SOMA module. The output projection, GLU, residual, and
+normalization remain unchanged from S4.
 
 The public S4 repository exposes the paper-faithful optimized S4Block. If that
 repository is on PYTHONPATH, use backend="official". The local fallback below
@@ -347,56 +348,21 @@ class DendSomaS4Activation(nn.Module):
         return y_seq.transpose(0, 1).contiguous()
 
 
-class DendSomaGLUGate(nn.Module):
-    """Preserve the GLU ``2H -> H`` contract with a DEND+SOMA gate."""
-
-    def __init__(self, gate_activation: nn.Module, dim: int = -1) -> None:
-        super().__init__()
-        self.gate_activation = gate_activation
-        self.dim = int(dim)
-
-    def forward(self, x: Tensor) -> Tensor:
-        if x.size(self.dim) % 2 != 0:
-            raise ValueError(
-                "DendSomaGLUGate requires an even feature dimension, "
-                f"got shape {tuple(x.shape)} along dim={self.dim}"
-            )
-        value, gate = x.chunk(2, dim=self.dim)
-        return value * self.gate_activation(gate)
-
-
-def replace_s4_activations(
+def replace_s4_activation(
     s4_module: nn.Module,
-    main_activation: nn.Module,
-    final_gate_activation: nn.Module,
+    activation: nn.Module,
 ) -> None:
-    """Replace the main GELU and the sigmoid gate inside the final GLU."""
+    """Replace only the activation immediately after the S4/FFTConv layer."""
 
     if hasattr(s4_module, "layer") and hasattr(s4_module.layer, "activation"):
-        s4_module.layer.activation = main_activation
+        s4_module.layer.activation = activation
     elif hasattr(s4_module, "activation"):
-        s4_module.activation = main_activation
+        s4_module.activation = activation
     else:
         raise AttributeError(
             "Could not find the main S4 activation. Expected either "
             "`s4.layer.activation` or `s4.activation`."
         )
-
-    output_linear = getattr(s4_module, "output_linear", None)
-    if not isinstance(output_linear, nn.Sequential) or len(output_linear) < 2:
-        raise AttributeError(
-            "Expected the S4 output transform to be Linear/Conv + GLU."
-        )
-    original_final_activation = output_linear[-1]
-    if not isinstance(original_final_activation, nn.GLU):
-        raise TypeError(
-            "Expected the final S4 activation to be nn.GLU, got "
-            f"{type(original_final_activation).__name__}."
-        )
-    output_linear[-1] = DendSomaGLUGate(
-        final_gate_activation,
-        dim=original_final_activation.dim,
-    )
 
 
 class StandardS4Block(nn.Module):
@@ -480,13 +446,9 @@ class StandardS4Block(nn.Module):
                 "ssf_thre": dend_soma_ssf_thre,
                 "activation_checkpoint": dend_soma_activation_checkpoint,
             }
-            replace_s4_activations(
+            replace_s4_activation(
                 self.s4,
-                main_activation=DendSomaS4Activation(
-                    d_model,
-                    **activation_kwargs,
-                ),
-                final_gate_activation=DendSomaS4Activation(
+                activation=DendSomaS4Activation(
                     d_model,
                     **activation_kwargs,
                 ),
@@ -879,7 +841,7 @@ def build_dend_soma_s4_lra(
     backend: str = "official",
     **overrides,
 ) -> StandardS4ForLRA:
-    """Build LRA S4 with DEND+SOMA at both activation sites per block."""
+    """Build LRA S4 with DEND+SOMA after FFTConv in each S4 block."""
 
     overrides.setdefault("use_dend_soma_activation", True)
     return build_standard_s4_lra(
