@@ -332,7 +332,7 @@ def save_checkpoint(state: dict, output_dir: Path, is_best: bool) -> None:
     if is_best:
         torch.save(state, output_dir / "model_best.pth.tar")
 
-# python train_lra_s4.py --task cifar --device cuda:4 --lr 0.005 --weight-decay 5e-4 --activation standard    --soma-type psn_integer_ssf
+# python train_lra_s4.py --task listops --device cuda:6 --dend-lr 0.01 --dend-wd 0.05 --soma-lr 0.01 --soma-wd 0.05 --dend-branches 8  --soma-type psn_integer_ssf  --lr 0.005 --weight-decay 5e-4 --activation standard    --soma-type psn_integer_ssf
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Train S4-LRA with optional DEND+SOMA activations."
@@ -400,7 +400,7 @@ def parse_args():
     )
     parser.add_argument("--zero-pad-embedding", action="store_true", help="Use padding_idx=0 in token embedding.")
 
-    parser.add_argument("--dend-branches", type=int, default=8)
+    parser.add_argument("--dend-branches", type=int, default=2)
     parser.add_argument("--dend-compartments", type=int, default=4)
     parser.add_argument("--dend-branch-degree", type=int, default=2)
     parser.add_argument(
@@ -459,7 +459,7 @@ def parse_args():
     parser.add_argument(
         "--soma-psn-exp-init",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="Use exponential initialization for the selected PSN when supported.",
     )
     parser.add_argument(

@@ -720,7 +720,7 @@ def validate_device_compatibility(
             "an FFT checkpoint keeps its stored backends when resumed."
         )
 
-#  python train_scifar10_pixel.py --psn-exp-init --device cuda:2 --lr 0.005 --weight-decay 0.0005 --dropout 0.0      --neuron-lr 1e-3 --neuron-weight-decay 0
+#  python train_scifar10_pixel.py --psn-exp-init --device cuda:1 --soma-type psn_integer_ssf   --lr 0.005 --weight-decay 0.0005 --dropout 0.0      --neuron-lr 1e-3 --neuron-weight-decay 0
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(

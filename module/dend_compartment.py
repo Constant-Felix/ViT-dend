@@ -2293,7 +2293,7 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
         store_branch_monitor: bool = False,
         no_filter: bool = False,
         merge_norm: str = "sqrt",
-        learn_edge_gain: bool = False,
+        learn_edge_gain: bool = True,
         learn_comp_gain: bool = True,
         edge_gain_scale: float = 0.5,
         distal_gain_init: float = 0.1,

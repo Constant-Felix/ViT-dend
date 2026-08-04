@@ -86,9 +86,9 @@ class DendSomaNeuron(nn.Module):
         self.T = T
         self.dend = SparseChannelPreservingTrunkDistalDendCompartment(
             channels=channels,
-            num_branches=8,
+            num_branches=2,
             compartments_per_branch=4,
-            branch_degree=1,
+            branch_degree=2,
             learn_comp_gain=True,
             learn_edge_gain=True,
             merge_norm='mean',
@@ -111,6 +111,8 @@ class DendSomaNeuron(nn.Module):
         self.dend.reset()
         if hasattr(self.soma, 'reset'):
             self.soma.reset()
+        if hasattr(self.dend, 'reset'):
+            self.dend.reset()    
         x = self.dend(x)
         x = self.soma(x)
         return x.flatten(0, 1)
@@ -187,7 +189,7 @@ def parse_args():
     parser.add_argument('--data_path', default='/data/hyx/ViT-dend/data/shd', type=str, help='SHD dataset root path')
     parser.add_argument('--ckpt_path', '--ckpt-path', default='exp/shd', type=str, help='Checkpoint path')
     parser.add_argument('--pretrain', default=None, type=str)
-    parser.add_argument('--device', default='cuda:0', type=str)
+    parser.add_argument('--device', default='cuda:7', type=str)
     parser.add_argument('--seed', default=1111, type=int)
     parser.add_argument('--log_interval', default=300, type=int)
     return parser.parse_args()
