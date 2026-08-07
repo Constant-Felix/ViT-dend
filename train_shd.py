@@ -111,8 +111,6 @@ class DendSomaNeuron(nn.Module):
         self.dend.reset()
         if hasattr(self.soma, 'reset'):
             self.soma.reset()
-        if hasattr(self.dend, 'reset'):
-            self.dend.reset()    
         x = self.dend(x)
         x = self.soma(x)
         return x.flatten(0, 1)

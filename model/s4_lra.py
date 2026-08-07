@@ -3,9 +3,9 @@
 MMDEND reports that its LRA experiments follow the S4 architecture from
 Gu et al. and replace the activation layer inside each of 6 S4 blocks with a
 2-branch, 4-compartment MMDEND. This file keeps the original S4-style block by
-default and can optionally replace the activation immediately after FFTConv
-with the project's DEND+SOMA module. The output projection, GLU, residual, and
-normalization remain unchanged from S4.
+default and can optionally replace the activation immediately after FFTConv,
+the final activation after the output projection, or both with independent
+DEND+SOMA modules. Residual and normalization behavior remains unchanged.
 
 The public S4 repository exposes the paper-faithful optimized S4Block. If that
 repository is on PYTHONPATH, use backend="official". The local fallback below
@@ -47,9 +47,11 @@ class S4LRAConfig:
     layer_lr: LayerLR = 0.001
     dt_min: float = 0.001
     dt_max: float = 0.1
+    dt_transform: str = "softplus"
     n_ssm: Optional[int] = None
     retrieval: bool = False
     use_dend_soma_activation: bool = False
+    dend_soma_activation_target: str = "gelu"
     dend_soma_num_branches: int = 2
     dend_soma_compartments_per_branch: int = 4
     dend_soma_branch_degree: int = 2
@@ -65,15 +67,16 @@ class S4LRAConfig:
 
 
 def resolve_official_s4block() -> S4LayerFactory:
-    """Return the optimized S4Block from HazyResearch/state-spaces."""
+    """Return the current modular S4Block from HazyResearch/state-spaces."""
 
     try:
-        from models.s4.s4 import S4Block
+        from src.models.sequence.modules.s4block import S4Block
     except ImportError as exc:
         raise ImportError(
-            "Could not import the official S4Block. Clone "
-            "https://github.com/HazyResearch/state-spaces and add it to "
-            "PYTHONPATH, or instantiate StandardS4ForLRA with backend='fallback'."
+            "Could not import the modular official S4Block. Clone "
+            "https://github.com/state-spaces/s4, install its requirements, and "
+            "add the repository root to PYTHONPATH; or instantiate "
+            "StandardS4ForLRA with backend='fallback'."
         ) from exc
 
     def factory(
@@ -88,10 +91,15 @@ def resolve_official_s4block() -> S4LayerFactory:
         layer_lr: LayerLR = 0.001,
         dt_min: float = 0.001,
         dt_max: float = 0.1,
+        dt_transform: str = "softplus",
         n_ssm: Optional[int] = None,
+        final_act: str = "glu",
     ) -> nn.Module:
         return S4Block(
             d_model,
+            activation="gelu",
+            final_act=final_act,
+            layer="fftconv",
             l_max=l_max,
             d_state=d_state,
             dropout=dropout,
@@ -100,9 +108,16 @@ def resolve_official_s4block() -> S4LayerFactory:
             lr=layer_lr,
             dt_min=dt_min,
             dt_max=dt_max,
+            dt_transform=dt_transform,
             init="legs",
             bidirectional=bidirectional,
             n_ssm=n_ssm,
+            mode="nplr",
+            rank=1,
+            wd=0.0,
+            channels=1,
+            drop_kernel=0.0,
+            deterministic=False,
         )
 
     return factory
@@ -123,6 +138,7 @@ class DiagonalSSMLayer(nn.Module):
         d_state: int = 64,
         dropout: float = 0.0,
         transposed: bool = True,
+        final_act: str = "glu",
         **kwargs,
     ) -> None:
         super().__init__()
@@ -138,10 +154,20 @@ class DiagonalSSMLayer(nn.Module):
 
         self.activation = nn.GELU()
         self.dropout = nn.Dropout(dropout)
-        self.output_linear = nn.Sequential(
-            nn.Conv1d(d_model, 2 * d_model, kernel_size=1),
-            nn.GLU(dim=1),
-        )
+        if final_act == "glu":
+            self.output_linear = nn.Sequential(
+                nn.Conv1d(d_model, 2 * d_model, kernel_size=1),
+                nn.GLU(dim=1),
+            )
+        elif final_act in {"id", "identity", "linear"}:
+            self.output_linear = nn.Sequential(
+                nn.Conv1d(d_model, d_model, kernel_size=1),
+                nn.Identity(),
+            )
+        else:
+            raise ValueError(
+                "DiagonalSSMLayer final_act must be 'glu' or an identity activation"
+            )
 
     def _kernel(self, length: int, dtype: torch.dtype, device: torch.device) -> Tensor:
         A = -torch.exp(self.A_log.float())
@@ -311,6 +337,7 @@ class DendSomaS4Activation(nn.Module):
         # from the same zero-state trajectory as the original forward pass.
         self._reset_state()
         return self.soma(self.dend(x_seq))
+        #return self.soma(x_seq)
 
     def _apply_time_first(self, x_seq: Tensor) -> Tensor:
         if (
@@ -350,19 +377,47 @@ class DendSomaS4Activation(nn.Module):
 
 def replace_s4_activation(
     s4_module: nn.Module,
-    activation: nn.Module,
+    *,
+    gelu_activation: Optional[nn.Module] = None,
+    final_act_activation: Optional[nn.Module] = None,
 ) -> None:
-    """Replace only the activation immediately after the S4/FFTConv layer."""
+    """Replace the post-FFTConv GELU, final activation, or both.
 
-    if hasattr(s4_module, "layer") and hasattr(s4_module.layer, "activation"):
-        s4_module.layer.activation = activation
-    elif hasattr(s4_module, "activation"):
-        s4_module.activation = activation
-    else:
-        raise AttributeError(
-            "Could not find the main S4 activation. Expected either "
-            "`s4.layer.activation` or `s4.activation`."
-        )
+    A final activation replacement requires ``output_linear`` to have been
+    constructed with a channel-preserving identity final activation. This
+    avoids retaining GLU's ``2H -> H`` input contract for a DEND+SOMA module
+    whose input and output channel counts are both ``H``.
+    """
+
+    if gelu_activation is None and final_act_activation is None:
+        raise ValueError("At least one S4 activation replacement must be provided")
+
+    if gelu_activation is not None:
+        if hasattr(s4_module, "activation"):
+            print("change block GELU activation")
+            s4_module.activation = gelu_activation
+        elif hasattr(s4_module, "layer") and hasattr(s4_module.layer, "activation"):
+            print("change FFTConv activation")
+            s4_module.layer.activation = gelu_activation
+        else:
+            raise AttributeError(
+                "Could not find the post-FFTConv S4 activation. Expected either "
+                "`s4.activation` or `s4.layer.activation`."
+            )
+
+    if final_act_activation is not None:
+        output_linear = getattr(s4_module, "output_linear", None)
+        if not isinstance(output_linear, nn.Sequential) or len(output_linear) < 2:
+            raise AttributeError(
+                "Could not find the final activation in `s4.output_linear`."
+            )
+        if not isinstance(output_linear[-1], nn.Identity):
+            raise ValueError(
+                "The S4 layer must be constructed with final_act='id' before "
+                "replacing final_act with a channel-preserving activation."
+            )
+        print("change block final_act activation")
+        output_linear[-1] = final_act_activation
 
 
 class StandardS4Block(nn.Module):
@@ -387,8 +442,10 @@ class StandardS4Block(nn.Module):
         layer_lr: LayerLR = 0.001,
         dt_min: float = 0.001,
         dt_max: float = 0.1,
+        dt_transform: str = "softplus",
         n_ssm: Optional[int] = None,
         use_dend_soma_activation: bool = False,
+        dend_soma_activation_target: str = "gelu",
         dend_soma_num_branches: int = 2,
         dend_soma_compartments_per_branch: int = 4,
         dend_soma_branch_degree: int = 2,
@@ -406,6 +463,14 @@ class StandardS4Block(nn.Module):
         self.prenorm = prenorm
         self.norm_kind = norm.lower()
         self.transposed = transposed
+
+        dend_soma_activation_target = dend_soma_activation_target.lower()
+        valid_activation_targets = {"gelu", "final_act", "both"}
+        if dend_soma_activation_target not in valid_activation_targets:
+            choices = ", ".join(sorted(valid_activation_targets))
+            raise ValueError(
+                f"dend_soma_activation_target must be one of: {choices}"
+            )
 
         if use_dend_soma_activation and dend_soma_psn_order is None:
             if l_max is None:
@@ -428,7 +493,16 @@ class StandardS4Block(nn.Module):
             layer_lr=layer_lr,
             dt_min=dt_min,
             dt_max=dt_max,
+            dt_transform=dt_transform,
             n_ssm=n_ssm,
+            # GLU requests an H -> 2H projection before reducing back to H.
+            # A channel-preserving DEND+SOMA final_act instead requires H -> H.
+            final_act=(
+                "id"
+                if use_dend_soma_activation
+                and dend_soma_activation_target in {"final_act", "both"}
+                else "glu"
+            ),
         )
         if use_dend_soma_activation:
             activation_transposed = isinstance(self.s4, DiagonalSSMLayer)
@@ -446,11 +520,24 @@ class StandardS4Block(nn.Module):
                 "ssf_thre": dend_soma_ssf_thre,
                 "activation_checkpoint": dend_soma_activation_checkpoint,
             }
-            replace_s4_activation(
-                self.s4,
-                activation=DendSomaS4Activation(
+
+            def make_dend_soma_activation() -> DendSomaS4Activation:
+                return DendSomaS4Activation(
                     d_model,
                     **activation_kwargs,
+                )
+
+            replace_s4_activation(
+                self.s4,
+                gelu_activation=(
+                    make_dend_soma_activation()
+                    if dend_soma_activation_target in {"gelu", "both"}
+                    else None
+                ),
+                final_act_activation=(
+                    make_dend_soma_activation()
+                    if dend_soma_activation_target in {"final_act", "both"}
+                    else None
                 ),
             )
 
@@ -539,9 +626,11 @@ class StandardS4ForLRA(nn.Module):
         layer_lr: LayerLR = 0.001,
         dt_min: float = 0.001,
         dt_max: float = 0.1,
+        dt_transform: str = "softplus",
         n_ssm: Optional[int] = None,
         retrieval: bool = False,
         use_dend_soma_activation: bool = False,
+        dend_soma_activation_target: str = "gelu",
         dend_soma_num_branches: int = 2,
         dend_soma_compartments_per_branch: int = 4,
         dend_soma_branch_degree: int = 2,
@@ -556,6 +645,13 @@ class StandardS4ForLRA(nn.Module):
         backend: str = "official",
     ) -> None:
         super().__init__()
+        dend_soma_activation_target = dend_soma_activation_target.lower()
+        valid_activation_targets = {"gelu", "final_act", "both"}
+        if dend_soma_activation_target not in valid_activation_targets:
+            choices = ", ".join(sorted(valid_activation_targets))
+            raise ValueError(
+                f"dend_soma_activation_target must be one of: {choices}"
+            )
         if use_dend_soma_activation and dend_soma_psn_order is None:
             if l_max is None:
                 raise ValueError(
@@ -585,9 +681,11 @@ class StandardS4ForLRA(nn.Module):
             layer_lr=layer_lr,
             dt_min=dt_min,
             dt_max=dt_max,
+            dt_transform=dt_transform,
             n_ssm=n_ssm,
             retrieval=retrieval,
             use_dend_soma_activation=use_dend_soma_activation,
+            dend_soma_activation_target=dend_soma_activation_target,
             dend_soma_num_branches=dend_soma_num_branches,
             dend_soma_compartments_per_branch=dend_soma_compartments_per_branch,
             dend_soma_branch_degree=dend_soma_branch_degree,
@@ -622,8 +720,10 @@ class StandardS4ForLRA(nn.Module):
                     layer_lr=layer_lr,
                     dt_min=dt_min,
                     dt_max=dt_max,
+                    dt_transform=dt_transform,
                     n_ssm=n_ssm,
                     use_dend_soma_activation=use_dend_soma_activation,
+                    dend_soma_activation_target=dend_soma_activation_target,
                     dend_soma_num_branches=dend_soma_num_branches,
                     dend_soma_compartments_per_branch=dend_soma_compartments_per_branch,
                     dend_soma_branch_degree=dend_soma_branch_degree,
@@ -841,7 +941,7 @@ def build_dend_soma_s4_lra(
     backend: str = "official",
     **overrides,
 ) -> StandardS4ForLRA:
-    """Build LRA S4 with DEND+SOMA after FFTConv in each S4 block."""
+    """Build LRA S4 with selectable DEND+SOMA activation replacements."""
 
     overrides.setdefault("use_dend_soma_activation", True)
     return build_standard_s4_lra(

@@ -4,8 +4,8 @@ Dataset preprocessing and undisclosed training details follow the local S4
 repository. Base learning rate, base weight decay, batch size, and epoch count
 follow MMDEND Appendix C, Table 7. DEND and SOMA use dedicated optimizer
 groups. By default the activation immediately after FFTConv in each S4 block
-uses the project's DEND+SOMA module; the output GLU and residual path retain
-their original S4 definitions.
+uses the project's DEND+SOMA module. The final activation can instead be
+replaced independently, while the residual path retains its S4 definition.
 """
 
 from __future__ import annotations
@@ -30,7 +30,9 @@ from tqdm.auto import tqdm
 
 from lra_dataset import canonicalize_lra_task, get_s4_lra_data
 
+import warnings
 
+warnings.filterwarnings("ignore", category=UserWarning)
 # MMDEND Appendix C, Table 7. These four values are intentionally not taken
 # from another benchmark implementation.
 MMDEND_TRAINING_PRESETS: Dict[str, Dict[str, float | int]] = {
@@ -85,6 +87,42 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
+def _backbone_no_weight_decay_parameter_ids(model: nn.Module) -> set[int]:
+    """Find the backbone parameters excluded from decay by official S4 hooks."""
+
+    normalization_modules = (
+        nn.BatchNorm1d,
+        nn.BatchNorm2d,
+        nn.BatchNorm3d,
+        nn.GroupNorm,
+        nn.SyncBatchNorm,
+        nn.InstanceNorm1d,
+        nn.InstanceNorm2d,
+        nn.InstanceNorm3d,
+        nn.LayerNorm,
+        nn.LocalResponseNorm,
+    )
+    blacklist_modules = (nn.Embedding, *normalization_modules)
+
+    roots = []
+    if hasattr(model, "blocks"):
+        roots.append(model.blocks)
+    if hasattr(model, "final_norm"):
+        roots.append(model.final_norm)
+
+    no_weight_decay_ids = set()
+    for root in roots:
+        for module in root.modules():
+            for local_name, parameter in module.named_parameters(recurse=False):
+                if (
+                    local_name.endswith("bias")
+                    or getattr(parameter, "_no_weight_decay", False)
+                    or isinstance(module, blacklist_modules)
+                ):
+                    no_weight_decay_ids.add(id(parameter))
+    return no_weight_decay_ids
+
+
 def setup_optimizer(
     model: nn.Module,
     lr: float,
@@ -137,16 +175,34 @@ def setup_optimizer(
         for _, parameter in named_parameters
         if id(parameter) not in component_ids and hasattr(parameter, "_optim")
     ]
+    backbone_no_weight_decay_ids = _backbone_no_weight_decay_parameter_ids(model)
     base_parameters = [
         parameter
         for _, parameter in named_parameters
-        if id(parameter) not in component_ids and not hasattr(parameter, "_optim")
+        if id(parameter) not in component_ids
+        and id(parameter) not in backbone_no_weight_decay_ids
+        and not hasattr(parameter, "_optim")
+    ]
+    base_no_weight_decay_parameters = [
+        parameter
+        for _, parameter in named_parameters
+        if id(parameter) not in component_ids
+        and id(parameter) in backbone_no_weight_decay_ids
+        and not hasattr(parameter, "_optim")
     ]
 
     parameter_groups = []
     if base_parameters:
         parameter_groups.append(
             {"params": base_parameters, "group_name": "base"}
+        )
+    if base_no_weight_decay_parameters:
+        parameter_groups.append(
+            {
+                "params": base_no_weight_decay_parameters,
+                "group_name": "base_no_weight_decay",
+                "weight_decay": 0.0,
+            }
         )
 
     s4_hyperparameters = []
@@ -332,7 +388,7 @@ def save_checkpoint(state: dict, output_dir: Path, is_best: bool) -> None:
     if is_best:
         torch.save(state, output_dir / "model_best.pth.tar")
 
-# python train_lra_s4.py --task listops --device cuda:6 --dend-lr 0.01 --dend-wd 0.05 --soma-lr 0.01 --soma-wd 0.05 --dend-branches 8  --soma-type psn_integer_ssf  --lr 0.005 --weight-decay 5e-4 --activation standard    --soma-type psn_integer_ssf
+# python train_lra_s4.py --task cifar --device cuda:5 --soma-lr 0.01 --dend-lr 0.01 --soma-type psn_integer_ssf    --dend-soma-target gelu  --lr 0.005 --wd 0.005 --dend-lr 0.001 --dend-wd 0.005 --soma-lr 0.005 --soma-wd 0.005 --dend-branches 8  --soma-type psn_integer_ssf  --lr 0.005 --weight-decay 5e-4 --activation standard    --soma-type psn_integer_ssf
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Train S4-LRA with optional DEND+SOMA activations."
@@ -369,6 +425,16 @@ def parse_args():
     )
     parser.add_argument("--backend", default="official", choices=["official", "fallback", "auto"])
     parser.add_argument("--activation", default="dend_soma", choices=["dend_soma", "standard"])
+    parser.add_argument(
+        "--dend-soma-target",
+        default="gelu",
+        choices=["gelu", "final_act", "both"],
+        help=(
+            "S4Block activation replaced by DEND+SOMA: the post-FFTConv GELU, "
+            "the final_act after output projection, or both. Replacing final_act "
+            "uses an H-to-H projection instead of GLU's H-to-2H projection."
+        ),
+    )
     parser.add_argument("--output-dir", default="", help="Directory for args/checkpoints. Default creates exp/lra-*.")
     parser.add_argument("--resume", default="", help="Resume from checkpoint.pth.tar/model_best.pth.tar.")
 
@@ -400,9 +466,9 @@ def parse_args():
     )
     parser.add_argument("--zero-pad-embedding", action="store_true", help="Use padding_idx=0 in token embedding.")
 
-    parser.add_argument("--dend-branches", type=int, default=2)
+    parser.add_argument("--dend-branches", type=int, default=8)
     parser.add_argument("--dend-compartments", type=int, default=4)
-    parser.add_argument("--dend-branch-degree", type=int, default=2)
+    parser.add_argument("--dend-branch-degree", type=int, default=1)
     parser.add_argument(
         "--dend-lr",
         type=float,
@@ -427,8 +493,8 @@ def parse_args():
         default="masked_sliding_psn",
         choices=["masked_sliding_psn", "psn_integer_ssf"],
         help=(
-            "Soma used after the channel-preserving dendrite that replaces "
-            "the post-FFTConv activation in every S4 block."
+            "Soma used after the channel-preserving dendrite at each selected "
+            "S4Block activation target."
         ),
     )
     parser.add_argument(
@@ -568,6 +634,7 @@ def main() -> None:
     if args.activation == "dend_soma":
         model_overrides.update(
             {
+                "dend_soma_activation_target": args.dend_soma_target,
                 "dend_soma_num_branches": args.dend_branches,
                 "dend_soma_compartments_per_branch": args.dend_compartments,
                 "dend_soma_branch_degree": args.dend_branch_degree,
@@ -624,13 +691,33 @@ def main() -> None:
         output_dir = Path(args.output_dir)
     else:
         stamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-        output_dir = Path("exp") / f"lra-new-{task_key}-{args.activation}-{stamp}"
+        activation_label = args.activation
+        if args.activation == "dend_soma":
+            activation_label += f"-{args.dend_soma_target}"
+        output_dir = Path("exp") / f"lra-new-{task_key}-{activation_label}-{stamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     start_epoch = 0
     best_val = -1.0
     if args.resume:
         checkpoint = torch.load(args.resume, map_location=device)
+        checkpoint_args = checkpoint.get("args") or {}
+        checkpoint_activation = checkpoint_args.get("activation")
+        if (
+            checkpoint_activation is not None
+            and checkpoint_activation != args.activation
+        ):
+            raise ValueError(
+                "Checkpoint activation mode does not match this run: "
+                f"{checkpoint_activation!r} != {args.activation!r}"
+            )
+        if args.activation == "dend_soma":
+            checkpoint_target = checkpoint_args.get("dend_soma_target", "gelu")
+            if checkpoint_target != args.dend_soma_target:
+                raise ValueError(
+                    "Checkpoint DEND+SOMA target does not match this run: "
+                    f"{checkpoint_target!r} != {args.dend_soma_target!r}"
+                )
         model.load_state_dict(checkpoint["state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         if scheduler is not None and checkpoint.get("scheduler") is not None:
@@ -649,6 +736,7 @@ def main() -> None:
     if args.activation == "dend_soma":
         print(
             "DEND+SOMA "
+            f"target={args.dend_soma_target} "
             f"branches={args.dend_branches} compartments={args.dend_compartments} "
             f"branch_degree={args.dend_branch_degree} "
             f"dend_backend={args.dend_integration_backend} "

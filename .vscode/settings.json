@@ -1,0 +1,9 @@
+{
+    "terminal.integrated.cwd": "/data2/hyx/ViT-dend2",
+
+    "python.defaultInterpreterPath": "/data2/hyx/envs/python310/bin/python",
+
+    "python.terminal.activateEnvironment": true,
+
+    "python.condaPath": "/data2/hyx/miniconda3/bin/conda"
+}
