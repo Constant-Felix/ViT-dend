@@ -14,6 +14,7 @@ import argparse
 import importlib.util
 import json
 import math
+import os
 import random
 import sys
 import time
@@ -23,9 +24,11 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
 from torch.cuda import amp
+from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm.auto import tqdm
 
 from lra_dataset import canonicalize_lra_task, get_s4_lra_data
@@ -85,6 +88,51 @@ def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def distributed_is_initialized() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def is_main_process() -> bool:
+    return not distributed_is_initialized() or dist.get_rank() == 0
+
+
+def unwrap_model(model: nn.Module) -> nn.Module:
+    return model.module if isinstance(model, DDP) else model
+
+
+def setup_distributed(args) -> tuple[bool, int, int, int, torch.device]:
+    """Initialize one-process-per-GPU DDP when launched with torchrun."""
+
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank or 0))
+    distributed = world_size > 1
+
+    if distributed:
+        requested_device = torch.device(args.device)
+        if requested_device.type != "cuda":
+            raise ValueError("Multi-GPU LRA training requires --device cuda")
+        if not torch.cuda.is_available():
+            raise RuntimeError("torchrun requested CUDA DDP, but CUDA is unavailable")
+        if local_rank >= torch.cuda.device_count():
+            raise RuntimeError(
+                f"LOCAL_RANK={local_rank}, but only {torch.cuda.device_count()} "
+                "visible CUDA devices were found"
+            )
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend=args.dist_backend, init_method="env://")
+        device = torch.device("cuda", local_rank)
+    else:
+        requested_device = torch.device(args.device)
+        if requested_device.type == "cuda" and not torch.cuda.is_available():
+            print(f"CUDA is unavailable; falling back from {requested_device} to cpu")
+            device = torch.device("cpu")
+        else:
+            device = requested_device
+
+    return distributed, rank, local_rank, world_size, device
 
 
 def _backbone_no_weight_decay_parameter_ids(model: nn.Module) -> set[int]:
@@ -260,13 +308,14 @@ def setup_optimizer(
     defaults = {"lr": lr, "weight_decay": weight_decay, "betas": (0.9, 0.999)}
     optimizer = optim.AdamW(parameter_groups, **defaults)
 
-    for index, group in enumerate(optimizer.param_groups):
-        parameter_count = sum(parameter.numel() for parameter in group["params"])
-        print(
-            f"Optimizer group {index} ({group['group_name']}): "
-            f"{len(group['params'])} tensors {parameter_count} parameters "
-            f"lr={group['lr']} weight_decay={group['weight_decay']}"
-        )
+    if is_main_process():
+        for index, group in enumerate(optimizer.param_groups):
+            parameter_count = sum(parameter.numel() for parameter in group["params"])
+            print(
+                f"Optimizer group {index} ({group['group_name']}): "
+                f"{len(group['params'])} tensors {parameter_count} parameters "
+                f"lr={group['lr']} weight_decay={group['weight_decay']}"
+            )
 
     return optimizer
 
@@ -317,6 +366,24 @@ def unpack_batch(batch, device: torch.device):
     return inputs, targets, lengths
 
 
+def synchronize_sequence_length(inputs: torch.Tensor) -> torch.Tensor:
+    """Pad variable-length token batches to one shared DDP sequence length."""
+
+    if not distributed_is_initialized() or inputs.dim() < 2:
+        return inputs
+    local_length = torch.tensor(inputs.size(1), device=inputs.device, dtype=torch.long)
+    dist.all_reduce(local_length, op=dist.ReduceOp.MAX)
+    global_length = int(local_length.item())
+    if inputs.size(1) < global_length:
+        padding_shape = (
+            inputs.size(0),
+            global_length - inputs.size(1),
+            *inputs.shape[2:],
+        )
+        inputs = torch.cat([inputs, inputs.new_zeros(padding_shape)], dim=1)
+    return inputs
+
+
 def run_epoch(
     loader,
     model: nn.Module,
@@ -336,9 +403,15 @@ def run_epoch(
     total_seen = 0
     phase = "train" if train else "eval"
 
-    iterator = tqdm(enumerate(loader), total=len(loader), leave=False)
+    iterator = tqdm(
+        enumerate(loader),
+        total=len(loader),
+        leave=False,
+        disable=not is_main_process(),
+    )
     for batch_idx, batch in iterator:
         inputs, targets, lengths = unpack_batch(batch, device)
+        inputs = synchronize_sequence_length(inputs)
 
         with torch.set_grad_enabled(train):
             with amp.autocast(enabled=scaler is not None):
@@ -373,6 +446,15 @@ def run_epoch(
                 f"loss={avg_loss:.4f} acc={avg_acc:.2f}"
             )
 
+    totals = torch.tensor(
+        [total_loss, float(total_correct), float(total_seen)],
+        device=device,
+        dtype=torch.float64,
+    )
+    if distributed_is_initialized():
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+    total_loss, total_correct, total_seen = totals.tolist()
+
     if total_seen == 0:
         raise RuntimeError(
             "The dataloader yielded no samples. With official S4 drop_last=True, "
@@ -388,7 +470,8 @@ def save_checkpoint(state: dict, output_dir: Path, is_best: bool) -> None:
     if is_best:
         torch.save(state, output_dir / "model_best.pth.tar")
 
-# python train_lra_s4.py --task cifar --device cuda:5 --soma-lr 0.01 --dend-lr 0.01 --soma-type psn_integer_ssf    --dend-soma-target gelu  --lr 0.005 --wd 0.005 --dend-lr 0.001 --dend-wd 0.005 --soma-lr 0.005 --soma-wd 0.005 --dend-branches 8  --soma-type psn_integer_ssf  --lr 0.005 --weight-decay 5e-4 --activation standard    --soma-type psn_integer_ssf
+# python train_lra_s4.py --task pathx --device cuda:1 --soma-lr 0.001 --dend-lr 0.001 --soma-type psn_integer_ssf    --dend-soma-target gelu  --lr 0.005 --wd 0.005 --dend-lr 0.001 --dend-wd 0.005 --soma-lr 0.005 --soma-wd 0.005 --dend-branches 8  --soma-type psn_integer_ssf  --lr 0.005 --weight-decay 5e-4 --activation standard    --soma-type psn_integer_ssf
+# CUDA_VISIBLE_DEVICES=4,5,6,7 python -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node=4 train_lra_s4.py --task pathx --device cuda --soma-lr 0.001 --dend-lr 0.001 --soma-type psn_integer_ssf --lr 0.01   --dend-compartments 2
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Train S4-LRA with optional DEND+SOMA activations."
@@ -410,18 +493,34 @@ def parse_args():
     )
     parser.add_argument(
         "--root",
-        default="/data/hyx/ViT-dend/data/lra_release",
+        default="/data2/hyx/ViT-dend/data/lra_release",
         help="Root containing raw IMDB, CIFAR-10, ListOps, AAN, and Pathfinder data.",
     )
     parser.add_argument(
         "--s4-root",
-        default="/data/hyx/s4",
+        default="/data2/hyx/s4",
         help="Official S4 repo root to add to PYTHONPATH.", ##
     )
     parser.add_argument(
         "--device",
         default="cuda",
-        help="Torch device, for example cuda, cuda:4, or cpu.",
+        help=(
+            "Torch device, for example cuda, cuda:4, or cpu. Under torchrun, "
+            "use cuda and LOCAL_RANK selects each process GPU."
+        ),
+    )
+    parser.add_argument(
+        "--local-rank",
+        "--local_rank",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--dist-backend",
+        default="nccl",
+        choices=["nccl", "gloo"],
+        help="torch.distributed backend used when launched with torchrun.",
     )
     parser.add_argument("--backend", default="official", choices=["official", "fallback", "auto"])
     parser.add_argument("--activation", default="dend_soma", choices=["dend_soma", "standard"])
@@ -439,7 +538,15 @@ def parse_args():
     parser.add_argument("--resume", default="", help="Resume from checkpoint.pth.tar/model_best.pth.tar.")
 
     parser.add_argument("--epochs", type=int, default=None)
-    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Global batch size. Under torchrun it is divided evenly across "
+            "all ranks; for AAN it counts document pairs, not individual documents."
+        ),
+    )
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--weight-decay", "--wd", dest="weight_decay", type=float, default=None)
     parser.add_argument("--scheduler", default="cosine-warmup", choices=["cosine-warmup", "cosine", "none"])
@@ -585,15 +692,23 @@ def main() -> None:
     if args.seed is None:
         args.seed = S4_TRAINING_SEEDS[task_key]
 
+    distributed, rank, local_rank, world_size, device = setup_distributed(args)
     set_seed(args.seed)
-    requested_device = torch.device(args.device)
-    if requested_device.type == "cuda" and not torch.cuda.is_available():
-        print(f"CUDA is unavailable; falling back from {requested_device} to cpu")
-        device = torch.device("cpu")
-    else:
-        device = requested_device
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = False
+
+    if distributed:
+        if args.batch_size % world_size != 0:
+            raise ValueError(
+                f"Global batch size {args.batch_size} must be divisible by "
+                f"world size {world_size}"
+            )
+        local_batch_size = args.batch_size // world_size
+    else:
+        local_batch_size = args.batch_size
+    args.distributed = distributed
+    args.world_size = world_size
+    args.local_batch_size = local_batch_size
 
     max_samples = {
         "train": args.max_train_samples,
@@ -601,19 +716,27 @@ def main() -> None:
         "test": args.max_test_samples,
     }
     max_samples = {k: v for k, v in max_samples.items() if v is not None}
+    if distributed and not is_main_process():
+        dist.barrier()
     data = get_s4_lra_data(
         task=task_key,
         root=args.root,
         s4_root=args.s4_root,
-        batch_size=args.batch_size,
+        batch_size=local_batch_size,
         num_workers=args.workers,
         max_samples=max_samples,
         max_len=args.max_len,
+        distributed=distributed,
+        rank=rank,
+        world_size=world_size,
+        distributed_seed=args.seed,
     )
+    if distributed and is_main_process():
+        dist.barrier()
     spec = data.spec
     loaders = data.loaders
     if args.activation == "dend_soma" and args.soma_psn_order is None:
-        args.soma_psn_order = spec.sequence_length  ##
+        args.soma_psn_order = spec.sequence_length ##
     args.data_pipeline = "official_s4"
     args.training_hparams_source = "MMDEND Appendix C Table 7"
     if args.activation == "dend_soma":
@@ -667,6 +790,9 @@ def main() -> None:
         **model_overrides,
     ).to(device)
 
+    if distributed:
+        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+
     criterion = nn.CrossEntropyLoss()
     optimizer = setup_optimizer(
         model,
@@ -687,15 +813,36 @@ def main() -> None:
     )
     scaler = amp.GradScaler() if args.amp and device.type == "cuda" else None
 
-    if args.output_dir:
-        output_dir = Path(args.output_dir)
-    else:
+    if distributed:
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            broadcast_buffers=True,
+            find_unused_parameters=args.activation == "dend_soma",
+        )
+        set_seed(args.seed + rank)
+
+    output_dir_value = args.output_dir or None
+    if output_dir_value is None and is_main_process():
         stamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
         activation_label = args.activation
         if args.activation == "dend_soma":
             activation_label += f"-{args.dend_soma_target}"
-        output_dir = Path("exp") / f"lra-new-{task_key}-{activation_label}-{stamp}"
-    output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir_value = str(
+            Path("exp") / f"lra-new-{task_key}-{activation_label}-{stamp}"
+        )
+    if distributed:
+        output_dir_values = [output_dir_value]
+        dist.broadcast_object_list(output_dir_values, src=0)
+        output_dir_value = output_dir_values[0]
+    if output_dir_value is None:
+        raise RuntimeError("Failed to resolve the training output directory")
+    output_dir = Path(output_dir_value)
+    if is_main_process():
+        output_dir.mkdir(parents=True, exist_ok=True)
+    if distributed:
+        dist.barrier()
 
     start_epoch = 0
     best_val = -1.0
@@ -718,7 +865,7 @@ def main() -> None:
                     "Checkpoint DEND+SOMA target does not match this run: "
                     f"{checkpoint_target!r} != {args.dend_soma_target!r}"
                 )
-        model.load_state_dict(checkpoint["state_dict"])
+        unwrap_model(model).load_state_dict(checkpoint["state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         if scheduler is not None and checkpoint.get("scheduler") is not None:
             scheduler.load_state_dict(checkpoint["scheduler"])
@@ -726,45 +873,56 @@ def main() -> None:
             scaler.load_state_dict(checkpoint["scaler"])
         start_epoch = int(checkpoint.get("epoch", 0))
         best_val = float(checkpoint.get("best_val", -1.0))
-        print(f"Resumed {args.resume} at epoch {start_epoch} best_val={best_val:.2f}")
+        if is_main_process():
+            print(f"Resumed {args.resume} at epoch {start_epoch} best_val={best_val:.2f}")
 
-    with (output_dir / "args.json").open("w") as f:
-        json.dump(vars(args), f, indent=2)
+    if is_main_process():
+        with (output_dir / "args.json").open("w") as f:
+            json.dump(vars(args), f, indent=2)
 
-    print(f"Task={task_key} spec={spec}")
-    print(f"Device={device} backend={args.backend} activation={args.activation}")
-    if args.activation == "dend_soma":
+    if is_main_process():
+        print(f"Task={task_key} spec={spec}")
+        print(f"Device={device} backend={args.backend} activation={args.activation}")
+        if distributed:
+            print(
+                f"DDP world_size={world_size} global_batch_size={args.batch_size} "
+                f"local_pair_batch_size={local_batch_size} sync_batchnorm=True"
+            )
+        if args.activation == "dend_soma":
+            print(
+                "DEND+SOMA "
+                f"target={args.dend_soma_target} "
+                f"branches={args.dend_branches} compartments={args.dend_compartments} "
+                f"branch_degree={args.dend_branch_degree} "
+                f"dend_backend={args.dend_integration_backend} "
+                f"dend_lr={args.dend_lr} dend_wd={args.dend_weight_decay} "
+                f"soma={args.soma_type} soma_lr={args.soma_lr} "
+                f"soma_wd={args.soma_weight_decay} "
+                f"psn_order={args.soma_psn_order} psn_backend={args.soma_psn_backend} "
+                f"activation_checkpoint={args.dend_soma_activation_checkpoint}"
+            )
+        print(f"Output dir={output_dir}")
         print(
-            "DEND+SOMA "
-            f"target={args.dend_soma_target} "
-            f"branches={args.dend_branches} compartments={args.dend_compartments} "
-            f"branch_degree={args.dend_branch_degree} "
-            f"dend_backend={args.dend_integration_backend} "
-            f"dend_lr={args.dend_lr} dend_wd={args.dend_weight_decay} "
-            f"soma={args.soma_type} soma_lr={args.soma_lr} "
-            f"soma_wd={args.soma_weight_decay} "
-            f"psn_order={args.soma_psn_order} psn_backend={args.soma_psn_backend} "
-            f"activation_checkpoint={args.dend_soma_activation_checkpoint}"
+            "Data pipeline=official S4 "
+            f"data_dir={spec.data_dir} drop_last=True pin_memory=True "
+            f"workers={args.workers}"
         )
-    print(f"Output dir={output_dir}")
-    print(
-        "Data pipeline=official S4 "
-        f"data_dir={spec.data_dir} drop_last=True pin_memory=True "
-        f"workers={args.workers}"
-    )
-    if data.validation_uses_test:
+        if data.validation_uses_test:
+            print(
+                "Validation protocol=official LRA IMDB: the test split is also used "
+                "for validation/checkpoint selection"
+            )
         print(
-            "Validation protocol=official LRA IMDB: the test split is also used "
-            "for validation/checkpoint selection"
+            f"Epochs={args.epochs} global_batch_size={args.batch_size} "
+            f"lr={args.lr} weight_decay={args.weight_decay} "
+            f"train_batches={len(loaders['train'])} scheduler={args.scheduler}/{scheduler_interval} "
+            f"warmup_steps={args.num_warmup_steps} total_steps={args.num_training_steps}"
         )
-    print(
-        f"Epochs={args.epochs} batch_size={args.batch_size} "
-        f"lr={args.lr} weight_decay={args.weight_decay} "
-        f"train_batches={len(loaders['train'])} scheduler={args.scheduler}/{scheduler_interval} "
-        f"warmup_steps={args.num_warmup_steps} total_steps={args.num_training_steps}"
-    )
 
     for epoch in range(start_epoch, args.epochs):
+        train_sampler = getattr(loaders["train"], "sampler", None)
+        if distributed and hasattr(train_sampler, "set_epoch"):
+            train_sampler.set_epoch(epoch)
         tic = time.time()
         train_loss, train_acc = run_epoch(
             loaders["train"],
@@ -819,14 +977,15 @@ def main() -> None:
         state = {
             "epoch": epoch + 1,
             "best_val": best_val,
-            "state_dict": model.state_dict(),
+            "state_dict": unwrap_model(model).state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": None if scheduler is None else scheduler.state_dict(),
             "scaler": None if scaler is None else scaler.state_dict(),
             "args": vars(args),
             "task_spec": spec.__dict__,
         }
-        save_checkpoint(state, output_dir, is_best=is_best)
+        if is_main_process():
+            save_checkpoint(state, output_dir, is_best=is_best)
 
         lr = optimizer.param_groups[0]["lr"]
         msg = (
@@ -837,12 +996,15 @@ def main() -> None:
         )
         if test_acc is not None:
             msg += f" test_loss={test_loss:.4f} test_acc={test_acc:.2f}"
-        print(msg, flush=True)
+        if is_main_process():
+            print(msg, flush=True)
 
+    if distributed:
+        dist.barrier()
     best_path = output_dir / "model_best.pth.tar"
     if best_path.exists():
         best = torch.load(best_path, map_location=device,weights_only=False)
-        model.load_state_dict(best["state_dict"])
+        unwrap_model(model).load_state_dict(best["state_dict"])
     test_loss, test_acc = run_epoch(
         loaders["test"],
         model,
@@ -856,7 +1018,10 @@ def main() -> None:
         print_freq=args.print_freq,
         epoch=args.epochs,
     )
-    print(f"Best checkpoint test_loss={test_loss:.4f} test_acc={test_acc:.2f}")
+    if is_main_process():
+        print(f"Best checkpoint test_loss={test_loss:.4f} test_acc={test_acc:.2f}")
+    if distributed_is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

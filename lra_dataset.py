@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
 from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data.distributed import DistributedSampler
 
 from s4_torchtext_compat import ensure_torchtext_for_s4
 
@@ -348,6 +349,10 @@ def get_s4_lra_data(
     max_samples: Optional[Mapping[str, int]] = None,
     max_len: Optional[int] = None,
     pin_memory: Optional[bool] = None,
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
+    distributed_seed: int = 0,
 ) -> LRADataBundle:
     """Build official-S4 datasets and loaders for one canonical LRA task."""
 
@@ -390,14 +395,54 @@ def get_s4_lra_data(
         "pin_memory": pin_memory,
         "drop_last": True,  # S4 configs/loader/default.yaml, including eval.
     }
+    if distributed:
+        if world_size <= 1:
+            raise ValueError("Distributed loading requires world_size > 1")
+        if not 0 <= rank < world_size:
+            raise ValueError(f"Invalid distributed rank {rank}/{world_size}")
+        train_loader_args = {
+            **loader_args,
+            "sampler": DistributedSampler(
+                train_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=True,
+                seed=distributed_seed,
+                drop_last=True,
+            ),
+        }
+        val_loader_args = {
+            **loader_args,
+            "sampler": DistributedSampler(
+                val_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=False,
+                seed=distributed_seed,
+                drop_last=True,
+            ),
+        }
+        test_loader_args = {
+            **loader_args,
+            "sampler": DistributedSampler(
+                test_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=False,
+                seed=distributed_seed,
+                drop_last=True,
+            ),
+        }
+    else:
+        train_loader_args = val_loader_args = test_loader_args = loader_args
     train_loader = _unwrap_loader(
-        datamodule._train_dataloader(train_dataset, **loader_args), "train"
+        datamodule._train_dataloader(train_dataset, **train_loader_args), "train"
     )
     val_loader = _unwrap_loader(
-        datamodule._eval_dataloader(val_dataset, **loader_args), "validation"
+        datamodule._eval_dataloader(val_dataset, **val_loader_args), "validation"
     )
     test_loader = _unwrap_loader(
-        datamodule._eval_dataloader(test_dataset, **loader_args), "test"
+        datamodule._eval_dataloader(test_dataset, **test_loader_args), "test"
     )
 
     spec = _build_task_spec(task, data_dir, datamodule)
@@ -427,13 +472,13 @@ def describe_lra_release(root: str | Path) -> Dict[str, Dict[str, object]]:
 
 
 if __name__ == "__main__":
-    default_root = os.getenv("DATA_PATH", "/data/hyx/ViT-dend/data/lra_release")
-    s4_root = Path('/data/hyx/s4').expanduser()
+    default_root = os.getenv("DATA_PATH", "/data2/hyx/ViT-dend/data/lra_release")
+    s4_root = Path('/data2/hyx/s4').expanduser()
     if s4_root.is_dir() and str(s4_root) not in sys.path:
         sys.path.insert(0, str(s4_root))
 
     for task_name, info in describe_lra_release(default_root).items():
         print(task_name, info)
 
-    a = get_s4_lra_data(task='aan',root=default_root,s4_root=s4_root,batch_size=1,num_workers=8,pin_memory=True)
+    a = get_s4_lra_data(task='pathx',root=default_root,s4_root=s4_root,batch_size=1,num_workers=8,pin_memory=True)
     print(len(a.loaders['train']), len(a.loaders['dev']), len(a.loaders['test']))

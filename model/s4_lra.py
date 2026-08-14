@@ -336,8 +336,8 @@ class DendSomaS4Activation(nn.Module):
         # Reset inside the checkpointed region so backward recomputation starts
         # from the same zero-state trajectory as the original forward pass.
         self._reset_state()
-        return self.soma(self.dend(x_seq))
-        #return self.soma(x_seq)
+        #return self.soma(self.dend(x_seq))
+        return self.soma(x_seq)
 
     def _apply_time_first(self, x_seq: Tensor) -> Tensor:
         if (
@@ -394,10 +394,8 @@ def replace_s4_activation(
 
     if gelu_activation is not None:
         if hasattr(s4_module, "activation"):
-            print("change block GELU activation")
             s4_module.activation = gelu_activation
         elif hasattr(s4_module, "layer") and hasattr(s4_module.layer, "activation"):
-            print("change FFTConv activation")
             s4_module.layer.activation = gelu_activation
         else:
             raise AttributeError(
@@ -416,7 +414,6 @@ def replace_s4_activation(
                 "The S4 layer must be constructed with final_act='id' before "
                 "replacing final_act with a channel-preserving activation."
             )
-        print("change block final_act activation")
         output_linear[-1] = final_act_activation
 
 
@@ -782,7 +779,7 @@ class StandardS4ForLRA(nn.Module):
         for block in self.blocks:
             x = block(x, lengths=lengths)
 
-        if isinstance(self.final_norm, nn.BatchNorm1d):
+        if isinstance(self.final_norm, (nn.BatchNorm1d, nn.SyncBatchNorm)):
             if self.transposed:
                 x = self.final_norm(x)
             else:
