@@ -41,6 +41,7 @@ TASK_DATA_DIRS = {
 }
 
 TOKEN_TASKS = {"imdb", "listops", "aan"}
+S4_LRA_CONFIG_PROFILES = {"v3", "v4"}
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,7 @@ class LRADataBundle:
     loaders: Dict[str, DataLoader]
     datamodule: Any
     validation_uses_test: bool = False
+    config_profile: str = "v4"
 
 
 def canonicalize_lra_task(task: str) -> str:
@@ -222,9 +224,24 @@ def _setup_official_datamodule(datamodule: Any, task: str) -> None:
         del Column.__add__
 
 
-def _official_dataset_config(task: str, max_len: Optional[int]) -> Dict[str, Any]:
+def _official_dataset_config(
+    task: str,
+    max_len: Optional[int],
+    config_profile: str = "v4",
+) -> Dict[str, Any]:
     # Values are the resolved official S4 dataset and LRA experiment configs.
     # The actual transforms/tokenizers remain implemented by the imported S4 classes.
+    config_profile = config_profile.lower()
+    if config_profile not in S4_LRA_CONFIG_PROFILES:
+        choices = ", ".join(sorted(S4_LRA_CONFIG_PROFILES))
+        raise ValueError(
+            f"Unknown S4 LRA config profile '{config_profile}'; choose {choices}"
+        )
+
+    # V3's PathFinder implementation always normalized ToTensor output from
+    # [0, 1] to [-1, 1]. V4 added ``center`` and its new LRA configs explicitly
+    # set it to false. All other resolved dataset options are shared.
+    pathfinder_center = config_profile == "v3"
     configs: Dict[str, Dict[str, Any]] = {
         "imdb": {
             "l_max": 4096,
@@ -262,7 +279,7 @@ def _official_dataset_config(task: str, max_len: Optional[int]) -> Dict[str, Any
             "resolution": 32,
             "sequential": True,
             "tokenize": False,
-            "center": False,
+            "center": pathfinder_center,
             "pool": 1,
             "val_split": 0.1,
             "test_split": 0.1,
@@ -272,7 +289,7 @@ def _official_dataset_config(task: str, max_len: Optional[int]) -> Dict[str, Any
             "resolution": 128,
             "sequential": True,
             "tokenize": False,
-            "center": False,
+            "center": pathfinder_center,
             "pool": 1,
             "val_split": 0.1,
             "test_split": 0.1,
@@ -353,6 +370,7 @@ def get_s4_lra_data(
     rank: int = 0,
     world_size: int = 1,
     distributed_seed: int = 0,
+    config_profile: str = "v4",
 ) -> LRADataBundle:
     """Build official-S4 datasets and loaders for one canonical LRA task."""
 
@@ -366,7 +384,11 @@ def get_s4_lra_data(
         os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
 
     classes = _load_official_s4_dataset_classes(s4_root, data_root)
-    config = _official_dataset_config(task, max_len=max_len)
+    config = _official_dataset_config(
+        task,
+        max_len=max_len,
+        config_profile=config_profile,
+    )
     s4_data_dir = data_root if task == "imdb" else data_dir
     datamodule = classes[task](
         _name_="pathfinder" if task == "pathx" else task,
@@ -452,6 +474,28 @@ def get_s4_lra_data(
         loaders={"train": train_loader, "dev": val_loader, "test": test_loader},
         datamodule=datamodule,
         validation_uses_test=validation_uses_test,
+        config_profile=config_profile.lower(),
+    )
+
+
+def get_s4_v3_lra_data(
+    task: str,
+    root: str | Path,
+    s4_root: str | Path,
+    batch_size: int,
+    **kwargs,
+) -> LRADataBundle:
+    """Build the dedicated data path matching S4's V3 LRA configs."""
+
+    if "config_profile" in kwargs:
+        raise TypeError("get_s4_v3_lra_data fixes config_profile='v3'")
+    return get_s4_lra_data(
+        task=task,
+        root=root,
+        s4_root=s4_root,
+        batch_size=batch_size,
+        config_profile="v3",
+        **kwargs,
     )
 
 
@@ -480,5 +524,5 @@ if __name__ == "__main__":
     for task_name, info in describe_lra_release(default_root).items():
         print(task_name, info)
 
-    a = get_s4_lra_data(task='pathx',root=default_root,s4_root=s4_root,batch_size=1,num_workers=8,pin_memory=True)
+    a = get_s4_lra_data(task='listops',root=default_root,s4_root=s4_root,batch_size=1,num_workers=8,pin_memory=True,config_profile='v3')
     print(len(a.loaders['train']), len(a.loaders['dev']), len(a.loaders['test']))

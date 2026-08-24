@@ -1,4 +1,4 @@
-"""Train S4/MMDEND-style models on official-S4 Long Range Arena data.
+"""Train S4-family models on official-S4 Long Range Arena data.
 
 Dataset preprocessing and undisclosed training details follow the local S4
 repository. Base learning rate, base weight decay, batch size, and epoch count
@@ -6,6 +6,15 @@ follow MMDEND Appendix C, Table 7. DEND and SOMA use dedicated optimizer
 groups. By default the activation immediately after FFTConv in each S4 block
 uses the project's DEND+SOMA module. The final activation can instead be
 replaced independently, while the residual path retains its S4 definition.
+
+The optional ``spikingssm_pathx`` recipe is isolated from that existing route.
+It follows the local SDN repository's PathX S4D model and training config, with
+only the SDN activation replaced by this project's DEND+SOMA module.
+
+The ``s4_v3`` recipe is a separate, config-faithful route for the six archived
+``old/v3-s4-*.yaml`` experiments. It restores their model, decoder, data,
+optimizer, scheduler, batch, epoch, and seed settings without changing the
+existing MMDEND/V4 route.
 """
 
 from __future__ import annotations
@@ -31,7 +40,11 @@ from torch.cuda import amp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm.auto import tqdm
 
-from lra_dataset import canonicalize_lra_task, get_s4_lra_data
+from lra_dataset import (
+    canonicalize_lra_task,
+    get_s4_lra_data,
+    get_s4_v3_lra_data,
+)
 
 import warnings
 
@@ -50,6 +63,20 @@ MMDEND_TRAINING_PRESETS: Dict[str, Dict[str, float | int]] = {
     },
     "listops": {"lr": 0.01, "weight_decay": 0.05, "batch_size": 32, "epochs": 40},
     "pathx": {"lr": 0.001, "weight_decay": 0.05, "batch_size": 16, "epochs": 50},
+}
+
+# SDN/configs/experiment/spikingssm/pathx.yaml. These values deliberately
+# remain separate from the MMDEND presets above.
+SPIKINGSSM_PATHX_TRAINING_PRESET: Dict[str, float | int] = {
+    "lr": 0.001,
+    "weight_decay": 0.01,
+    "batch_size": 16,
+    "epochs": 50,
+}
+
+SPIKINGSSM_PATHX_SCHEDULER_PRESET: Dict[str, int] = {
+    "num_training_steps": 500000,
+    "num_warmup_steps": 50000,
 }
 
 # state-spaces/s4 configs/experiment/lra/s4-*.yaml at the local S4 revision.
@@ -72,11 +99,56 @@ S4_TRAINING_SEEDS = {
 }
 
 
+# state-spaces/s4 configs/experiment/lra/old/v3-s4-*.yaml. These values are
+# deliberately duplicated instead of inheriting MMDEND_TRAINING_PRESETS: the
+# V3 ListOps batch size and Pathfinder weight decay are different.
+S4_V3_TRAINING_PRESETS: Dict[str, Dict[str, float | int]] = {
+    "aan": {"lr": 0.01, "weight_decay": 0.05, "batch_size": 64, "epochs": 20},
+    "cifar": {"lr": 0.01, "weight_decay": 0.05, "batch_size": 50, "epochs": 200},
+    "imdb": {"lr": 0.01, "weight_decay": 0.05, "batch_size": 16, "epochs": 32},
+    "pathfinder": {
+        "lr": 0.004,
+        "weight_decay": 0.03,
+        "batch_size": 64,
+        "epochs": 200,
+    },
+    "listops": {"lr": 0.01, "weight_decay": 0.05, "batch_size": 50, "epochs": 40},
+    "pathx": {"lr": 0.001, "weight_decay": 0.05, "batch_size": 16, "epochs": 50},
+}
+
+S4_V3_SCHEDULER_PRESETS: Dict[str, Dict[str, int]] = {
+    # V3 inherits 1000 warmup steps from scheduler/cosine_warmup.yaml when the
+    # experiment file does not override that field.
+    "aan": {"num_training_steps": 50000, "num_warmup_steps": 2500},
+    "cifar": {"num_training_steps": 180000, "num_warmup_steps": 900},
+    "imdb": {"num_training_steps": 50000, "num_warmup_steps": 1000},
+    "pathfinder": {"num_training_steps": 500000, "num_warmup_steps": 2500},
+    "listops": {"num_training_steps": 80000, "num_warmup_steps": 1000},
+    "pathx": {"num_training_steps": 500000, "num_warmup_steps": 50000},
+}
+
+S4_V3_TRAINING_SEEDS = {task: 2222 for task in S4_V3_TRAINING_PRESETS}
+
+
 def load_s4_lra_module():
+    module_name = "_vit_dend_s4_lra_shared"
+    if module_name in sys.modules:
+        return sys.modules[module_name]
     path = Path(__file__).resolve().parent / "model" / "s4_lra.py"
-    spec = importlib.util.spec_from_file_location("s4_lra_file", path)
+    spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Could not load S4 LRA module from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_spikingssm_pathx_module():
+    path = Path(__file__).resolve().parent / "model" / "spikingssm_pathx.py"
+    spec = importlib.util.spec_from_file_location("spikingssm_pathx_file", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load SpikingSSM PathX module from {path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -157,6 +229,8 @@ def _backbone_no_weight_decay_parameter_ids(model: nn.Module) -> set[int]:
         roots.append(model.blocks)
     if hasattr(model, "final_norm"):
         roots.append(model.final_norm)
+    if hasattr(model, "backbone"):
+        roots.append(model.backbone)
 
     no_weight_decay_ids = set()
     for root in roots:
@@ -180,8 +254,10 @@ def setup_optimizer(
     dend_weight_decay: float = 0.0,
     soma_lr: float = 5e-4,
     soma_weight_decay: float = 0.0,
+    dedicated_dend_soma_groups: bool = True,
+    exclude_bias_norm_from_weight_decay: bool = True,
 ) -> optim.Optimizer:
-    """Create disjoint AdamW groups for base, S4, DEND, and SOMA parameters."""
+    """Create AdamW groups while honoring official S4 ``_optim`` hooks."""
 
     hyperparameters = {
         "lr": lr,
@@ -204,16 +280,24 @@ def setup_optimizer(
     def belongs_to(name: str, component: str) -> bool:
         return component in name.split(".")
 
-    dend_parameters = [
-        parameter
-        for name, parameter in named_parameters
-        if belongs_to(name, "dend")
-    ]
-    soma_parameters = [
-        parameter
-        for name, parameter in named_parameters
-        if belongs_to(name, "soma")
-    ]
+    dend_parameters = (
+        [
+            parameter
+            for name, parameter in named_parameters
+            if belongs_to(name, "dend")
+        ]
+        if dedicated_dend_soma_groups
+        else []
+    )
+    soma_parameters = (
+        [
+            parameter
+            for name, parameter in named_parameters
+            if belongs_to(name, "soma")
+        ]
+        if dedicated_dend_soma_groups
+        else []
+    )
     component_ids = {
         id(parameter) for parameter in dend_parameters + soma_parameters
     }
@@ -223,7 +307,11 @@ def setup_optimizer(
         for _, parameter in named_parameters
         if id(parameter) not in component_ids and hasattr(parameter, "_optim")
     ]
-    backbone_no_weight_decay_ids = _backbone_no_weight_decay_parameter_ids(model)
+    backbone_no_weight_decay_ids = (
+        _backbone_no_weight_decay_parameter_ids(model)
+        if exclude_bias_norm_from_weight_decay
+        else set()
+    )
     base_parameters = [
         parameter
         for _, parameter in named_parameters
@@ -470,8 +558,8 @@ def save_checkpoint(state: dict, output_dir: Path, is_best: bool) -> None:
     if is_best:
         torch.save(state, output_dir / "model_best.pth.tar")
 
-# python train_lra_s4.py --task pathx --device cuda:1 --soma-lr 0.001 --dend-lr 0.001 --soma-type psn_integer_ssf    --dend-soma-target gelu  --lr 0.005 --wd 0.005 --dend-lr 0.001 --dend-wd 0.005 --soma-lr 0.005 --soma-wd 0.005 --dend-branches 8  --soma-type psn_integer_ssf  --lr 0.005 --weight-decay 5e-4 --activation standard    --soma-type psn_integer_ssf
-# CUDA_VISIBLE_DEVICES=4,5,6,7 python -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node=4 train_lra_s4.py --task pathx --device cuda --soma-lr 0.001 --dend-lr 0.001 --soma-type psn_integer_ssf --lr 0.01   --dend-compartments 2
+# python train_lra_s4.py --task cifar --device cuda:7 --soma-lr 0.01 --dend-lr 0.01 --soma-type psn_integer_ssf --recipe s4_v3   --dend-soma-target gelu  --lr 0.005 --wd 0.005 --dend-lr 0.001 --dend-wd 0.005 --soma-lr 0.005 --soma-wd 0.005 --dend-branches 8  --soma-type psn_integer_ssf  --lr 0.005 --weight-decay 5e-4 --activation standard    --soma-type psn_integer_ssf
+# CUDA_VISIBLE_DEVICES=1,4,5,6 torchrun --standalone --nproc-per-node=4 train_lra_s4.py --task aan --device cuda --soma-lr 0.001 --dend-lr 0.001 --soma-type psn_integer_ssf --recipe s4_v3 --batch-size 16      --lr 0.01   --dend-compartments 2
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Train S4-LRA with optional DEND+SOMA activations."
@@ -490,6 +578,18 @@ def parse_args():
             "listops",
             "pathx",
         ],
+    )
+    parser.add_argument(
+        "--recipe",
+        default="mmdend_s4",
+        choices=["mmdend_s4", "s4_v3", "spikingssm_pathx"],
+        help=(
+            "mmdend_s4 preserves the existing model/training path; "
+            "s4_v3 follows state-spaces/s4 old/v3-s4-*.yaml; "
+            "spikingssm_pathx uses the local SDN repository's exact PathX "
+            "S4D macro-model and training hyperparameters, replacing only its "
+            "neuron activation with DEND+SOMA."
+        ),
     )
     parser.add_argument(
         "--root",
@@ -531,7 +631,9 @@ def parse_args():
         help=(
             "S4Block activation replaced by DEND+SOMA: the post-FFTConv GELU, "
             "the final_act after output projection, or both. Replacing final_act "
-            "uses an H-to-H projection instead of GLU's H-to-2H projection."
+            "uses an H-to-H projection instead of GLU's H-to-2H projection. "
+            "This option applies to the mmdend_s4 and s4_v3 recipes; "
+            "spikingssm_pathx always uses the SDN neuron position."
         ),
     )
     parser.add_argument("--output-dir", default="", help="Directory for args/checkpoints. Default creates exp/lra-*.")
@@ -543,8 +645,10 @@ def parse_args():
         type=int,
         default=None,
         help=(
-            "Global batch size. Under torchrun it is divided evenly across "
-            "all ranks; for AAN it counts document pairs, not individual documents."
+            "For mmdend_s4 this is the global batch size and is divided across "
+            "torchrun ranks. For s4_v3 and spikingssm_pathx it is the official "
+            "S4/Lightning DataLoader's per-rank batch size. For AAN it counts "
+            "document pairs, not individual documents."
         ),
     )
     parser.add_argument("--lr", type=float, default=None)
@@ -568,8 +672,12 @@ def parse_args():
     parser.add_argument(
         "--eval-test-every-epoch",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Match S4 by evaluating the test loader during each validation epoch.",
+        default=None,
+        help=(
+            "Evaluate the test loader after every validation epoch. Defaults to "
+            "disabled for strict s4_v3 and preserves the existing enabled "
+            "behavior for other recipes."
+        ),
     )
     parser.add_argument("--zero-pad-embedding", action="store_true", help="Use padding_idx=0 in token embedding.")
 
@@ -580,7 +688,10 @@ def parse_args():
         "--dend-lr",
         type=float,
         default=1e-3,
-        help="Peak learning rate for all trainable DEND parameters.",
+        help=(
+            "Peak DEND learning rate when dedicated groups are enabled. "
+            "spikingssm_pathx ignores this value."
+        ),
     )
     parser.add_argument(
         "--dend-weight-decay",
@@ -588,7 +699,10 @@ def parse_args():
         dest="dend_weight_decay",
         type=float,
         default=0.0,
-        help="AdamW weight decay for DEND parameters.",
+        help=(
+            "DEND weight decay when dedicated groups are enabled. "
+            "spikingssm_pathx ignores this value."
+        ),
     )
     parser.add_argument(
         "--dend-integration-backend",
@@ -608,7 +722,10 @@ def parse_args():
         "--soma-lr",
         type=float,
         default=5e-4,
-        help="Peak learning rate for all trainable SOMA parameters.",
+        help=(
+            "Peak SOMA learning rate when dedicated groups are enabled. "
+            "spikingssm_pathx ignores this value."
+        ),
     )
     parser.add_argument(
         "--soma-weight-decay",
@@ -616,7 +733,10 @@ def parse_args():
         dest="soma_weight_decay",
         type=float,
         default=0.0,
-        help="AdamW weight decay for SOMA parameters.",
+        help=(
+            "SOMA weight decay when dedicated groups are enabled. "
+            "spikingssm_pathx ignores this value."
+        ),
     )
     parser.add_argument(
         "--soma-psn-order",
@@ -656,6 +776,15 @@ def parse_args():
             "long-sequence activation memory."
         ),
     )
+    parser.add_argument(
+        "--dedicated-dend-soma-optimizer",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Put DEND and SOMA in their dedicated LR/WD groups. Defaults to "
+            "enabled for DEND+SOMA under mmdend_s4 and s4_v3."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -668,8 +797,35 @@ def main() -> None:
     s4_lra = load_s4_lra_module()
     task_key = canonicalize_lra_task(args.task)
     args.task = task_key
-    training_preset = MMDEND_TRAINING_PRESETS[task_key]
-    scheduler_preset = S4_SCHEDULER_PRESETS[task_key]
+    if args.recipe == "spikingssm_pathx":
+        if task_key != "pathx":
+            raise ValueError(
+                "The spikingssm_pathx recipe is defined only for --task pathx"
+            )
+        if args.activation != "dend_soma":
+            raise ValueError(
+                "The spikingssm_pathx recipe replaces the SDN neuron with "
+                "DEND+SOMA and therefore requires --activation dend_soma"
+            )
+        if args.backend != "official":
+            raise ValueError(
+                "The spikingssm_pathx recipe requires --backend official so it "
+                "can use the same SSMKernelDiag implementation as SDN"
+            )
+        training_preset = SPIKINGSSM_PATHX_TRAINING_PRESET
+        scheduler_preset = SPIKINGSSM_PATHX_SCHEDULER_PRESET
+        seed_preset = S4_TRAINING_SEEDS
+    elif args.recipe == "s4_v3":
+        training_preset = S4_V3_TRAINING_PRESETS[task_key]
+        scheduler_preset = S4_V3_SCHEDULER_PRESETS[task_key]
+        seed_preset = S4_V3_TRAINING_SEEDS
+    else:
+        training_preset = MMDEND_TRAINING_PRESETS[task_key]
+        scheduler_preset = S4_SCHEDULER_PRESETS[task_key]
+        seed_preset = S4_TRAINING_SEEDS
+
+    if args.eval_test_every_epoch is None:
+        args.eval_test_every_epoch = True
 
     args.epochs = (
         int(training_preset["epochs"]) if args.epochs is None else args.epochs
@@ -690,25 +846,35 @@ def main() -> None:
     if args.num_warmup_steps is None:
         args.num_warmup_steps = scheduler_preset["num_warmup_steps"]
     if args.seed is None:
-        args.seed = S4_TRAINING_SEEDS[task_key]
+        args.seed = seed_preset[task_key]
 
     distributed, rank, local_rank, world_size, device = setup_distributed(args)
     set_seed(args.seed)
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = False
 
-    if distributed:
+    if distributed and args.recipe in {"s4_v3", "spikingssm_pathx"}:
+        # Lightning leaves loader.batch_size unchanged on every DDP process.
+        local_batch_size = args.batch_size
+        effective_global_batch_size = args.batch_size * world_size
+        args.batch_size_scope = "per_rank"
+    elif distributed:
         if args.batch_size % world_size != 0:
             raise ValueError(
                 f"Global batch size {args.batch_size} must be divisible by "
                 f"world size {world_size}"
             )
         local_batch_size = args.batch_size // world_size
+        effective_global_batch_size = args.batch_size
+        args.batch_size_scope = "global"
     else:
         local_batch_size = args.batch_size
+        effective_global_batch_size = args.batch_size
+        args.batch_size_scope = "single_process"
     args.distributed = distributed
     args.world_size = world_size
     args.local_batch_size = local_batch_size
+    args.effective_global_batch_size = effective_global_batch_size
 
     max_samples = {
         "train": args.max_train_samples,
@@ -718,7 +884,8 @@ def main() -> None:
     max_samples = {k: v for k, v in max_samples.items() if v is not None}
     if distributed and not is_main_process():
         dist.barrier()
-    data = get_s4_lra_data(
+    data_builder = get_s4_v3_lra_data if args.recipe == "s4_v3" else get_s4_lra_data
+    data = data_builder(
         task=task_key,
         root=args.root,
         s4_root=args.s4_root,
@@ -736,11 +903,51 @@ def main() -> None:
     spec = data.spec
     loaders = data.loaders
     if args.activation == "dend_soma" and args.soma_psn_order is None:
-        args.soma_psn_order = spec.sequence_length ##
-    args.data_pipeline = "official_s4"
-    args.training_hparams_source = "MMDEND Appendix C Table 7"
-    if args.activation == "dend_soma":
-        args.training_hparams_source += " with dedicated DEND/SOMA optimizer groups"
+        args.soma_psn_order = spec.sequence_length
+    args.data_pipeline = (
+        "official_s4_v3" if args.recipe == "s4_v3" else "official_s4_v4"
+    )
+    args.data_config_profile = data.config_profile
+    if args.recipe == "spikingssm_pathx":
+        args.model_source = "local SDN SpikingSSM PathX S4D-Lin implementation"
+        args.training_hparams_source = (
+            "SDN/configs/experiment/spikingssm/pathx.yaml"
+        )
+        args.activation_location = "SDN neuron position after S4D convolution"
+        args.dedicated_dend_soma_optimizer = False
+        args.exclude_bias_norm_from_weight_decay = True
+    elif args.recipe == "s4_v3":
+        args.model_source = (
+            "official S4Block resolved from "
+            "state-spaces/s4 old/v3-s4-*.yaml"
+        )
+        args.training_hparams_source = (
+            "state-spaces/s4 configs/experiment/lra/old/v3-s4-*.yaml"
+        )
+        args.activation_location = args.dend_soma_target
+        if args.dedicated_dend_soma_optimizer is None:
+            args.dedicated_dend_soma_optimizer = args.activation == "dend_soma"
+        if args.activation == "standard":
+            args.dedicated_dend_soma_optimizer = False
+        elif args.dedicated_dend_soma_optimizer:
+            args.training_hparams_source += (
+                " plus dedicated DEND/SOMA optimizer groups"
+            )
+        # V3 predates train.optimizer_param_grouping in configs/config.yaml.
+        args.exclude_bias_norm_from_weight_decay = False
+    else:
+        args.model_source = "official S4Block with MMDEND activation placement"
+        args.training_hparams_source = "MMDEND Appendix C Table 7"
+        args.activation_location = args.dend_soma_target
+        if args.dedicated_dend_soma_optimizer is None:
+            args.dedicated_dend_soma_optimizer = args.activation == "dend_soma"
+        if args.activation == "standard":
+            args.dedicated_dend_soma_optimizer = False
+        elif args.dedicated_dend_soma_optimizer:
+            args.training_hparams_source += (
+                " with dedicated DEND/SOMA optimizer groups"
+            )
+        args.exclude_bias_norm_from_weight_decay = True
     args.drop_last = True
     args.pin_memory = True
     args.validation_uses_test = data.validation_uses_test
@@ -754,43 +961,69 @@ def main() -> None:
         model_overrides["n_layers"] = args.n_layers
     if args.dropout is not None:
         model_overrides["dropout"] = args.dropout
-    if args.activation == "dend_soma":
-        model_overrides.update(
-            {
-                "dend_soma_activation_target": args.dend_soma_target,
-                "dend_soma_num_branches": args.dend_branches,
-                "dend_soma_compartments_per_branch": args.dend_compartments,
-                "dend_soma_branch_degree": args.dend_branch_degree,
-                "dend_soma_dend_backend": args.dend_integration_backend,
-                "dend_soma_soma_type": args.soma_type,
-                "dend_soma_psn_order": args.soma_psn_order,
-                "dend_soma_psn_backend": args.soma_psn_backend,
-                "dend_soma_psn_exp_init": args.soma_psn_exp_init,
-                "dend_soma_psn_threshold_init": args.soma_psn_threshold_init,
-                "dend_soma_ssf_thre": args.soma_ssf_thre,
-                "dend_soma_activation_checkpoint": (
-                    args.dend_soma_activation_checkpoint
-                ),
-            }
+    dend_soma_overrides = {
+        "dend_soma_num_branches": args.dend_branches,
+        "dend_soma_compartments_per_branch": args.dend_compartments,
+        "dend_soma_branch_degree": args.dend_branch_degree,
+        "dend_soma_dend_backend": args.dend_integration_backend,
+        "dend_soma_soma_type": args.soma_type,
+        "dend_soma_psn_order": args.soma_psn_order,
+        "dend_soma_psn_backend": args.soma_psn_backend,
+        "dend_soma_psn_exp_init": args.soma_psn_exp_init,
+        "dend_soma_psn_threshold_init": args.soma_psn_threshold_init,
+        "dend_soma_ssf_thre": args.soma_ssf_thre,
+        "dend_soma_activation_checkpoint": args.dend_soma_activation_checkpoint,
+    }
+
+    if args.recipe == "spikingssm_pathx":
+        spikingssm_pathx = load_spikingssm_pathx_module()
+        model = spikingssm_pathx.build_spikingssm_pathx_dend_soma(
+            d_input=spec.d_input,
+            d_output=spec.d_output,
+            vocab_size=spec.vocab_size,
+            sequence_length=spec.sequence_length,
+            **model_overrides,
+            **dend_soma_overrides,
+        ).to(device)
+    else:
+        if args.activation == "dend_soma":
+            model_overrides.update(dend_soma_overrides)
+            model_overrides["dend_soma_activation_target"] = (
+                args.dend_soma_target
+            )
+        if args.recipe == "s4_v3":
+            builder = (
+                s4_lra.build_dend_soma_s4_lra_v3
+                if args.activation == "dend_soma"
+                else s4_lra.build_standard_s4_lra_v3
+            )
+        else:
+            builder = (
+                s4_lra.build_dend_soma_s4_lra
+                if args.activation == "dend_soma"
+                else s4_lra.build_standard_s4_lra
+            )
+        embedding_padding_idx = (
+            spec.padding_idx if args.zero_pad_embedding else None
         )
+        model = builder(
+            task_key,
+            d_input=spec.d_input,
+            d_output=spec.d_output,
+            vocab_size=spec.vocab_size,
+            backend=args.backend,
+            padding_idx=embedding_padding_idx,
+            **model_overrides,
+        ).to(device)
 
-    builder = (
-        s4_lra.build_dend_soma_s4_lra
-        if args.activation == "dend_soma"
-        else s4_lra.build_standard_s4_lra
-    )
-    embedding_padding_idx = spec.padding_idx if args.zero_pad_embedding else None
-    model = builder(
-        task_key,
-        d_input=spec.d_input,
-        d_output=spec.d_output,
-        vocab_size=spec.vocab_size,
-        backend=args.backend,
-        padding_idx=embedding_padding_idx,
-        **model_overrides,
-    ).to(device)
+    if args.recipe in {"s4_v3", "spikingssm_pathx"}:
+        args.resolved_model_config = dict(model.config.__dict__)
+    else:
+        args.resolved_model_config = None
 
-    if distributed:
+    # SDN retains ordinary per-rank BatchNorm from its reference pipeline.
+    args.sync_batchnorm = distributed and args.recipe in {"mmdend_s4", "s4_v3"}
+    if args.sync_batchnorm:
         model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
     criterion = nn.CrossEntropyLoss()
@@ -802,6 +1035,10 @@ def main() -> None:
         dend_weight_decay=args.dend_weight_decay,
         soma_lr=args.soma_lr,
         soma_weight_decay=args.soma_weight_decay,
+        dedicated_dend_soma_groups=args.dedicated_dend_soma_optimizer,
+        exclude_bias_norm_from_weight_decay=(
+            args.exclude_bias_norm_from_weight_decay
+        ),
     )
     scheduler, scheduler_interval = build_scheduler(
         optimizer,
@@ -819,6 +1056,8 @@ def main() -> None:
             device_ids=[local_rank],
             output_device=local_rank,
             broadcast_buffers=True,
+            # The channel-preserving dendrite keeps inactive readout parameters
+            # for interface compatibility, so DDP must tolerate unused tensors.
             find_unused_parameters=args.activation == "dend_soma",
         )
         set_seed(args.seed + rank)
@@ -828,10 +1067,17 @@ def main() -> None:
         stamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
         activation_label = args.activation
         if args.activation == "dend_soma":
-            activation_label += f"-{args.dend_soma_target}"
-        output_dir_value = str(
-            Path("exp") / f"lra-new-{task_key}-{activation_label}-{stamp}"
+            activation_label += (
+                "-sdn-neuron"
+                if args.recipe == "spikingssm_pathx"
+                else f"-{args.dend_soma_target}"
+            )
+        run_name = (
+            f"lra-new-{task_key}-{activation_label}-{stamp}"
+            if args.recipe == "mmdend_s4"
+            else f"lra-{args.recipe}-{task_key}-{activation_label}-{stamp}"
         )
+        output_dir_value = str(Path("exp") / run_name)
     if distributed:
         output_dir_values = [output_dir_value]
         dist.broadcast_object_list(output_dir_values, src=0)
@@ -849,6 +1095,12 @@ def main() -> None:
     if args.resume:
         checkpoint = torch.load(args.resume, map_location=device)
         checkpoint_args = checkpoint.get("args") or {}
+        checkpoint_recipe = checkpoint_args.get("recipe", "mmdend_s4")
+        if checkpoint_recipe != args.recipe:
+            raise ValueError(
+                "Checkpoint recipe does not match this run: "
+                f"{checkpoint_recipe!r} != {args.recipe!r}"
+            )
         checkpoint_activation = checkpoint_args.get("activation")
         if (
             checkpoint_activation is not None
@@ -858,7 +1110,10 @@ def main() -> None:
                 "Checkpoint activation mode does not match this run: "
                 f"{checkpoint_activation!r} != {args.activation!r}"
             )
-        if args.activation == "dend_soma":
+        if args.activation == "dend_soma" and args.recipe in {
+            "mmdend_s4",
+            "s4_v3",
+        }:
             checkpoint_target = checkpoint_args.get("dend_soma_target", "gelu")
             if checkpoint_target != args.dend_soma_target:
                 raise ValueError(
@@ -882,28 +1137,53 @@ def main() -> None:
 
     if is_main_process():
         print(f"Task={task_key} spec={spec}")
-        print(f"Device={device} backend={args.backend} activation={args.activation}")
+        print(
+            f"Recipe={args.recipe} device={device} backend={args.backend} "
+            f"activation={args.activation}"
+        )
+        print(f"Model source={args.model_source}")
+        if args.resolved_model_config is not None:
+            print(f"Resolved model config={args.resolved_model_config}")
         if distributed:
             print(
-                f"DDP world_size={world_size} global_batch_size={args.batch_size} "
-                f"local_pair_batch_size={local_batch_size} sync_batchnorm=True"
+                f"DDP world_size={world_size} "
+                f"effective_global_batch_size={args.effective_global_batch_size} "
+                f"local_batch_size={local_batch_size} "
+                f"configured_batch_scope={args.batch_size_scope} "
+                f"sync_batchnorm={args.sync_batchnorm}"
             )
         if args.activation == "dend_soma":
             print(
                 "DEND+SOMA "
-                f"target={args.dend_soma_target} "
+                f"target={args.activation_location} "
                 f"branches={args.dend_branches} compartments={args.dend_compartments} "
                 f"branch_degree={args.dend_branch_degree} "
                 f"dend_backend={args.dend_integration_backend} "
-                f"dend_lr={args.dend_lr} dend_wd={args.dend_weight_decay} "
-                f"soma={args.soma_type} soma_lr={args.soma_lr} "
-                f"soma_wd={args.soma_weight_decay} "
+                f"soma={args.soma_type} "
                 f"psn_order={args.soma_psn_order} psn_backend={args.soma_psn_backend} "
                 f"activation_checkpoint={args.dend_soma_activation_checkpoint}"
             )
+            if args.dedicated_dend_soma_optimizer:
+                print(
+                    "DEND/SOMA optimizer "
+                    f"dend_lr={args.dend_lr} dend_wd={args.dend_weight_decay} "
+                    f"soma_lr={args.soma_lr} soma_wd={args.soma_weight_decay}"
+                )
+            else:
+                weight_decay_detail = (
+                    "with zero decay for biases and normalization parameters"
+                    if args.exclude_bias_norm_from_weight_decay
+                    else "with V3 weight decay on all non-S4 parameters"
+                )
+                print(
+                    "DEND/SOMA optimizer=official S4 base grouping "
+                    f"lr={args.lr} weight_decay={args.weight_decay} "
+                    f"{weight_decay_detail}"
+                )
         print(f"Output dir={output_dir}")
         print(
-            "Data pipeline=official S4 "
+            f"Data pipeline={args.data_pipeline} "
+            f"profile={args.data_config_profile} "
             f"data_dir={spec.data_dir} drop_last=True pin_memory=True "
             f"workers={args.workers}"
         )
@@ -913,11 +1193,13 @@ def main() -> None:
                 "for validation/checkpoint selection"
             )
         print(
-            f"Epochs={args.epochs} global_batch_size={args.batch_size} "
+            f"Epochs={args.epochs} "
+            f"effective_global_batch_size={args.effective_global_batch_size} "
             f"lr={args.lr} weight_decay={args.weight_decay} "
             f"train_batches={len(loaders['train'])} scheduler={args.scheduler}/{scheduler_interval} "
             f"warmup_steps={args.num_warmup_steps} total_steps={args.num_training_steps}"
         )
+        print(f"Training hyperparameters={args.training_hparams_source}")
 
     for epoch in range(start_epoch, args.epochs):
         train_sampler = getattr(loaders["train"], "sampler", None)

@@ -50,6 +50,7 @@ class S4LRAConfig:
     dt_transform: str = "softplus"
     n_ssm: Optional[int] = None
     retrieval: bool = False
+    decoder_mode: str = "pool"
     use_dend_soma_activation: bool = False
     dend_soma_activation_target: str = "gelu"
     dend_soma_num_branches: int = 2
@@ -336,8 +337,8 @@ class DendSomaS4Activation(nn.Module):
         # Reset inside the checkpointed region so backward recomputation starts
         # from the same zero-state trajectory as the original forward pass.
         self._reset_state()
-        #return self.soma(self.dend(x_seq))
-        return self.soma(x_seq)
+        return self.soma(self.dend(x_seq))
+        #return self.soma(x_seq)
 
     def _apply_time_first(self, x_seq: Tensor) -> Tensor:
         if (
@@ -395,6 +396,7 @@ def replace_s4_activation(
     if gelu_activation is not None:
         if hasattr(s4_module, "activation"):
             s4_module.activation = gelu_activation
+            print("change gelu activation to dend+soma activation")
         elif hasattr(s4_module, "layer") and hasattr(s4_module.layer, "activation"):
             s4_module.layer.activation = gelu_activation
         else:
@@ -415,6 +417,7 @@ def replace_s4_activation(
                 "replacing final_act with a channel-preserving activation."
             )
         output_linear[-1] = final_act_activation
+        print("change final_act to dend+soma activation")
 
 
 class StandardS4Block(nn.Module):
@@ -601,7 +604,8 @@ class StandardS4ForLRA(nn.Module):
 
     Continuous inputs use shape ``(B, L, d_input)``. Token inputs set
     ``vocab_size`` and use shape ``(B, L)``.
-    Sequence length ``L`` is pooled by mean pooling after the final S4 block.
+    Sequence length ``L`` is reduced using the configured official-S4 decoder
+    mode after the final S4 block.
     """
 
     def __init__(
@@ -626,6 +630,7 @@ class StandardS4ForLRA(nn.Module):
         dt_transform: str = "softplus",
         n_ssm: Optional[int] = None,
         retrieval: bool = False,
+        decoder_mode: str = "pool",
         use_dend_soma_activation: bool = False,
         dend_soma_activation_target: str = "gelu",
         dend_soma_num_branches: int = 2,
@@ -660,6 +665,9 @@ class StandardS4ForLRA(nn.Module):
         self.transposed = transposed
         self.prenorm = prenorm
         self.norm_kind = norm.lower()
+        self.decoder_mode = decoder_mode.lower()
+        if self.decoder_mode not in {"pool", "last"}:
+            raise ValueError("decoder_mode must be either 'pool' or 'last'")
         self.config = S4LRAConfig(
             d_input=d_input,
             d_output=d_output,
@@ -681,6 +689,7 @@ class StandardS4ForLRA(nn.Module):
             dt_transform=dt_transform,
             n_ssm=n_ssm,
             retrieval=retrieval,
+            decoder_mode=self.decoder_mode,
             use_dend_soma_activation=use_dend_soma_activation,
             dend_soma_activation_target=dend_soma_activation_target,
             dend_soma_num_branches=dend_soma_num_branches,
@@ -749,6 +758,30 @@ class StandardS4ForLRA(nn.Module):
             else nn.Linear(d_model, d_output)
         )
 
+    def _decode_sequence(
+        self,
+        x: Tensor,
+        lengths: Optional[Tensor],
+    ) -> Tensor:
+        """Apply the official LRA ``pool`` or ``last`` feature decoder."""
+
+        if self.decoder_mode == "last":
+            if lengths is None:
+                return x[:, -1]
+            indices = lengths.to(device=x.device, dtype=torch.long)
+            indices = indices.clamp(min=1, max=x.size(1)) - 1
+            batch_indices = torch.arange(x.size(0), device=x.device)
+            return x[batch_indices, indices]
+
+        if lengths is None:
+            return x.mean(dim=1)
+        mask = (
+            torch.arange(x.size(1), device=x.device).unsqueeze(0)
+            < lengths.unsqueeze(1)
+        )
+        x = (x * mask.unsqueeze(-1)).sum(dim=1)
+        return x / lengths.clamp_min(1).unsqueeze(-1)
+
     @staticmethod
     def _select_s4_factory(backend: str) -> S4LayerFactory:
         backend = backend.lower()
@@ -792,12 +825,7 @@ class StandardS4ForLRA(nn.Module):
 
         if self.transposed:
             x = x.transpose(-1, -2)
-        if lengths is None:
-            x = x.mean(dim=1)
-        else:
-            mask = torch.arange(x.size(1), device=x.device).unsqueeze(0) < lengths.unsqueeze(1)
-            x = (x * mask.unsqueeze(-1)).sum(dim=1)
-            x = x / lengths.clamp_min(1).unsqueeze(-1)
+        x = self._decode_sequence(x, lengths)
 
         return self.decoder(x)
 
@@ -813,6 +841,7 @@ LRA_S4_PRESETS: Dict[str, Dict[str, object]] = {
         "l_max": 2048,
         "layer_lr": {"dt": None, "A": 0.001, "B": 0.001},
         "n_ssm": 1,
+        "decoder_mode": "pool",
     },
     "text": {
         "n_layers": 6,
@@ -824,6 +853,7 @@ LRA_S4_PRESETS: Dict[str, Dict[str, object]] = {
         "l_max": 4096,
         "layer_lr": {"dt": None, "A": 0.001, "B": 0.001},
         "n_ssm": 1,
+        "decoder_mode": "pool",
     },
     "imdb": {
         "n_layers": 6,
@@ -835,6 +865,7 @@ LRA_S4_PRESETS: Dict[str, Dict[str, object]] = {
         "l_max": 4096,
         "layer_lr": {"dt": None, "A": 0.001, "B": 0.001},
         "n_ssm": 1,
+        "decoder_mode": "pool",
     },
     "aan": {
         "n_layers": 6,
@@ -847,6 +878,7 @@ LRA_S4_PRESETS: Dict[str, Dict[str, object]] = {
         "layer_lr": {"dt": None, "A": 0.001, "B": 0.001},
         "n_ssm": 1,
         "retrieval": True,
+        "decoder_mode": "pool",
     },
     "retrieval": {
         "n_layers": 6,
@@ -859,6 +891,7 @@ LRA_S4_PRESETS: Dict[str, Dict[str, object]] = {
         "layer_lr": {"dt": None, "A": 0.001, "B": 0.001},
         "n_ssm": 1,
         "retrieval": True,
+        "decoder_mode": "pool",
     },
     "image": {
         "n_layers": 6,
@@ -870,6 +903,7 @@ LRA_S4_PRESETS: Dict[str, Dict[str, object]] = {
         "prenorm": False,
         "l_max": 1024,
         "n_ssm": 1,
+        "decoder_mode": "pool",
     },
     "cifar": {
         "n_layers": 6,
@@ -881,6 +915,7 @@ LRA_S4_PRESETS: Dict[str, Dict[str, object]] = {
         "prenorm": False,
         "l_max": 1024,
         "n_ssm": 1,
+        "decoder_mode": "pool",
     },
     "pathfinder": {
         "n_layers": 6,
@@ -891,6 +926,7 @@ LRA_S4_PRESETS: Dict[str, Dict[str, object]] = {
         "prenorm": True,
         "l_max": 1024,
         "n_ssm": None,
+        "decoder_mode": "pool",
     },
     "pathx": {
         "n_layers": 6,
@@ -902,8 +938,145 @@ LRA_S4_PRESETS: Dict[str, Dict[str, object]] = {
         "l_max": 16384,
         "dt_min": 0.0001,
         "n_ssm": None,
+        "decoder_mode": "pool",
     },
 }
+
+
+# state-spaces/s4 configs/experiment/lra/old/v3-s4-*.yaml. Keep this
+# independent from LRA_S4_PRESETS so V4/MMDEND experiments cannot silently
+# inherit a V3 architectural setting. ``dt_transform='exp'`` restores the V3
+# log-dt parameterization used before the V4 switch to softplus.
+LRA_S4_V3_PRESETS: Dict[str, Dict[str, object]] = {
+    "listops": {
+        "n_layers": 8,
+        "d_model": 128,
+        "d_state": 64,
+        "dropout": 0.0,
+        "tie_dropout": True,
+        "norm": "batch",
+        "prenorm": False,
+        "l_max": 2048,
+        "layer_lr": {"dt": None, "A": 0.001, "B": 0.001},
+        "dt_min": 0.001,
+        "dt_max": 0.1,
+        "dt_transform": "exp",
+        "n_ssm": "d_model",
+        "decoder_mode": "pool",
+    },
+    "imdb": {
+        "n_layers": 6,
+        "d_model": 256,
+        "d_state": 64,
+        "dropout": 0.0,
+        "tie_dropout": True,
+        "norm": "batch",
+        "prenorm": True,
+        "l_max": 4096,
+        "layer_lr": {"dt": None, "A": 0.001, "B": 0.001},
+        "dt_min": 0.001,
+        "dt_max": 0.1,
+        "dt_transform": "exp",
+        "n_ssm": None,
+        "decoder_mode": "pool",
+    },
+    "cifar": {
+        "n_layers": 6,
+        "d_model": 512,
+        "d_state": 64,
+        "dropout": 0.1,
+        "tie_dropout": True,
+        "norm": "layer",
+        "prenorm": False,
+        "l_max": 1024,
+        "layer_lr": {"dt": None, "A": 0.001, "B": 0.001},
+        "dt_min": 0.001,
+        "dt_max": 0.1,
+        "dt_transform": "exp",
+        "n_ssm": 2,
+        "decoder_mode": "pool",
+    },
+    "aan": {
+        "n_layers": 6,
+        "d_model": 256,
+        "d_state": 64,
+        "dropout": 0.0,
+        "tie_dropout": True,
+        "norm": "batch",
+        "prenorm": True,
+        "l_max": 4000,
+        "layer_lr": {"dt": None, "A": 0.001, "B": 0.001},
+        "dt_min": 0.001,
+        "dt_max": 0.1,
+        "dt_transform": "exp",
+        "n_ssm": 256,
+        "retrieval": True,
+        "decoder_mode": "pool",
+    },
+    "pathfinder": {
+        "n_layers": 6,
+        "d_model": 256,
+        "d_state": 64,
+        "dropout": 0.0,
+        "tie_dropout": True,
+        "norm": "batch",
+        "prenorm": True,
+        "l_max": 1024,
+        "layer_lr": 0.001,
+        "dt_min": 0.001,
+        "dt_max": 0.1,
+        "dt_transform": "exp",
+        "n_ssm": "d_model",
+        "decoder_mode": "last",
+    },
+    "pathx": {
+        "n_layers": 6,
+        "d_model": 256,
+        "d_state": 64,
+        "dropout": 0.0,
+        "tie_dropout": True,
+        "norm": "batch",
+        "prenorm": True,
+        "l_max": 16384,
+        "layer_lr": 0.0005,
+        "dt_min": 0.0001,
+        "dt_max": 0.1,
+        "dt_transform": "exp",
+        "n_ssm": None,
+        "decoder_mode": "pool",
+    },
+}
+
+
+def _build_s4_lra_from_presets(
+    presets: Mapping[str, Mapping[str, object]],
+    task: str,
+    d_input: int,
+    d_output: int,
+    vocab_size: Optional[int],
+    backend: str,
+    overrides: Mapping[str, object],
+) -> StandardS4ForLRA:
+    task_key = task.lower()
+    task_key = {"text": "imdb", "image": "cifar", "retrieval": "aan"}.get(
+        task_key,
+        task_key,
+    )
+    if task_key not in presets:
+        choices = ", ".join(sorted(presets))
+        raise KeyError(f"Unknown S4 LRA task '{task}'. Available tasks: {choices}")
+
+    config = dict(presets[task_key])
+    config.update(overrides)
+    if config.get("n_ssm") == "d_model":
+        config["n_ssm"] = config["d_model"]
+    return StandardS4ForLRA(
+        d_input=d_input,
+        d_output=d_output,
+        vocab_size=vocab_size,
+        backend=backend,
+        **config,
+    )
 
 
 def build_standard_s4_lra(
@@ -916,17 +1089,14 @@ def build_standard_s4_lra(
 ) -> StandardS4ForLRA:
     """Build the S4 backbone with MMDEND/S4-repo LRA task defaults."""
 
-    config = dict(LRA_S4_PRESETS.get(task.lower(), {}))
-    config.update(overrides)
-    #config.setdefault("n_layers", 6)
-    if config.get("n_ssm") == "d_model":
-        config["n_ssm"] = config["d_model"]
-    return StandardS4ForLRA(
-        d_input=d_input,
-        d_output=d_output,
-        vocab_size=vocab_size,
-        backend=backend,
-        **config,
+    return _build_s4_lra_from_presets(
+        LRA_S4_PRESETS,
+        task,
+        d_input,
+        d_output,
+        vocab_size,
+        backend,
+        overrides,
     )
 
 
@@ -942,6 +1112,48 @@ def build_dend_soma_s4_lra(
 
     overrides.setdefault("use_dend_soma_activation", True)
     return build_standard_s4_lra(
+        task=task,
+        d_input=d_input,
+        d_output=d_output,
+        vocab_size=vocab_size,
+        backend=backend,
+        **overrides,
+    )
+
+
+def build_standard_s4_lra_v3(
+    task: str,
+    d_input: int,
+    d_output: int,
+    vocab_size: Optional[int] = None,
+    backend: str = "official",
+    **overrides,
+) -> StandardS4ForLRA:
+    """Build the exact model configuration from ``old/v3-s4-*.yaml``."""
+
+    return _build_s4_lra_from_presets(
+        LRA_S4_V3_PRESETS,
+        task,
+        d_input,
+        d_output,
+        vocab_size,
+        backend,
+        overrides,
+    )
+
+
+def build_dend_soma_s4_lra_v3(
+    task: str,
+    d_input: int,
+    d_output: int,
+    vocab_size: Optional[int] = None,
+    backend: str = "official",
+    **overrides,
+) -> StandardS4ForLRA:
+    """Build the V3 S4 configuration with only its activation replaced."""
+
+    overrides.setdefault("use_dend_soma_activation", True)
+    return build_standard_s4_lra_v3(
         task=task,
         d_input=d_input,
         d_output=d_output,
