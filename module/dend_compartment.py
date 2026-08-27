@@ -57,6 +57,70 @@ def _causal_fft_convolution_time_first(
     return _causal_fft_convolution_impl(x, kernel)
 
 
+def _causal_fft_template_convolution_impl(
+    x: torch.Tensor,
+    kernel_template: torch.Tensor,
+    branch_index: torch.Tensor,
+    input_gain: torch.Tensor,
+) -> torch.Tensor:
+    """Convolve with branch templates gathered after their shared FFT."""
+    T = x.shape[0]
+    kernel_length = kernel_template.shape[-1]
+    if T <= 0 or kernel_length <= 0:
+        raise ValueError("x and kernel_template must have non-empty time dimensions")
+
+    linear_length = T + kernel_length - 1
+    n_fft = 1 << (linear_length - 1).bit_length()
+    work_dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
+    x_work = x.movedim(0, -1).to(dtype=work_dtype)
+    kernel_work = kernel_template.to(device=x.device, dtype=work_dtype)
+
+    x_f = torch.fft.rfft(x_work, n=n_fft, dim=-1)
+    kernel_f = torch.fft.rfft(kernel_work, n=n_fft, dim=-1)
+    kernel_f = kernel_f[branch_index.to(device=kernel_f.device)]
+
+    spatial_dims = x.dim() - 5
+    kernel_f = kernel_f.reshape(
+        1,
+        *kernel_f.shape[:-1],
+        *([1] * spatial_dims),
+        kernel_f.shape[-1],
+    )
+    input_gain = input_gain.to(device=x.device, dtype=work_dtype)
+    y = torch.fft.irfft(
+        x_f * kernel_f * input_gain,
+        n=n_fft,
+        dim=-1,
+    )[..., :T].clone(memory_format=torch.contiguous_format)
+    return y.movedim(-1, 0).to(dtype=x.dtype)
+
+
+def _causal_fft_template_convolution_time_first(
+    x: torch.Tensor,
+    kernel_template: torch.Tensor,
+    branch_index: torch.Tensor,
+    input_gain: torch.Tensor,
+) -> torch.Tensor:
+    """Apply shared branch kernels while recomputing FFT workspaces in backward."""
+    if torch.is_grad_enabled() and (
+        x.requires_grad or kernel_template.requires_grad or input_gain.requires_grad
+    ):
+        return checkpoint(
+            _causal_fft_template_convolution_impl,
+            x,
+            kernel_template,
+            branch_index,
+            input_gain,
+            use_reentrant=False,
+        )
+    return _causal_fft_template_convolution_impl(
+        x,
+        kernel_template,
+        branch_index,
+        input_gain,
+    )
+
+
 class BaseDendCompartment(base.MemoryModule, abc.ABC):
     """Base class for all dendritic compartments.
 
@@ -1534,24 +1598,21 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
 
         T = x_seq.shape[0]
         spatial_dims = x_seq.dim() - 3
-        tau = self._edge_branch_value(self.tau_compartments)
         kernel, init_factor = self._build_exponential_fft_terms(
-            tau,
+            self.tau_compartments,
             T,
             x_seq.dtype,
             x_seq.device,
         )
-        kernel = kernel.view(
-            1,
-            self.branch_degree,
-            self.channels,
-            self.compartments_per_branch,
-            *([1] * spatial_dims),
-            T,
-        )
         drive, input_gain = self._build_fft_drive(x_seq)
-        state_seq = _causal_fft_convolution_time_first(drive, kernel * input_gain)
+        state_seq = _causal_fft_template_convolution_time_first(
+            drive,
+            kernel,
+            self._edge_index(kernel.device),
+            input_gain,
+        )
 
+        init_factor = self._edge_branch_value(init_factor)
         init_factor = init_factor.movedim(-1, 0).view(
             T,
             1,

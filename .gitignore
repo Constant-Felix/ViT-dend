@@ -1,5 +1,7 @@
 output/
 exp/
+pymp-*
+torchinductor_hyx
 all_spike/
 logs/
 events.*
