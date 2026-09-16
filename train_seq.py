@@ -230,122 +230,8 @@ class RandomCutmix(torch.nn.Module):
         )
         return s
 
-class IFNode5(nn.Module):
-    def __init__(self, T: int, surrogate_function: surrogate.SurrogateFunctionBase):
-        super().__init__()
-        self.surrogate_function = surrogate_function
-        self.fc = nn.Linear(T, T)
-        nn.init.constant_(self.fc.bias, -1)
-
-    def forward(self, x_seq: torch.Tensor):
-        # x_seq.shape = [T, N, *]
-        h_seq = torch.addmm(self.fc.bias.unsqueeze(1), self.fc.weight, x_seq.flatten(1))
-        spike = self.surrogate_function(h_seq)
-        return spike.view(x_seq.shape)
-
-class MaskedSlidingPSN(nn.Module):
-    def gen_gemm_weight(self, T: int):
-        weight = torch.zeros([T, T], device=self.weight.device)
-        for i in range(T):
-            end = i + 1
-            start = max(0, i + 1 - self.order)
-            length = min(end - start, self.order)
-            weight[i][start: end] = self.weight[self.order - length: self.order]
-
-        return weight
-
-
-    def __init__(self, order: int, surrogate_function, exp_init: bool, backend='gemm'):
-        super().__init__()
-        self.order = order
-        self.backend = backend
-        if self.backend == 'gemm':
-            if exp_init:
-                weight = torch.ones([order])
-                for i in range(order - 2, -1, -1):
-                    weight[i] = weight[i + 1] / 2.
-
-                self.weight = nn.Parameter(weight)
-            else:
-                self.weight = torch.ones([1, order])
-                nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-                self.weight = nn.Parameter(self.weight[0])
-
-
-            self.threshold = nn.Parameter(torch.as_tensor(-1.))
-            self.surrogate_function = surrogate_function
-
-
-        elif self.backend == 'conv':
-            self.weight = torch.zeros([1, 1, order])
-            nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-            self.weight = nn.Parameter(self.weight)
-            self.threshold = nn.Parameter(torch.as_tensor(1.))
-            self.surrogate_function = surrogate_function
-
-
-    def forward(self, x_seq: torch.Tensor):
-        if self.backend == 'gemm':
-            weight = self.gen_gemm_weight(x_seq.shape[0])
-            h_seq = torch.addmm(self.threshold, weight, x_seq.flatten(1)).view(x_seq.shape)
-            return self.surrogate_function(h_seq)
-
-        elif self.backend == 'conv':
-            # x_seq.shape = [T, N, *]
-            x_seq_shape = x_seq.shape
-            # [T, N, *] -> [T, N] -> [N, T] -> [N, 1, T]
-            x_seq = x_seq.flatten(1).t().unsqueeze(1)
-            x_seq = F.pad(x_seq, pad=(self.order - 1, 0))
-            x_seq = F.conv1d(x_seq, self.weight, stride=1)
-            x_seq = x_seq.squeeze(1).t().view(x_seq_shape)
-            return self.surrogate_function(x_seq - self.threshold)
-        else:
-            raise NotImplementedError(self.backend)
-
-
-class DecayPorderMaskedLinear(nn.Linear):
-    def __init__(self, P: int, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.P = P
-        mask1 = torch.ones_like(self.weight.data)
-        mask0 = torch.tril(mask1) * torch.triu(mask1, -(P - 1))
-        self.register_buffer('mask0', mask0)
-        self.register_buffer('mask1', mask1)
-        self.k = 0.
-        # k should be set as epoch / (epochs - 1)
-
-    @staticmethod
-    @torch.jit.script
-    def gen_mask(k: float, mask0: torch.Tensor, mask1: torch.Tensor):
-        return k * mask0 + (1. - k) * mask1
-
-    @staticmethod
-    @torch.jit.script
-    def gen_masked_weight(weight: torch.Tensor, k: float, mask0: torch.Tensor, mask1: torch.Tensor):
-        return weight * (k * mask0 + (1. - k) * mask1)
-
-    def masked_weight(self):
-        return self.gen_masked_weight(self.weight, self.k, self.mask0, self.mask1)
-
-    def forward(self, x: torch.Tensor):
-        return F.linear(x, self.weight * self.gen_mask(self.k, self.mask0, self.mask1), self.bias)
-
-class IFNode5PorderMaskD(nn.Module):
-    def __init__(self, T: int, surrogate_function: surrogate.SurrogateFunctionBase, P: int):
-        super().__init__()
-        self.surrogate_function = surrogate_function
-        self.fc = DecayPorderMaskedLinear(P, T, T)
-        nn.init.constant_(self.fc.bias, -1)
-
-    def forward(self, x_seq: torch.Tensor):
-        # x_seq.shape = [T, N, *]
-        h_seq = torch.addmm(self.fc.bias.unsqueeze(1), self.fc.masked_weight(), x_seq.flatten(1))
-        spike = self.surrogate_function(h_seq)
-        return spike.view(x_seq.shape)
-    
-
 class CIFAR10Net(nn.Module):
-    def __init__(self, channels, class_num: int, T: int=32, P:int=-1,num_branches=4,compartments_per_branch=4,branch_degree=1):
+    def __init__(self, channels, class_num: int, T: int=32, P:int=-1,num_branches=8,compartments_per_branch=4,branch_degree=1):
         super().__init__()
         conv = []
         for i in range(2):
@@ -356,11 +242,11 @@ class CIFAR10Net(nn.Module):
                     in_channels = channels
                 conv.append(layer.Conv1d(in_channels, channels, kernel_size=3, padding=1, bias=False))
                 conv.append(layer.BatchNorm1d(channels))
-                conv.append(SparseChannelPreservingTrunkDistalDendCompartment(channels,num_branches=num_branches,compartments_per_branch=compartments_per_branch,c_sub=channels,branch_degree=branch_degree,learn_comp_gain=True,learn_edge_gain=True,integration_backend='fft'))
+                conv.append(SparseChannelPreservingTrunkDistalDendCompartment(channels,num_branches=num_branches,compartments_per_branch=compartments_per_branch,c_sub=channels,branch_degree=branch_degree,learn_comp_gain=True,learn_edge_gain=True,integration_backend='fft',merge_norm='mean'))
                 #conv.append(soma.AstroPSNIntergerSoma_ssf(psn_order=T,psn_exp_init=True))
                 #conv.append(soma.AstroMaskedSlidingPSN(order=T,exp_init=True,astro_thre=0.4,astro_pool_kernel=5))
-                #conv.append(soma.PSNIntergerSoma_ssf(psn_order=T,psn_exp_init=True,psn_backend='gemm'))
-                conv.append(soma.MaskedSlidingPSN(order=T,exp_init=True,backend='fft'))
+                conv.append(soma.PSNIntergerSoma_ssf(psn_order=T,psn_exp_init=True,psn_backend='fft'))
+                #conv.append(soma.MaskedSlidingPSN(order=T,exp_init=True,backend='fft'))
 
             conv.append(layer.AvgPool1d(2))
 
@@ -370,11 +256,11 @@ class CIFAR10Net(nn.Module):
         self.fc = nn.Sequential(
             layer.Flatten(),
             layer.Linear(channels * 8, channels * 8 // 4),
-            SparseChannelPreservingTrunkDistalDendCompartment(channels * 2,num_branches=num_branches,compartments_per_branch=compartments_per_branch,c_sub=channels,branch_degree=branch_degree,learn_comp_gain=True,learn_edge_gain=True,integration_backend='fft'),
+            SparseChannelPreservingTrunkDistalDendCompartment(channels * 2,num_branches=num_branches,compartments_per_branch=compartments_per_branch,c_sub=channels,branch_degree=branch_degree,learn_comp_gain=True,learn_edge_gain=True,integration_backend='fft',merge_norm='mean'),
             #soma.AstroPSNIntergerSoma_ssf(psn_order=T,psn_exp_init=True),
             #soma.AstroMaskedSlidingPSN(order=T,exp_init=True,astro_thre=0.4,astro_pool_kernel=5),
-            soma.MaskedSlidingPSN(order=T,exp_init=True,backend='fft'),
-            #soma.PSNIntergerSoma_ssf(psn_order=T,psn_exp_init=True,psn_backend='gemm'),
+            #soma.MaskedSlidingPSN(order=T,exp_init=True,backend='fft'),
+            soma.PSNIntergerSoma_ssf(psn_order=T,psn_exp_init=True,psn_backend='fft'),
             layer.Linear(channels * 8 // 4, class_num),
         )
 
@@ -386,13 +272,13 @@ class CIFAR10Net(nn.Module):
         x_seq = self.fc(self.conv(x_seq))  # [W, N, C]
         return x_seq.mean(0)
 
-# python train_seq.py -data-dir /data/hyx/ViT-dend/data/cifar100 -amp -class-num 100 -channels 128  -warmup-epochs 0  -epochs 400 -opt adamw -lr 0.005 -wd 5e-4 -min-lr 0.00001   -resume logs/pt/None_e400_b128_adamw_lr0.001_c128_20260608-112508_amp_P32/checkpoint_latest.pth
+# python train_seq.py -data-dir /data2/hyx/ViT-dend/data/cifar100 -amp -class-num 100 -channels 128  -warmup-epochs 0  -epochs 400 -opt adamw -lr 0.001   -wd 5e-4 -min-lr 0.00001   -resume logs/pt/None_e400_b128_adamw_lr0.001_c128_20260608-112508_amp_P32/checkpoint_latest.pth
 
 from datetime import datetime
 def main():
 
     parser = argparse.ArgumentParser(description='Classify Sequential CIFAR10/100')
-    parser.add_argument('-device', default='cuda:7', help='device')
+    parser.add_argument('-device', default='cuda:4', help='device')
     parser.add_argument('-b', default=128, type=int, help='batch size')
     parser.add_argument('-epochs', default=256, type=int, metavar='N',
                         help='number of total epochs to run')

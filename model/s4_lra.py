@@ -266,8 +266,10 @@ class DendSomaS4Activation(nn.Module):
         psn_order: int = 32,
         psn_backend: str = "fft",
         psn_exp_init: bool = True,
+        branch_readout_mode: str = "trunk_distal",
         psn_threshold_init: float = 0.0,
         ssf_thre: int = 4,
+        ssf: bool = True,  ##
         activation_checkpoint: bool = True,
     ) -> None:
         super().__init__()
@@ -300,6 +302,7 @@ class DendSomaS4Activation(nn.Module):
             branch_degree=branch_degree,
             integration_backend=dend_backend,
             step_mode="m",
+            branch_readout_mode=branch_readout_mode
         )
         if self.soma_type == "masked_sliding_psn":
             MaskedSlidingPSN = load_local_class(
@@ -324,6 +327,7 @@ class DendSomaS4Activation(nn.Module):
                 psn_backend=psn_backend,
                 psn_threshold_init=psn_threshold_init,
                 thre=ssf_thre,
+                ssf=ssf,
                 step_mode="m",
             )
 
@@ -832,8 +836,8 @@ class StandardS4ForLRA(nn.Module):
 
 LRA_S4_PRESETS: Dict[str, Dict[str, object]] = {
     "listops": {
-        "n_layers": 6,
-        "d_model": 256,
+        "n_layers": 6, #
+        "d_model": 256, #
         "d_state": 4,
         "dropout": 0.0,
         "norm": "batch",
@@ -937,6 +941,8 @@ LRA_S4_PRESETS: Dict[str, Dict[str, object]] = {
         "prenorm": True,
         "l_max": 16384,
         "dt_min": 0.0001,
+        "dt_max": 0.1,
+        "layer_lr": 0.001,
         "n_ssm": None,
         "decoder_mode": "pool",
     },

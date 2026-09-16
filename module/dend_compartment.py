@@ -1262,10 +1262,12 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
         self.distal_gain = nn.Parameter(torch.full((self.num_branches,), float(distal_gain_init)))
         self.distal_residual_gain = nn.Parameter(torch.full((self.num_branches,), float(distal_residual_init)))
         self.branch_strength = nn.Parameter(torch.ones(self.num_branches))
+        # Physical-space readout: C starts at the terminal compartment, while
+        # the branch-level direct feedthrough D starts disabled.
         linear_comp_readout = torch.zeros(self.num_branches, self.compartments_per_branch)
         linear_comp_readout[:, -1] = 1.0
         self.linear_comp_readout = nn.Parameter(linear_comp_readout)
-        self.linear_input_readout = nn.Parameter(torch.zeros(self.num_branches, self.compartments_per_branch))
+        self.linear_input_readout = nn.Parameter(torch.zeros(self.num_branches))
         self.input_residual_scale = nn.Parameter(torch.tensor(float(input_residual_init)))
         self.output_scale = nn.Parameter(torch.tensor(1.0))
 
@@ -1740,9 +1742,10 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
         rms = torch.sqrt(delta.square().mean(dim=reduce_dims, keepdim=True) + 1e-6)
         return delta / rms
 
-    def _compute_linear_branch_output(self, state: torch.Tensor, branch_input: torch.Tensor):
-        if branch_input is None:
-            raise ValueError("branch_input is required when branch_readout_mode='linear'")
+    def _compute_linear_branch_output(self, state: torch.Tensor, raw_input: torch.Tensor):
+        """Apply the routed branch readout C_r z + D_r x to every active edge."""
+        if raw_input is None:
+            raise ValueError("raw_input is required when branch_readout_mode='linear'")
 
         comp_readout = self._edge_branch_value(
             self.linear_comp_readout.to(dtype=state.dtype, device=state.device)
@@ -1751,9 +1754,10 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
             self.linear_input_readout.to(dtype=state.dtype, device=state.device)
         )
         comp_readout = self._view_edge_compartment(comp_readout, state)
-        input_readout = self._view_edge_compartment(input_readout, state)
+        raw_input = raw_input.unsqueeze(1)
+        input_readout = self._view_edge_channel(input_readout, raw_input)
 
-        y = (state * comp_readout).sum(dim=3) + (branch_input * input_readout).sum(dim=3)
+        y = (state * comp_readout).sum(dim=3) + raw_input * input_readout
 
         if self.store_branch_monitor:
             self._branch_mod_step = torch.zeros_like(y).detach()
@@ -1765,9 +1769,9 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
             self._branch_output_step = None
         return y
 
-    def _compute_branch_output(self, state: torch.Tensor, branch_input: torch.Tensor = None):
+    def _compute_branch_output(self, state: torch.Tensor, raw_input: torch.Tensor = None):
         if self.branch_readout_mode == "linear":
-            return self._compute_linear_branch_output(state, branch_input)
+            return self._compute_linear_branch_output(state, raw_input)
 
         trunk = state[:, :, :, 0, ...]
         distal = state[:, :, :, 1:, ...]
@@ -1812,9 +1816,12 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
             y = y / torch.sqrt(degree)
         elif self.merge_norm == "mean":
             y = y / degree
-        return self.output_scale * y + self.input_residual_scale * raw_input
+        y = self.output_scale * y
+        if self.branch_readout_mode != "linear":
+            y = y + self.input_residual_scale * raw_input
+        return y
 
-    def _compute_branch_output_sequence(self, state_seq: torch.Tensor, branch_input_seq: torch.Tensor = None):
+    def _compute_branch_output_sequence(self, state_seq: torch.Tensor, raw_input_seq: torch.Tensor = None):
         T, N = state_seq.shape[:2]
         spatial_shape = state_seq.shape[5:]
         state_flat = state_seq.reshape(
@@ -1824,16 +1831,14 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
             self.compartments_per_branch,
             *spatial_shape,
         )
-        branch_input_flat = None
-        if branch_input_seq is not None:
-            branch_input_flat = branch_input_seq.reshape(
+        raw_input_flat = None
+        if raw_input_seq is not None:
+            raw_input_flat = raw_input_seq.reshape(
                 T * N,
-                self.branch_degree,
                 self.channels,
-                self.compartments_per_branch,
                 *spatial_shape,
             )
-        edge_output_flat = self._compute_branch_output(state_flat, branch_input_flat)
+        edge_output_flat = self._compute_branch_output(state_flat, raw_input_flat)
         edge_output_seq = edge_output_flat.reshape(
             T,
             N,
@@ -1882,7 +1887,7 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
     def _step(self, x: torch.Tensor, v_prev: torch.Tensor):
         branch_input = self._build_branch_input(x)
         state = self._integrate(branch_input, v_prev)
-        edge_output = self._compute_branch_output(state, branch_input)
+        edge_output = self._compute_branch_output(state, x)
         y = self._merge_edges(edge_output, x)
         return y, state
 
@@ -1890,7 +1895,7 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
         branch_input = self._build_branch_input(x)
         v_prev = self._init_state(branch_input)
         state = self._integrate(branch_input, v_prev)
-        edge_output = self._compute_branch_output(state, branch_input)
+        edge_output = self._compute_branch_output(state, x)
         y = self._merge_edges(edge_output, x)
         self.v = state.detach()
         if self.store_v_seq:
@@ -1926,7 +1931,7 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
         for t in range(x_seq.shape[0]):
             if t == 0:
                 state = self._integrate(first_branch_input, v)
-                edge_output = self._compute_branch_output(state, first_branch_input)
+                edge_output = self._compute_branch_output(state, x_seq[t])
                 y = self._merge_edges(edge_output, x_seq[t])
             else:
                 y, state = self._step(x_seq[t], v)
@@ -1979,9 +1984,7 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
                 v_init = self._init_state(branch_input_step)
                 state_seq = self._parallel_integrate_fft(x_seq, v_init)
 
-            needs_branch_input = (
-                self.branch_readout_mode == "linear" or self.store_branch_monitor
-            )
+            needs_branch_input = self.store_branch_monitor
             if needs_branch_input:
                 branch_input_seq = (
                     state_seq
@@ -2000,7 +2003,7 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
                     state_seq = self._parallel_integrate_shared_tau(branch_input_seq, v_init)
                 else:
                     state_seq = self._parallel_integrate(branch_input_seq, v_init)
-        edge_output_seq = self._compute_branch_output_sequence(state_seq, branch_input_seq)
+        edge_output_seq = self._compute_branch_output_sequence(state_seq, x_seq)
         y_seq = self._merge_edges_sequence(edge_output_seq, x_seq)
 
         self.v = state_seq[-1].detach()

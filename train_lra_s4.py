@@ -558,9 +558,9 @@ def save_checkpoint(state: dict, output_dir: Path, is_best: bool) -> None:
     if is_best:
         torch.save(state, output_dir / "model_best.pth.tar")
 
-# python train_lra_s4.py --task imdb --device cuda:5 --soma-lr 0.001 --dend-lr 0.001 --soma-type psn_integer_ssf    --recipe s4_v3   --dend-soma-target gelu  --lr 0.005 --wd 0.005 --dend-lr 0.001 --dend-wd 0.005 --soma-lr 0.005 --soma-wd 0.005 --dend-branches 8  --soma-type psn_integer_ssf  --lr 0.005 --weight-decay 5e-4 --activation standard    --soma-type psn_integer_ssf
-# python train_lra_s4.py --task pathx --recipe spikingssm_pathx --device cuda:7 --soma-lr 0.001 --dend-lr 0.001 --soma-type psn_integer_ssf
-# CUDA_VISIBLE_DEVICES=1,4,5,6 torchrun --standalone --nproc-per-node=4 train_lra_s4.py --task aan --device cuda --soma-lr 0.001 --dend-lr 0.001 --soma-type psn_integer_ssf --recipe s4_v3 --batch-size 16      --lr 0.01   --dend-compartments 2
+# python train_lra_s4.py --task imdb --device cuda:5 --soma-lr 0.001 --dend-lr 0.001 --soma-type psn_integer_ssf  --recipe s4_v3   --dend-soma-target gelu  --lr 0.005 --wd 0.005 --dend-lr 0.001 --dend-wd 0.005 --soma-lr 0.005 --soma-wd 0.005 --dend-branches 8  --soma-type psn_integer_ssf  --lr 0.005 --weight-decay 5e-4 --activation standard    --soma-type psn_integer_ssf
+# CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --standalone --nproc-per-node=4  train_lra_s4.py --task pathx --recipe spikingssm_pathx --soma-lr 0.001 --dend-lr 0.001 --soma-type psn_integer_ssf --batch-size 4
+# CUDA_VISIBLE_DEVICES=0,4,5,6 torchrun --standalone --nproc-per-node=4 train_lra_s4.py --task aan --device cuda --soma-lr 0.001 --dend-lr 0.001 --soma-type psn_integer_ssf --recipe s4_v3 --batch-size 16      --lr 0.01   --dend-compartments 2
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Train S4-LRA with optional DEND+SOMA activations."
@@ -904,7 +904,8 @@ def main() -> None:
     spec = data.spec
     loaders = data.loaders
     if args.activation == "dend_soma" and args.soma_psn_order is None:
-        args.soma_psn_order = spec.sequence_length  ##
+        args.soma_psn_order = spec.sequence_length // 100 ##
+        args.soma_psn_exp_init = True ##
     args.data_pipeline = (
         "official_s4_v3" if args.recipe == "s4_v3" else "official_s4_v4"
     )
@@ -915,7 +916,7 @@ def main() -> None:
             "SDN/configs/experiment/spikingssm/pathx.yaml"
         )
         args.activation_location = "SDN neuron position after S4D convolution"
-        args.dedicated_dend_soma_optimizer = False
+        args.dedicated_dend_soma_optimizer = True
         args.exclude_bias_norm_from_weight_decay = True
     elif args.recipe == "s4_v3":
         args.model_source = (
@@ -1023,7 +1024,7 @@ def main() -> None:
         args.resolved_model_config = None
 
     # SDN retains ordinary per-rank BatchNorm from its reference pipeline.
-    args.sync_batchnorm = distributed and args.recipe in {"mmdend_s4", "s4_v3"}
+    args.sync_batchnorm = distributed #and args.recipe in {"mmdend_s4", "s4_v3"}  ##
     if args.sync_batchnorm:
         model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
@@ -1094,7 +1095,7 @@ def main() -> None:
     start_epoch = 0
     best_val = -1.0
     if args.resume:
-        checkpoint = torch.load(args.resume, map_location=device)
+        checkpoint = torch.load(args.resume, map_location=device,weights_only=False)
         checkpoint_args = checkpoint.get("args") or {}
         checkpoint_recipe = checkpoint_args.get("recipe", "mmdend_s4")
         if checkpoint_recipe != args.recipe:

@@ -157,7 +157,7 @@ class MaskedSlidingPSN(nn.Module):
         return weight
 
 
-    def __init__(self, order: int, surrogate_function=surrogate.Sigmoid(), exp_init: bool=False, backend='fft'):
+    def __init__(self, order: int, surrogate_function=surrogate.Sigmoid(), exp_init: bool=True, backend='fft'):
         super().__init__()
         if order <= 0:
             raise ValueError("order must be positive")
@@ -603,12 +603,12 @@ import torch.nn as nn
 
 class SSF_Quant(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, input, U, v_th):
+    def forward(ctx, input, U):
         ctx.save_for_backward(input)
         ctx.U = U
         # 根据论文公式(17)：先截断，除以阈值，最后向下取整 (floor)
         clipped_input = torch.clamp(input, min=-U, max=U)
-        return torch.floor(clipped_input / v_th)
+        return torch.floor(clipped_input)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -622,24 +622,23 @@ class SSF_Quant(torch.autograd.Function):
         return grad_input, None, None  # 对应 input, U, v_th 的梯度，常数不需要梯度
 
 class SSF(nn.Module):
-    def __init__(self, U: int = 4, v_th: float = 1.0):
+    def __init__(self, U: int = 4):
         super().__init__()
         self.U = U
-        self.v_th = v_th
         
         # 【核心新增】引入可学习的平移参数 phi_p 和缩放参数 phi_s
         # 初始化为不改变原分布的状态 (phi_p=0, phi_s=1)
-        self.phi_p = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
-        self.phi_s = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+        #self.phi_p = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+        #self.phi_s = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
 
     def forward(self, x):
         # 1. 膜电位平移与缩放 (PyTorch 的 autograd 会自动计算 phi_p 和 phi_s 的梯度)
         # 为防止缩放因子在训练中更新至负数或极小值导致除零错误，进行极小值限制
-        phi_s_clamped = torch.clamp(self.phi_s, min=1e-3)
-        x_norm = (x - self.phi_p) / phi_s_clamped
-        
+        #phi_s_clamped = torch.clamp(self.phi_s, min=1e-3)
+        #x_norm = (x - self.phi_p) / phi_s_clamped
+        x_norm = x
         # 2. 离散化与激活 (进入自定义的直通估计器)
-        spike = SSF_Quant.apply(x_norm, self.U, self.v_th)
+        spike = SSF_Quant.apply(x_norm, self.U)
         return spike
 
 class IntergerSoma_ssf(neuron.BaseNode): # 假设基于 SpikingJelly 或类似框架的基类
@@ -656,7 +655,7 @@ class IntergerSoma_ssf(neuron.BaseNode): # 假设基于 SpikingJelly 或类似�
         self.decay_input = decay_input
         
         # 替换原有的 MultiSpike 为 SSF 机制
-        self.qtrick = SSF(U=thre, v_th=v_threshold)
+        self.qtrick = SSF(U=thre)
 
     def parallel_membrane_forward(self, x: torch.Tensor, tau: torch.Tensor):
         """Compute the no-reset membrane recurrence for all timesteps at once.
@@ -836,12 +835,12 @@ class PSNIntergerSoma_ssf(neuron.BaseNode):
     def __init__(
         self,
         psn_order: int = 32,
-        psn_exp_init: bool = False,
+        psn_exp_init: bool = True,
         psn_backend: str = "fft",
         psn_threshold_init: float = 0.0,
         tau: float = 2.,
         v_threshold: float = 1., v_reset: float = 0., detach_reset: bool = True,
-        decay_input: bool = True, step_mode='m', backend='torch', thre=4,
+        decay_input: bool = True, step_mode='m', backend='torch', thre=4, ssf=True,
         surrogate_function: Callable = surrogate.Sigmoid(),
     ):
         super().__init__(
@@ -867,7 +866,7 @@ class PSNIntergerSoma_ssf(neuron.BaseNode):
             weight = weight[0]
         self.psn_weight = nn.Parameter(weight)
         self.psn_threshold = nn.Parameter(torch.as_tensor(psn_threshold_init, dtype=torch.float32))
-        self.qtrick = SSF(U=thre, v_th=v_threshold)
+        self.qtrick = SSF(U=thre) if ssf==True else MultiSpike4()
 
     def gen_gemm_weight(self, T: int, device=None, dtype=None):
         if device is None:
