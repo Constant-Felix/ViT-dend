@@ -558,8 +558,8 @@ def save_checkpoint(state: dict, output_dir: Path, is_best: bool) -> None:
     if is_best:
         torch.save(state, output_dir / "model_best.pth.tar")
 
-# python train_lra_s4.py --task imdb --device cuda:5 --soma-lr 0.001 --dend-lr 0.001 --soma-type psn_integer_ssf  --recipe s4_v3   --dend-soma-target gelu  --lr 0.005 --wd 0.005 --dend-lr 0.001 --dend-wd 0.005 --soma-lr 0.005 --soma-wd 0.005 --dend-branches 8  --soma-type psn_integer_ssf  --lr 0.005 --weight-decay 5e-4 --activation standard    --soma-type psn_integer_ssf
-# CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --standalone --nproc-per-node=4  train_lra_s4.py --task pathx --recipe spikingssm_pathx --soma-lr 0.001 --dend-lr 0.001 --soma-type psn_integer_ssf --batch-size 4
+# python train_lra_s4.py --task pathx --device cuda:2 --soma-lr 0.001 --dend-lr 0.001 --soma-type psn_integer_ssf --lr 0.0005 --batch-size 32 --wd 0.01 --recipe s4_v3   --dend-soma-target gelu  --lr 0.005 --wd 0.005 --dend-lr 0.001 --dend-wd 0.005 --soma-lr 0.005 --soma-wd 0.005 --dend-branches 8  --soma-type psn_integer_ssf  --lr 0.005 --weight-decay 5e-4 --activation standard    --soma-type psn_integer_ssf
+# CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc-per-node=8  train_lra_s4.py --task pathx  --soma-lr 0.001 --dend-lr 0.001 --soma-type psn_integer_ssf --lr 0.0005 --batch-size 32 --wd 0.01
 # CUDA_VISIBLE_DEVICES=0,4,5,6 torchrun --standalone --nproc-per-node=4 train_lra_s4.py --task aan --device cuda --soma-lr 0.001 --dend-lr 0.001 --soma-type psn_integer_ssf --recipe s4_v3 --batch-size 16      --lr 0.01   --dend-compartments 2
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -904,7 +904,7 @@ def main() -> None:
     spec = data.spec
     loaders = data.loaders
     if args.activation == "dend_soma" and args.soma_psn_order is None:
-        args.soma_psn_order = spec.sequence_length // 100 ##
+        args.soma_psn_order = 4 #spec.sequence_length // 100 ##
         args.soma_psn_exp_init = True ##
     args.data_pipeline = (
         "official_s4_v3" if args.recipe == "s4_v3" else "official_s4_v4"

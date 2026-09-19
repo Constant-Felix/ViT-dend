@@ -245,7 +245,7 @@ class CIFAR10Net(nn.Module):
                 conv.append(SparseChannelPreservingTrunkDistalDendCompartment(channels,num_branches=num_branches,compartments_per_branch=compartments_per_branch,c_sub=channels,branch_degree=branch_degree,learn_comp_gain=True,learn_edge_gain=True,integration_backend='fft',merge_norm='mean'))
                 #conv.append(soma.AstroPSNIntergerSoma_ssf(psn_order=T,psn_exp_init=True))
                 #conv.append(soma.AstroMaskedSlidingPSN(order=T,exp_init=True,astro_thre=0.4,astro_pool_kernel=5))
-                conv.append(soma.PSNIntergerSoma_ssf(psn_order=T,psn_exp_init=True,psn_backend='fft'))
+                conv.append(soma.PSNIntergerSoma_ssf(psn_order=T//8,psn_exp_init=True,psn_backend='fft',thre=1))
                 #conv.append(soma.MaskedSlidingPSN(order=T,exp_init=True,backend='fft'))
 
             conv.append(layer.AvgPool1d(2))
@@ -260,7 +260,7 @@ class CIFAR10Net(nn.Module):
             #soma.AstroPSNIntergerSoma_ssf(psn_order=T,psn_exp_init=True),
             #soma.AstroMaskedSlidingPSN(order=T,exp_init=True,astro_thre=0.4,astro_pool_kernel=5),
             #soma.MaskedSlidingPSN(order=T,exp_init=True,backend='fft'),
-            soma.PSNIntergerSoma_ssf(psn_order=T,psn_exp_init=True,psn_backend='fft'),
+            soma.PSNIntergerSoma_ssf(psn_order=T//8,psn_exp_init=True,psn_backend='fft',thre=1),
             layer.Linear(channels * 8 // 4, class_num),
         )
 
@@ -278,7 +278,7 @@ from datetime import datetime
 def main():
 
     parser = argparse.ArgumentParser(description='Classify Sequential CIFAR10/100')
-    parser.add_argument('-device', default='cuda:4', help='device')
+    parser.add_argument('-device', default='cuda:1', help='device')
     parser.add_argument('-b', default=128, type=int, help='batch size')
     parser.add_argument('-epochs', default=256, type=int, metavar='N',
                         help='number of total epochs to run')

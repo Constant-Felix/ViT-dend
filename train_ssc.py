@@ -570,7 +570,7 @@ parser.add_argument("--workers", type=int, default=8)
 parser.add_argument('--cos', action='store_true', default=False, help='use cosine lr schedule')
 parser.add_argument('--scheduler', default=None, choices=['onecycle', 'cos', 'step'],
                     help='learning-rate scheduler; SRC/ASRC SSC defaults to OneCycle')
-parser.add_argument('--data-root', default='/data/hyx/ViT-dend/data/ssc', type=str,
+parser.add_argument('--data-root', default='/data2/hyx/ViT-dend/data/ssc', type=str,
                     help='path to extract/ or frames_number_250_split_by_number/')
 parser.add_argument('--ssc-preprocess', default=None, choices=['current', 'asrc'],
                     help='SSC preprocessing pipeline: current fixed-time bins or ASRC-SNN style')

@@ -341,8 +341,8 @@ class DendSomaS4Activation(nn.Module):
         # Reset inside the checkpointed region so backward recomputation starts
         # from the same zero-state trajectory as the original forward pass.
         self._reset_state()
-        return self.soma(self.dend(x_seq))
-        #return self.soma(x_seq)
+        #return self.soma(self.dend(x_seq))
+        return self.soma(x_seq)
 
     def _apply_time_first(self, x_seq: Tensor) -> Tensor:
         if (
