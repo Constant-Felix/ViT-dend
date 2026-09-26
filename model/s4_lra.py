@@ -341,8 +341,8 @@ class DendSomaS4Activation(nn.Module):
         # Reset inside the checkpointed region so backward recomputation starts
         # from the same zero-state trajectory as the original forward pass.
         self._reset_state()
-        #return self.soma(self.dend(x_seq))
-        return self.soma(x_seq)
+        return self.soma(self.dend(x_seq))
+        #return self.soma(x_seq)
 
     def _apply_time_first(self, x_seq: Tensor) -> Tensor:
         if (
@@ -836,8 +836,8 @@ class StandardS4ForLRA(nn.Module):
 
 LRA_S4_PRESETS: Dict[str, Dict[str, object]] = {
     "listops": {
-        "n_layers": 6, #
-        "d_model": 256, #
+        "n_layers": 8, #
+        "d_model": 128, #
         "d_state": 4,
         "dropout": 0.0,
         "norm": "batch",

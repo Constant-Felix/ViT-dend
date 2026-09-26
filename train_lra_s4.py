@@ -558,9 +558,9 @@ def save_checkpoint(state: dict, output_dir: Path, is_best: bool) -> None:
     if is_best:
         torch.save(state, output_dir / "model_best.pth.tar")
 
-# python train_lra_s4.py --task pathx --device cuda:2 --soma-lr 0.001 --dend-lr 0.001 --soma-type psn_integer_ssf --lr 0.0005 --batch-size 32 --wd 0.01 --recipe s4_v3   --dend-soma-target gelu  --lr 0.005 --wd 0.005 --dend-lr 0.001 --dend-wd 0.005 --soma-lr 0.005 --soma-wd 0.005 --dend-branches 8  --soma-type psn_integer_ssf  --lr 0.005 --weight-decay 5e-4 --activation standard    --soma-type psn_integer_ssf
-# CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc-per-node=8  train_lra_s4.py --task pathx  --soma-lr 0.001 --dend-lr 0.001 --soma-type psn_integer_ssf --lr 0.0005 --batch-size 32 --wd 0.01
-# CUDA_VISIBLE_DEVICES=0,4,5,6 torchrun --standalone --nproc-per-node=4 train_lra_s4.py --task aan --device cuda --soma-lr 0.001 --dend-lr 0.001 --soma-type psn_integer_ssf --recipe s4_v3 --batch-size 16      --lr 0.01   --dend-compartments 2
+# python train_lra_s4.py --task cifar --device cuda:4 --soma-lr 0.001 --dend-lr 0.001 --soma-type psn_integer_ssf --resume /data2/hyx/ViT-dend2/exp/lra-new-cifar-dend_soma-gelu-2026-09-23-04-02-51/checkpoint.pth.tar --output-dir /data2/hyx/ViT-dend2/exp/lra-new-cifar-dend_soma-gelu-2026-09-23-04-02-51
+# CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc-per-node=8  train_lra_s4.py --task pathx  --soma-lr 0.001 --dend-lr 0.001 --soma-type psn_integer_ssf --resume /data2/hyx/ViT-dend2/exp/lra-new-pathx-dend_soma-gelu-2026-09-20-03-52-24/checkpoint.pth.tar --output-dir /data2/hyx/ViT-dend2/exp/lra-new-pathx-dend_soma-gelu-2026-09-20-03-52-24
+# CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc-per-node=4 train_lra_s4.py --task aan --device cuda --soma-lr 0.001 --dend-lr 0.001 --soma-type psn_integer_ssf --recipe s4_v3 --batch-size 16      --lr 0.01   --dend-compartments 2
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Train S4-LRA with optional DEND+SOMA activations."

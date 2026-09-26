@@ -607,7 +607,7 @@ class SSF_Quant(torch.autograd.Function):
         ctx.save_for_backward(input)
         ctx.U = U
         # 根据论文公式(17)：先截断，除以阈值，最后向下取整 (floor)
-        clipped_input = torch.clamp(input, min=0, max=U)
+        clipped_input = torch.clamp(input, min=-U, max=U)  ##
         return torch.floor(clipped_input)
         #return clipped_input
 
@@ -618,7 +618,7 @@ class SSF_Quant(torch.autograd.Function):
         grad_input = grad_output.clone()
         
         # 替代梯度 (STE): 在有效截断区间 [-U, U] 内放行梯度，超出则截断为 0
-        grad_input[input < 0] = 0
+        grad_input[input < -U] = 0  ##
         grad_input[input > U] = 0
         return grad_input, None, None  # 对应 input, U, v_th 的梯度，常数不需要梯度
 
@@ -914,6 +914,104 @@ class PSNIntergerSoma_ssf(neuron.BaseNode):
         #mem_seq = x
         output = self.qtrick(mem_seq)
         self.v = mem_seq[-1].detach()
+        self.firing_rate = output.float().mean()
+        return output
+
+class ExponentialSoma_ssf(neuron.BaseNode):
+    """Parallel exponential integration followed by the existing SSF firing.
+
+    For an input of shape ``[T, N, ...]``, the membrane is
+    ``v[t] = bias + sum(gain * decay**lag * x[t-lag], lag=0..t)``.
+    The three scalar parameters are shared across channels and samples;
+    ``decay`` is constrained to (0, 1). The default kernel is ``2**(-lag)``,
+    matching an exponentially initialized PSN soma with ``psn_order=T``.
+
+    Each multi-step call starts from zero integration state and uses all T
+    causal lags, with no spike-dependent reset or finite sliding-window cutoff.
+    Only whole-sequence (``step_mode='m'``) execution is supported. ``self.v``
+    records the final biased membrane for monitoring, not recurrent carryover.
+    """
+
+    def __init__(
+        self,
+        decay_init: float = 0.5,
+        gain_init: float = 1.0,
+        bias_init: float = 0.0,
+        kernel_backend: str = "fft",
+        thre: int = 4,
+        step_mode: str = "m",
+        backend: str = "torch",
+        store_v_seq: bool = False,
+    ):
+        if not math.isfinite(decay_init) or not 0.0 < decay_init < 1.0:
+            raise ValueError("decay_init must be finite and strictly between 0 and 1")
+        if not math.isfinite(gain_init) or not math.isfinite(bias_init):
+            raise ValueError("gain_init and bias_init must be finite")
+        if kernel_backend not in ("fft", "conv", "gemm"):
+            raise ValueError("kernel_backend must be 'fft', 'conv', or 'gemm'")
+        if isinstance(thre, bool) or not isinstance(thre, int) or thre <= 0:
+            raise ValueError("thre must be a positive integer")
+        if step_mode != "m":
+            raise ValueError("ExponentialSoma_ssf supports only step_mode='m'")
+        super().__init__(
+            step_mode=step_mode, backend=backend, store_v_seq=store_v_seq,
+        )
+        self.kernel_backend = kernel_backend
+        self.decay_logit = nn.Parameter(torch.tensor(
+            math.log(decay_init) - math.log1p(-decay_init), dtype=torch.float32,
+        ))
+        self.gain = nn.Parameter(torch.tensor(gain_init, dtype=torch.float32))
+        self.bias = nn.Parameter(torch.tensor(bias_init, dtype=torch.float32))
+        self.qtrick = SSF(U=thre)
+
+    def exponential_kernel(self, length: int, device=None, dtype=None):
+        """Return lag-ordered weights, with the current-input tap first."""
+        if length <= 0:
+            raise ValueError("kernel length must be positive")
+        if device is None:
+            device = self.decay_logit.device
+        if dtype is None:
+            dtype = self.decay_logit.dtype
+        # Generate powers in FP32 (FP64 for double inputs), including under AMP.
+        work_dtype = torch.float64 if dtype == torch.float64 else torch.float32
+        logit = self.decay_logit.to(device=device, dtype=work_dtype)
+        eps = torch.finfo(work_dtype).eps
+        decay = torch.sigmoid(logit).clamp(min=eps, max=1.0 - eps)
+        lag = torch.arange(length, device=device, dtype=work_dtype)
+        return self.gain.to(device=device, dtype=work_dtype) * decay.pow(lag)
+
+    def exponential_membrane_forward(self, x: torch.Tensor):
+        if x.ndim < 2 or x.shape[0] == 0:
+            raise ValueError("expected a non-empty time-first input [T, N, ...]")
+        if not x.is_floating_point():
+            raise TypeError("exponential soma inputs must be floating-point tensors")
+        T = x.shape[0]
+        kernel = self.exponential_kernel(T, device=x.device, dtype=x.dtype)
+        if self.kernel_backend == "fft":
+            mem = _causal_fft_convolution_time_first(x, kernel)
+        elif self.kernel_backend == "conv":
+            x_flat = x.flatten(1).t().unsqueeze(1).to(dtype=kernel.dtype)
+            mem = F.conv1d(
+                F.pad(x_flat, (T - 1, 0)), kernel.flip(0).view(1, 1, T),
+            )
+            mem = mem.squeeze(1).t().reshape_as(x).to(dtype=x.dtype)
+        else:
+            t = torch.arange(T, device=x.device)
+            lag = t[:, None] - t[None, :]
+            weight = kernel[lag.clamp_min(0)] * (lag >= 0)
+            mem = (weight @ x.flatten(1).to(dtype=kernel.dtype)).reshape_as(x)
+            mem = mem.to(dtype=x.dtype)
+        return mem + self.bias.to(device=x.device, dtype=x.dtype)
+
+    def single_step_forward(self, x: torch.Tensor):
+        raise NotImplementedError("ExponentialSoma_ssf requires a complete [T, N, ...] sequence")
+
+    def multi_step_forward(self, x: torch.Tensor):
+        mem_seq = self.exponential_membrane_forward(x)
+        output = self.qtrick(mem_seq)
+        self.v = mem_seq[-1].detach()
+        if self.store_v_seq:
+            self.v_seq = mem_seq
         self.firing_rate = output.float().mean()
         return output
 

@@ -1776,18 +1776,18 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
         trunk = state[:, :, :, 0, ...]
         distal = state[:, :, :, 1:, ...]
         delta = distal - trunk.unsqueeze(3)
-        delta_norm = self._normalize_distal_delta(delta)
+        #delta_norm = self._normalize_distal_delta(delta)
 
         alpha = F.softplus(self._edge_branch_value(self.distal_gate_alpha).to(dtype=state.dtype, device=state.device))
         threshold = self._edge_branch_value(self.distal_gate_threshold.abs()).to(dtype=state.dtype, device=state.device)
-        alpha = self._view_edge_distal(alpha, delta_norm)
-        threshold = self._view_edge_distal(threshold, delta_norm)
-        distal_gate = torch.sigmoid(alpha * delta_norm.abs() - threshold)
+        alpha = self._view_edge_distal(alpha, delta)
+        threshold = self._view_edge_distal(threshold, delta)
+        distal_gate = torch.sigmoid(alpha * delta.abs() - threshold)
 
         mix = torch.softmax(self.distal_mix_logits, dim=-1)
         mix = self._edge_branch_value(mix.to(dtype=state.dtype, device=state.device))
-        mix = self._view_edge_distal(mix, delta_norm)
-        branch_mod = (mix * distal_gate * torch.tanh(delta_norm)).sum(dim=3)
+        mix = self._view_edge_distal(mix, delta)
+        branch_mod = (mix * distal_gate * torch.tanh(delta)).sum(dim=3)
         branch_mod = torch.tanh(branch_mod)
 
         distal_gain = self._edge_branch_value(self.distal_gain).to(dtype=state.dtype, device=state.device)
@@ -1797,7 +1797,7 @@ class SparseChannelPreservingTrunkDistalDendCompartment(BaseDendCompartment):
         residual_gain = self._view_edge_channel(residual_gain, trunk)
         branch_strength = self._view_edge_channel(branch_strength, trunk)
 
-        y = branch_strength * (trunk + distal_gain * trunk * branch_mod + residual_gain * branch_mod)
+        y = branch_strength * (trunk + distal_gain * trunk * branch_mod) #+ residual_gain * branch_mod)
 
         if self.store_branch_monitor:
             self._branch_mod_step = branch_mod.detach()

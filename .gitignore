@@ -1,6 +1,8 @@
 output/
 exp/
 pymp-*
+qk*.py
+ms*.py
 torchinductor_hyx
 all_spike/
 logs/
@@ -30,3 +32,4 @@ pretrain.py
 *.zip
 core.150285
 core.150286
+train_scifar10_pixel.py
